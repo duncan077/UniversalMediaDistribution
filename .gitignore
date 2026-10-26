@@ -1,0 +1,51 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+.vscode/
+TestResults/
+*.user
+*.suo
+*.cache
+*.log
+artifacts/
+artifacts-*
+*.binlog
+.npm-cache/
+.pnpm-store/
+**/node_modules/
+
+# Editor/merge debris
+*.bak
+*.orig
+*.old
+
+# Local tooling, diagnostics, and development captures
+.agents/
+.artifacts/
+.claude/
+.codex-debug/
+.dotnet/
+.scratch/
+.tmp/
+NVIDIA Corporation/
+artifacts-*.png
+artifacts-*.xml
+*.gcdump
+/gc.csv
+/rep.txt
+/sos.txt
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Local publish scripts and profiles
+**/[Pp]ublish*.ps1
+**/[Pp]ublish*.py
+**/PublishProfiles/

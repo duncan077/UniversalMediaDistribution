@@ -1,0 +1,84 @@
+{
+  "format": "universal-media-distribution.catalog",
+  "version": 1,
+  "exportedAt": "2026-07-22T00:00:00Z",
+  "sourceLabel": "Torrent-local metadata for Open Skies",
+  "items": [
+    {
+      "mediaType": "book",
+      "subtype": "manga",
+      "name": "Open Skies",
+      "description": "A freely distributable example manga.",
+      "publicationStatus": "ongoing",
+      "originalLanguage": "en",
+      "thumbnailRef": "art/cover.webp",
+      "alternativeNames": [
+        {
+          "name": "Cielos abiertos",
+          "language": "es",
+          "aliasType": "translation"
+        },
+        {
+          "name": "Open Skies Manga",
+          "language": "en",
+          "aliasType": "short"
+        }
+      ],
+      "genres": [
+        "Adventure",
+        "Science Fiction"
+      ],
+      "categories": [
+        "Manga",
+        "Independent"
+      ],
+      "contributors": [
+        {
+          "name": "Example Indie Collective",
+          "kind": "organization",
+          "url": "https://example.test/indie-collective",
+          "credits": [
+            {
+              "role": "Author",
+              "sortOrder": 0
+            }
+          ]
+        }
+      ],
+      "units": [
+        {
+          "kind": "chapter",
+          "displayNumber": "1",
+          "sortOrder": 0,
+          "name": "First Flight",
+          "thumbnailRef": "art/chapter-1.webp",
+          "pageCount": 3,
+          "sources": [
+            {
+              "assetRole": "primary",
+              "sourceLayout": "image_sequence",
+              "filePath": "chapters/1",
+              "mimeType": "image/webp",
+              "container": "IMAGE_SEQUENCE",
+              "sortOrder": 0,
+              "torrent": {
+                "displayName": "Open Skies - Chapter 1",
+                "language": "en",
+                "isPrivate": true
+              }
+            }
+          ]
+        }
+      ],
+      "distributionRights": [
+        {
+          "sourceName": "Example Indie Collective",
+          "sourceUri": "https://example.test/open-skies",
+          "licenseName": "Creative Commons Attribution 4.0",
+          "licenseUri": "https://creativecommons.org/licenses/by/4.0/",
+          "attribution": "Example Indie Collective"
+        }
+      ]
+    }
+  ]
+}

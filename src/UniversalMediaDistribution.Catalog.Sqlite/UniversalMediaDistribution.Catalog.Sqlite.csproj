@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UniversalMediaDistribution.Application\UniversalMediaDistribution.Application.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Catalog\UniversalMediaDistribution.Catalog.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.ContentFiltering\UniversalMediaDistribution.ContentFiltering.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Domain\UniversalMediaDistribution.Domain.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Ingestion\UniversalMediaDistribution.Torrenting.Ingestion.csproj" />
+  </ItemGroup>
+</Project>

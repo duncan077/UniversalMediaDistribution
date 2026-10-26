@@ -1,0 +1,66 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; color: #e9edf5; background: #10151e; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+header, main { max-width: 1500px; margin: auto; padding: 26px 28px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 8px; }
+h1 { margin: 5px 0; font-size: clamp(1.5rem, 3vw, 2rem); }
+h2 { font-size: 1.1rem; margin: 0 0 16px; }
+p { line-height: 1.5; }
+.eyebrow { margin: 0; color: #60dabb; font-size: .8rem; letter-spacing: .09em; text-transform: uppercase; }
+.muted { color: #a8b3c6; font-size: .88rem; }
+.panel { background: #1b2330; border: 1px solid #2e394b; border-radius: 15px; padding: 22px; margin-bottom: 20px; }
+.login { max-width: 520px; margin: 30px auto; }
+.login form { display: grid; gap: 12px; margin-top: 24px; }
+input, select, button { font: inherit; color: inherit; }
+input[type=password], input[type=number], select { background: #111923; border: 1px solid #495973; border-radius: 8px; padding: 10px 12px; max-width: 100%; }
+.interval-controls { display: flex; align-items: center; gap: 8px; }
+.interval-controls input { width: 5rem; }
+button { background: #235f58; border: 1px solid #418c81; border-radius: 9px; padding: 10px 16px; cursor: pointer; }
+button:hover { background: #30776e; }
+button:disabled { opacity: .55; cursor: wait; }
+button.secondary { background: #283244; border-color: #46536b; }
+button.secondary:hover { background: #36445b; }
+:focus-visible { outline: 3px solid #67e2c1; outline-offset: 3px; }
+.toolbar, .section-title { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.toolbar p, .section-title p, .section-title h2 { margin: 0; }
+.actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.actions label { font-size: .88rem; }
+.check { display: flex; align-items: center; gap: 8px; }
+input[type=checkbox] { accent-color: #67e2c1; width: 17px; height: 17px; }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.stats .panel { margin-bottom: 0; min-height: 155px; }
+.stats h2 { color: #b6c2d5; font-size: .85rem; font-weight: 500; }
+.stats .muted { margin: 6px 0 0; }
+.value { font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 650; margin: 0; }
+.stats + .notice, .stats + .panel { margin-top: 20px; }
+.notice { color: #f6d49c; background: #342c20; border: 1px solid #5e4a2f; border-radius: 10px; padding: 14px 18px; margin: 20px 0; }
+#error { border: 1px solid #9b555d; background: #38232a; color: #ffd4d8; padding: 15px 18px; border-radius: 10px; }
+.table-scroll { overflow: auto; }
+table { border-collapse: collapse; width: 100%; text-align: left; font-size: .86rem; }
+th { color: #aebbd0; font-weight: 500; font-size: .78rem; white-space: nowrap; }
+td, th { padding: 13px 12px; border-bottom: 1px solid #313d4f; vertical-align: top; }
+td:first-child, th:first-child { padding-left: 0; }
+tr:last-child td { border-bottom: 0; }
+td { line-height: 1.5; }
+.badge { display: inline-block; border-radius: 6px; padding: 3px 9px; background: #303d50; color: #cbd5e5; font-size: .78rem; white-space: nowrap; }
+.badge[data-tone=good] { color: #8be4c1; background: #173e35; }
+.badge[data-tone=warning] { color: #f9d58f; background: #46391f; }
+.badge[data-tone=error] { color: #ffb9c2; background: #492832; }
+.provider-link { background: none; border: none; padding: 0; text-align: left; color: #87e0ce; }
+.provider-link:hover { background: none; text-decoration: underline; }
+.sub { display: block; color: #a8b3c6; font-size: .76rem; }
+.logs td:last-child { min-width: 270px; max-width: 600px; overflow-wrap: anywhere; white-space: pre-wrap; }
+#older { margin-top: 15px; }
+.footer { margin-bottom: 25px; }
+@media (max-width: 900px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) {
+  header, main { padding: 20px 14px; }
+  header { align-items: flex-start; }
+  .stats { grid-template-columns: 1fr; gap: 12px; }
+  .stats .panel { min-height: 125px; }
+  .panel { padding: 18px; }
+  .actions { width: 100%; }
+  .actions label { flex: 1 1 auto; }
+  select { display: block; margin-top: 5px; width: 100%; }
+}

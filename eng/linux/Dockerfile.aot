@@ -1,0 +1,17 @@
+FROM debian:bookworm-slim
+ARG DOTNET_SDK_VERSION
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl clang zlib1g-dev libicu72 libssl3 python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN test -n "$DOTNET_SDK_VERSION" && mkdir /usr/share/dotnet \
+    && case "$TARGETARCH" in amd64) sdk_arch=x64 ;; arm64) sdk_arch=arm64 ;; *) exit 1 ;; esac \
+    && curl --fail --location --retry 3 \
+       "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_SDK_VERSION}/dotnet-sdk-${DOTNET_SDK_VERSION}-linux-${sdk_arch}.tar.gz" \
+       -o /tmp/dotnet-sdk.tar.gz \
+    && tar -xzf /tmp/dotnet-sdk.tar.gz -C /usr/share/dotnet \
+    && rm /tmp/dotnet-sdk.tar.gz
+ENV DOTNET_ROOT=/usr/share/dotnet PATH=/usr/share/dotnet:$PATH \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+COPY publish-aot.py /build/publish-aot.py
+ENTRYPOINT ["python3", "/build/publish-aot.py"]

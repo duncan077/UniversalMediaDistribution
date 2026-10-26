@@ -1,0 +1,11 @@
+{
+  "name": "donation-remote-scroll",
+  "defaultDelayMs": 300,
+  "steps": [
+    { "action": "assert", "assert": { "focusedContains": "DonationDismissButton" } },
+    { "name": "enter-scroll-content", "action": "key", "key": "up", "assert": { "focusedContains": "DonationBodyScroll" } },
+    { "name": "scroll-content", "action": "key", "key": "down", "screenshot": true, "assert": { "focusedContains": "DonationBodyScroll", "visibleWithinWindow": ["DonationDismissButton", "DonationCopyButton"] } },
+    { "name": "return-to-action", "action": "key", "key": "down", "repeat": 10, "assert": { "focusedContains": "DonationDismissButton" } },
+    { "name": "dismiss", "action": "key", "key": "center", "assert": { "notVisible": ["DonationDismissButton"] } }
+  ]
+}

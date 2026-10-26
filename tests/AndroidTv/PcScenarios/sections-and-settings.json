@@ -1,0 +1,29 @@
+{
+  "name": "sections-and-settings",
+  "description": "Checks Live TV list/tools, Lists, and modal Settings navigation without starting playback or changing settings.",
+  "defaultDelayMs": 500,
+  "steps": [
+    { "name": "dismiss-prompt", "action": "key", "key": "back" },
+    { "name": "open-menu", "action": "key", "key": "left", "assert": { "focusedContains": "HomeNavButton" } },
+    { "name": "choose-live-tv", "action": "key", "key": "down", "repeat": 4, "assert": { "focusedContains": "LiveTvNavButton" } },
+    { "name": "open-live-tv", "action": "key", "key": "center", "waitMs": 2500, "screenshot": true, "dumpUi": true, "assert": { "running": true, "uiContains": "LiveTvChannelList" } },
+    { "name": "live-tv-up-to-tools", "action": "key", "key": "up", "repeat": 2, "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "LiveTvToolsToggleButton" } },
+    { "name": "first-channel", "action": "key", "key": "down", "rememberFocus": "channel-one", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "next-channel", "action": "key", "key": "down", "assert": { "focusedDifferentFrom": "channel-one" } },
+    { "name": "previous-channel", "action": "key", "key": "up", "assert": { "focusedSameAs": "channel-one" } },
+    { "name": "channel-up-to-tools", "action": "key", "key": "up", "assert": { "focusedContains": "LiveTvToolsToggleButton" } },
+    { "name": "live-tv-menu", "action": "key", "key": "left", "assert": { "focusedContains": "LiveTvNavButton" } },
+    { "name": "choose-lists", "action": "key", "key": "down", "assert": { "focusedContains": "UserListsNavButton" } },
+    { "name": "open-lists", "action": "key", "key": "center", "waitMs": 1200, "rememberFocus": "lists", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "lists-menu", "action": "key", "key": "back", "assert": { "focusedContains": "UserListsNavButton" } },
+    { "name": "choose-settings", "action": "key", "key": "down", "assert": { "focusedContains": "SettingsNavButton" } },
+    { "name": "menu-bottom-edge", "action": "key", "key": "down", "repeat": 4, "assert": { "focusedContains": "SettingsNavButton" } },
+    { "name": "open-settings", "action": "key", "key": "center", "screenshot": true, "dumpUi": true, "rememberFocus": "settings-start", "assert": { "focusedDifferentFrom": "lists" } },
+    { "name": "settings-down", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedDifferentFrom": "settings-start" } },
+    { "name": "settings-back", "action": "key", "key": "back", "screenshot": true, "dumpUi": true, "assert": { "focusedSameAs": "lists" } },
+    { "name": "reopen-menu", "action": "key", "key": "back", "assert": { "focusedContains": "UserListsNavButton" } },
+    { "name": "choose-settings-again", "action": "key", "key": "down", "assert": { "focusedContains": "SettingsNavButton" } },
+    { "name": "reopen-settings-held-ok", "action": "key", "key": "center", "holdMs": 1200, "assert": { "focusedContains": "SettingsCloseButton" } },
+    { "name": "close-settings-with-ok", "action": "key", "key": "center", "screenshot": true, "dumpUi": true, "assert": { "running": true, "focusedSameAs": "lists" } }
+  ]
+}

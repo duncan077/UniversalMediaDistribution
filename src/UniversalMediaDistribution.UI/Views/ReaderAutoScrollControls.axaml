@@ -1,0 +1,41 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:UniversalMediaDistribution.UI.ViewModels"
+             x:Class="UniversalMediaDistribution.UI.Views.ReaderAutoScrollControls"
+             x:DataType="vm:ImageReaderViewModel">
+  <StackPanel Spacing="12">
+    <TextBlock Text="{DynamicResource ReaderAutoScrollTitle}" FontWeight="SemiBold" TextWrapping="Wrap" />
+    <Grid ColumnDefinitions="*,Auto">
+      <TextBlock Text="{DynamicResource ReaderAutoScrollSpeed}" VerticalAlignment="Center"
+                 Foreground="{StaticResource TextSecondaryBrush}" />
+      <Border Grid.Column="1" Background="{StaticResource AccentScrimBrush}"
+              CornerRadius="8" Padding="12,5" MinWidth="64">
+        <TextBlock Text="{Binding AutoScrollSpeedLabel}" FontWeight="SemiBold" HorizontalAlignment="Center" />
+      </Border>
+    </Grid>
+    <Slider x:Name="SpeedSlider" Minimum="0.25" Maximum="10" MinHeight="48"
+            SmallChange="0.25" LargeChange="1" TickFrequency="0.25" IsSnapToTickEnabled="True"
+            HorizontalAlignment="Stretch" Value="{Binding AutoScrollSpeed, Mode=TwoWay}"
+            AutomationProperties.Name="{DynamicResource ReaderAutoScrollSpeed}" />
+    <Grid ColumnDefinitions="*,*" Margin="0,-8,0,0">
+      <TextBlock Classes="hint" Text="0.25×" />
+      <TextBlock Grid.Column="1" Classes="hint" Text="10×" HorizontalAlignment="Right" />
+    </Grid>
+    <UniformGrid Columns="4" Rows="1">
+      <Button Classes="quiet" Content="1×"  Margin="0,0,4,0" HorizontalAlignment="Stretch"
+              Command="{Binding SetAutoScrollSpeedCommand}" CommandParameter="1" />
+      <Button Classes="quiet" Content="3×"  Margin="0,0,4,0" HorizontalAlignment="Stretch"
+              Command="{Binding SetAutoScrollSpeedCommand}" CommandParameter="3" />
+      <Button Classes="quiet" Content="5×"  Margin="0,0,4,0" HorizontalAlignment="Stretch"
+              Command="{Binding SetAutoScrollSpeedCommand}" CommandParameter="5" />
+      <Button Classes="quiet" Content="10×"  HorizontalAlignment="Stretch"
+              Command="{Binding SetAutoScrollSpeedCommand}" CommandParameter="10" />
+    </UniformGrid>
+    <Button Classes="primary" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+            Content="{Binding AutoScrollActionLabel}" Command="{Binding ToggleAutoScrollCommand}"
+            ToolTip.Tip="{DynamicResource ReaderAutoScrollHint}" />
+    <TextBlock x:Name="MiddleScrollHint" Classes="hint" Text="{DynamicResource ReaderMiddleScrollHint}" TextWrapping="Wrap" />
+    <TextBlock x:Name="RemoteScrollHint" Classes="hint" IsVisible="False"
+               Text="{DynamicResource ReaderRemoteScrollHint}" TextWrapping="Wrap" />
+  </StackPanel>
+</UserControl>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="app_name">Universal Media Distribution</string>
+  <string name="now_playing">Now playing</string>
+  <string name="web_challenge_title">Site verification</string>
+  <string name="web_challenge_message">%1$s wants to check that you are not a bot. Answer it below and this closes on its own.</string>
+</resources>

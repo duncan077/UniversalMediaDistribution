@@ -1,0 +1,10 @@
+{
+  "name": "donation-responsive",
+  "defaultDelayMs": 300,
+  "steps": [
+    { "name": "modal-fits", "action": "assert", "screenshot": true, "dumpUi": true,
+      "assert": { "focusedContains": "DonationDismissButton", "visibleWithinWindow": ["DonationDismissButton", "DonationCopyButton", "DonationCloseButton"] } },
+    { "name": "default-ok-dismisses", "action": "key", "key": "center", "screenshot": true,
+      "assert": { "running": true, "notVisible": ["DonationDismissButton", "DonationCopyButton"] } }
+  ]
+}

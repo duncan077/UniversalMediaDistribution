@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Headless" />
+    <PackageReference Include="Avalonia.Skia" />
+    <PackageReference Include="coverlet.collector">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Build order only: no assembly is consumed from the server head, and
+         SkipGetTargetFrameworkProperties keeps MSBuild from running the
+         framework compatibility check on a reference that exists purely to
+         sequence the build. -->
+    <ProjectReference
+        Include="..\..\src\UniversalMediaDistribution.Server\UniversalMediaDistribution.Server.csproj"
+        ReferenceOutputAssembly="false"
+        SkipGetTargetFrameworkProperties="true" />
+    <ProjectReference Include="..\..\src\UniversalMediaDistribution.Catalog.Sqlite\UniversalMediaDistribution.Catalog.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\UniversalMediaDistribution.UI\UniversalMediaDistribution.UI.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' != 'true'">
+    <Compile Remove="BackgroundWebVideoPlaybackTests.cs" />
+  </ItemGroup>
+</Project>

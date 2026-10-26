@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="app_name">Distribución Multimedia Universal</string>
+  <string name="now_playing">Reproduciendo</string>
+  <string name="web_challenge_title">Verificación del sitio</string>
+  <string name="web_challenge_message">%1$s quiere comprobar que no eres un bot. Respóndelo abajo y esta pantalla se cierra sola.</string>
+</resources>

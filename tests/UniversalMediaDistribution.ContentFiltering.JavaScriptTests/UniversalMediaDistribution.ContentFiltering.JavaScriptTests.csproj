@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/UniversalMediaDistribution.ContentFiltering/UniversalMediaDistribution.ContentFiltering.csproj" />
+    <Compile Include="../../src/UniversalMediaDistribution.UI/Playback/EmbeddedWebAdBlocker.cs" Link="EmbeddedWebAdBlocker.cs" />
+    <Compile Include="../../src/UniversalMediaDistribution.UI/Playback/EmbeddedWebAdBlockerJsonContext.cs" Link="EmbeddedWebAdBlockerJsonContext.cs" />
+    <None Update="runtime.cjs" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

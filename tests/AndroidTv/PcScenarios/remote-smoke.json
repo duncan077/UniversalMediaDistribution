@@ -1,0 +1,54 @@
+{
+  "name": "remote-smoke",
+  "description": "Exercises the shared Android TV navigation path in the Windows desktop preview.",
+  "defaultDelayMs": 600,
+  "steps": [
+    {
+      "name": "initial-focus",
+      "action": "assert",
+      "screenshot": true,
+      "dumpUi": true,
+      "assert": {
+        "running": true,
+        "uiContains": "Home"
+      }
+    },
+    {
+      "name": "move-right",
+      "action": "key",
+      "key": "right",
+      "screenshot": true,
+      "assert": {
+        "running": true
+      }
+    },
+    {
+      "name": "move-down",
+      "action": "key",
+      "key": "down",
+      "screenshot": true,
+      "assert": {
+        "running": true
+      }
+    },
+    {
+      "name": "select",
+      "action": "key",
+      "key": "center",
+      "waitMs": 1000,
+      "screenshot": true,
+      "assert": {
+        "running": true
+      }
+    },
+    {
+      "name": "back",
+      "action": "key",
+      "key": "back",
+      "screenshot": true,
+      "assert": {
+        "running": true
+      }
+    }
+  ]
+}

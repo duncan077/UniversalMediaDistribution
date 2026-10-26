@@ -1,0 +1,158 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- 32-bit ARM televisions require the android-arm NativeAOT runtime
+         pack from the .NET 11 Android workload. Use the SDK pinned in
+         global.json and restore its matching workloads. -->
+    <TargetFramework>net11.0-android</TargetFramework>
+    <!-- 24, not 23: the .NET 11 Android workload refuses anything lower
+         (XA4216, "the minimum is 24.0"), and NativeAOT links against the NDK
+         sysroot for API 24 via $(AndroidNdkApiLevel_Arm) regardless. This drops
+         Android 6.0; both televisions report API 34. -->
+    <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+    <ApplicationId>org.universalmediadistribution.client</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>0.7.0</ApplicationDisplayVersion>
+    <UmdAndroidPackageProfile Condition="'$(UmdAndroidPackageProfile)' == ''">universal</UmdAndroidPackageProfile>
+    <!-- android-x86 is gone from every profile: the .NET 11 Android workload
+         ships only a Mono pack for it, no CoreCLR one, and CoreCLR is the
+         default runtime now, so naming that RID fails the build outright with
+         NETSDK1181. The ABI is emulators and a few Chromebooks. -->
+    <RuntimeIdentifiers Condition="'$(UmdAndroidRuntimeIdentifier)' == '' and '$(UmdAndroidPackageProfile)' == 'universal'">android-arm;android-arm64;android-x64</RuntimeIdentifiers>
+    <RuntimeIdentifiers Condition="'$(UmdAndroidRuntimeIdentifier)' == '' and ('$(UmdAndroidPackageProfile)' == 'arm' or '$(UmdAndroidPackageProfile)' == 'tv-arm')">android-arm;android-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(UmdAndroidRuntimeIdentifier)' != ''">$(UmdAndroidRuntimeIdentifier)</RuntimeIdentifier>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <!-- Ahead-of-time compile the startup path against the shipped profile, for
+         the Mono builds. The televisions pay for JIT on a weak CPU, which is
+         where the startup input-dispatch ANRs came from. Irrelevant on a
+         NativeAOT publish, since Mono is not in the app then - and the 32-bit
+         ARM televisions can now take that route, see the NativeAOT block
+         below. -->
+    <!-- Off again: the one run with it enabled produced a fresh input-dispatch
+         ANR and a process kill on the television, and a 561% CPU spike at
+         startup. That may have been device-state noise rather than the setting,
+         but it is unproven either way, so it stays off until it can be A/B'd on
+         a freshly rebooted device. -->
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <!-- Partial trimming keeps reflection-heavy application/provider code safe
+         while the Android workload removes unused framework code. Splitting the
+         ABI families provides the large, deterministic package-size reduction. -->
+    <PublishTrimmed Condition="'$(Configuration)' == 'Release'">true</PublishTrimmed>
+    <TrimMode Condition="'$(Configuration)' == 'Release'">partial</TrimMode>
+    <DefineConstants Condition="'$(UmdAndroidPackageProfile)' == 'tv-arm'">$(DefineConstants);UMD_ANDROID_TV</DefineConstants>
+    <AndroidManifest Condition="'$(UmdAndroidPackageProfile)' == 'arm' or '$(UmdAndroidPackageProfile)' == 'x86-x64'">Properties\AndroidManifest.mobile.xml</AndroidManifest>
+    <AndroidManifest Condition="'$(UmdAndroidPackageProfile)' == 'tv-arm'">Properties\AndroidManifest.tv.xml</AndroidManifest>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' == 'true'">
+    <DefineConstants>$(DefineConstants);UMD_BACKGROUND_WEB_VIDEO</DefineConstants>
+  </PropertyGroup>
+
+  <!-- NativeAOT replaces Mono entirely, so it needs an NDK clang to link
+       against and a single concrete RID; it also forces full trimming, which
+       the partial mode above deliberately avoids.
+
+       On by default for every ABI that has a runtime pack, and only when one
+       concrete runtime identifier is being built. The universal profile names
+       four identifiers at once and cannot be AOT compiled. android-x86 has no
+       NativeAOT runtime pack, so that ABI keeps the Mono build.
+       -p:UmdUseNativeAot=true still forces it on for a one-off publish. -->
+  <PropertyGroup Condition="'$(UmdUseNativeAot)' == 'true' or ('$(UmdUseNativeAot)' != 'false' and ('$(RuntimeIdentifier)' == 'android-arm' or '$(RuntimeIdentifier)' == 'android-arm64' or '$(RuntimeIdentifier)' == 'android-x64'))">
+    <!-- No CppCompilerAndLinker/ObjCopyName/clang-triple overrides here on
+         purpose. Microsoft.Android.Sdk.NativeAOT.targets sets all three itself,
+         per RID, and gets two things right that the old hand-rolled values got
+         wrong: it selects the NDK API level from $(AndroidNdkApiLevel_Arm),
+         which is 24, rather than the hardcoded 35 that was being linked against
+         devices running API 34; and on Windows it invokes the NDK's .cmd
+         wrapper scripts, which resolve without the NDK bin directory being on
+         PATH. Setting these by hand again would reintroduce both bugs. -->
+    <UseMonoRuntime>false</UseMonoRuntime>
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifiers></RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">android-arm64</RuntimeIdentifier>
+    <TrimMode>full</TrimMode>
+  </PropertyGroup>
+
+  <!-- NativeAOT requires a supported concrete RID and the matching .NET 11
+       Android workload. android-x86 has no NativeAOT runtime pack; fail
+       explicitly instead of producing a missing-pack error during publish. -->
+  <Target Name="ValidateUmdNativeAotRuntimeIdentifier"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(UmdUseNativeAot)' == 'true'">
+    <Error
+        Condition="'$(RuntimeIdentifier)' != 'android-arm' and '$(RuntimeIdentifier)' != 'android-arm64' and '$(RuntimeIdentifier)' != 'android-x64'"
+        Text="NativeAOT supports android-arm, android-arm64 and android-x64 only. '$(RuntimeIdentifier)' has no Microsoft.Android.Runtime.NativeAOT runtime pack; build it without UmdUseNativeAot." />
+  </Target>
+
+  <Target Name="ValidateUmdAndroidPackageProfile" BeforeTargets="PrepareForBuild">
+    <Error
+        Condition="'$(UmdAndroidPackageProfile)' != 'universal' and '$(UmdAndroidPackageProfile)' != 'arm' and '$(UmdAndroidPackageProfile)' != 'tv-arm'"
+        Text="UmdAndroidPackageProfile must be universal, arm, or tv-arm." />
+  </Target>
+
+  <!--
+    No GC tuning here, and both routes that were tried are recorded so they are
+    not repeated blindly.
+
+    System.GC.ConserveMemory and System.GC.RetainVM as
+    RuntimeHostConfigurationOption measured no change whatsoever (464 MB
+    resident against 462 MB without them). They configure the CoreCLR collector
+    and this head runs MonoVM, which logcat confirms via its MonoDroid and
+    monodroid-assembly tags, so SGen never saw them.
+
+    MONO_GC_PARAMS through an AndroidEnvironment file also measured no change
+    (466 MB), and adding MONO_LOG_LEVEL=info with MONO_LOG_MASK=gc to observe
+    SGen directly broke startup outright: liblog is not loaded that early, and
+    the failed p/invoke left Application.onCreate with no native implementation
+    (UnsatisfiedLinkError). Anything wanting SGen logging needs a route that
+    does not run before liblog is available.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Android" />
+    <PackageReference Include="Avalonia.Controls.WebView" />
+    <PackageReference Include="LibVLCSharp" />
+    <PackageReference Include="VideoLAN.LibVLC.Android" GeneratePathProperty="true" ExcludeAssets="build" />
+    <!-- WebViewCompat.AddDocumentStartJavaScript: the only way to run the
+         cosmetic payload before the page's own scripts. -->
+    <PackageReference Include="Xamarin.AndroidX.WebKit" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' != 'true'">
+    <Compile Remove="AndroidBackgroundWebVideoPlayer.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdAndroidPackageProfile)' == 'tv-arm'">
+    <Compile Remove="MainActivity.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdAndroidPackageProfile)' == 'arm' or '$(UmdAndroidPackageProfile)' == 'x86-x64'">
+    <Compile Remove="TvMainActivity.cs" />
+    <AndroidResource Remove="Resources\drawable-es-xhdpi\tv_banner.png" />
+    <AndroidResource Remove="Resources\drawable-xhdpi\tv_banner.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UniversalMediaDistribution.Mobile\UniversalMediaDistribution.Mobile.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.UI\UniversalMediaDistribution.UI.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProguardConfiguration Include="libvlc.proguard.cfg" />
+  </ItemGroup>
+
+  <!-- Upstream 3.6.5 targets inspect RuntimeIdentifiers/AndroidSupportedAbis,
+       but not the singular RuntimeIdentifier used by our TV/NativeAOT builds.
+       Explicit ABI selection prevents shipping a working wrapper without VLC. -->
+  <PropertyGroup>
+    <_UmdVlcRids Condition="'$(RuntimeIdentifier)' != ''">;$(RuntimeIdentifier);</_UmdVlcRids>
+    <_UmdVlcRids Condition="'$(RuntimeIdentifier)' == ''">;$(RuntimeIdentifiers);</_UmdVlcRids>
+  </PropertyGroup>
+  <ItemGroup Condition="$(_UmdVlcRids.Contains(';android-arm;'))">
+    <AndroidNativeLibrary Include="$(PkgVideoLAN_LibVLC_Android)\build\android-armv7\*.so" Abi="armeabi-v7a" />
+  </ItemGroup>
+  <ItemGroup Condition="$(_UmdVlcRids.Contains(';android-arm64;'))">
+    <AndroidNativeLibrary Include="$(PkgVideoLAN_LibVLC_Android)\build\android-armv8\*.so" Abi="arm64-v8a" />
+  </ItemGroup>
+  <ItemGroup Condition="$(_UmdVlcRids.Contains(';android-x64;'))">
+    <AndroidNativeLibrary Include="$(PkgVideoLAN_LibVLC_Android)\build\android-x86_64\*.so" Abi="x86_64" />
+  </ItemGroup>
+</Project>

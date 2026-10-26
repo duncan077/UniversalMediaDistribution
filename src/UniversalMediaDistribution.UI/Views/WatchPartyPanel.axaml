@@ -1,0 +1,69 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:UniversalMediaDistribution.UI.ViewModels"
+             x:Class="UniversalMediaDistribution.UI.Views.WatchPartyPanel"
+             x:DataType="vm:MainViewModel"
+             x:CompileBindings="True">
+  <StackPanel Spacing="10">
+    <TextBlock Text="{DynamicResource WatchPartyTitle}" FontSize="18" FontWeight="SemiBold" />
+    <TextBlock Text="{DynamicResource WatchPartyDescription}" TextWrapping="Wrap" Opacity="0.75" />
+    <TextBlock Text="{DynamicResource WatchPartyUnavailableHint}" TextWrapping="Wrap"
+               IsVisible="{Binding !SupportsWatchParties}" />
+    <TextBlock Text="{Binding PartyFeedback.Message}" TextWrapping="Wrap" Foreground="#FF9C9C"
+               IsVisible="{Binding PartyFeedback.HasMessage}" />
+    <StackPanel IsVisible="{Binding ShowWatchPartyJoinControls}" Spacing="8">
+      <Button x:Name="CreatePartyButton" Content="{DynamicResource WatchPartyStartAction}"
+              Command="{Binding StartWatchPartyCommand}" IsEnabled="{Binding !IsWatchPartyBusy}"
+              HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" MinHeight="40" />
+      <TextBlock Text="{DynamicResource WatchPartyJoinCodeLabel}" Opacity="0.75" />
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+        <TextBox x:Name="JoinCodeInput" Text="{Binding WatchPartyJoinCode}" MaxLength="6"
+                 MinHeight="40" VerticalContentAlignment="Center"
+                 AutomationProperties.Name="{DynamicResource WatchPartyJoinCodeLabel}">
+          <TextBox.KeyBindings>
+            <KeyBinding Gesture="Enter" Command="{Binding JoinWatchPartyCommand}" />
+          </TextBox.KeyBindings>
+        </TextBox>
+        <Button x:Name="JoinPartyButton" Grid.Column="1" Content="{DynamicResource WatchPartyJoinAction}"
+                Command="{Binding JoinWatchPartyCommand}" IsEnabled="{Binding !IsWatchPartyBusy}" MinHeight="40" />
+      </Grid>
+    </StackPanel>
+    <StackPanel IsVisible="{Binding HasWatchParty}" Spacing="10">
+      <TextBlock Text="{DynamicResource WatchPartyCodeShareLabel}" Opacity="0.75" />
+      <WrapPanel>
+        <SelectableTextBlock Text="{Binding WatchPartyCode}" FontSize="24" FontWeight="Bold"
+                             Margin="0,0,14,8" VerticalAlignment="Center"
+                             AutomationProperties.Name="{DynamicResource WatchPartyCodeShareLabel}" />
+        <Button x:Name="CopyCodeButton" Content="{DynamicResource WatchPartyCopyCode}"
+                Click="CopyCode_OnClick" MinHeight="40" Margin="0,0,0,8" />
+      </WrapPanel>
+      <TextBlock x:Name="CopyFeedback" TextWrapping="Wrap" IsVisible="False" Foreground="#65D6AD" />
+      <TextBlock Text="{Binding WatchPartyContentLabel}" TextWrapping="Wrap" />
+      <TextBlock Text="{Binding WatchPartySyncStatus}" IsVisible="{Binding HasWatchPartySyncStatus}"
+                 TextWrapping="Wrap" Foreground="#65D6AD" />
+      <TextBlock Text="{Binding WatchPartyLastEvent}" IsVisible="{Binding HasWatchPartyLastEvent}"
+                 TextWrapping="Wrap" Opacity="0.75" />
+      <TextBlock Text="{DynamicResource WatchPartyMembersTitle}" FontWeight="SemiBold" />
+      <ItemsControl ItemsSource="{Binding WatchPartyMemberLabels}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="x:String">
+            <TextBlock Text="{Binding}" TextWrapping="Wrap" Margin="0,2" />
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+      <CheckBox IsVisible="{Binding ShowWatchPartyHostControlsToggle}"
+                IsChecked="{Binding WatchPartyHostControlsOnly}">
+        <TextBlock Text="{DynamicResource WatchPartyHostControlsLabel}" TextWrapping="Wrap" />
+      </CheckBox>
+      <WrapPanel>
+        <Button x:Name="ResyncPartyButton" Content="{DynamicResource WatchPartyResync}"
+                Command="{Binding ResynchronizeWatchPartyCommand}" IsEnabled="{Binding CanResynchronizeWatchParty}"
+                MinHeight="40" Margin="0,0,8,8" />
+        <Button Content="{DynamicResource WatchPartyOpenContentAction}" Command="{Binding OpenWatchPartyContentCommand}"
+                IsVisible="{Binding WatchPartyHasContent}" MinHeight="40" Margin="0,0,8,8" />
+        <Button x:Name="LeavePartyButton" Content="{DynamicResource WatchPartyLeaveAction}" Command="{Binding LeaveWatchPartyCommand}"
+                IsEnabled="{Binding !IsWatchPartyBusy}" MinHeight="40" Margin="0,0,0,8" />
+      </WrapPanel>
+    </StackPanel>
+  </StackPanel>
+</UserControl>

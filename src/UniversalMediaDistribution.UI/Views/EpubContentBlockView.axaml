@@ -1,0 +1,66 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:UniversalMediaDistribution.UI.ViewModels"
+             x:Class="UniversalMediaDistribution.UI.Views.EpubContentBlockView"
+             x:DataType="vm:EpubContentBlockViewModel"
+             d:DesignWidth="800"
+             d:DesignHeight="500"
+             mc:Ignorable="d">
+  <Grid Margin="0,10">
+    <SelectableTextBlock Text="{Binding DisplayText}"
+                         IsVisible="{Binding IsHeading}"
+                         Foreground="{StaticResource TextPrimaryBrush}"
+                         FontSize="{Binding HeadingFontSize}"
+                         FontWeight="Bold"
+                         LineSpacing="4"
+                         Margin="0,8,0,2"
+                         TextWrapping="Wrap" />
+
+    <SelectableTextBlock Text="{Binding DisplayText}"
+                         IsVisible="{Binding IsBodyText}"
+                         Foreground="{StaticResource TextSecondaryBrush}"
+                         FontSize="{Binding FontSize}"
+                         LineSpacing="7"
+                         TextWrapping="Wrap" />
+
+    <StackPanel IsVisible="{Binding IsImage}" Spacing="10">
+      <Border Background="{StaticResource SurfaceSunkenBrush}"
+              BorderBrush="{StaticResource BorderSubtleBrush}"
+              BorderThickness="1"
+              CornerRadius="{StaticResource RadiusMd}"
+              Padding="10"
+              MinHeight="160">
+        <Grid>
+          <Image Source="{Binding Image}"
+                 AutomationProperties.Name="{DynamicResource EpubIllustrationLabel}"
+                 Stretch="Uniform"
+                 MaxWidth="820"
+                 MaxHeight="1400"
+                 HorizontalAlignment="Center" />
+          <ProgressBar Width="160"
+                       AutomationProperties.Name="{DynamicResource BusyLabel}"
+                       IsIndeterminate="{Binding IsLoading}"
+                       IsVisible="{Binding IsLoading}"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
+          <TextBlock Text="{Binding ErrorMessage}"
+                     AutomationProperties.Name="{DynamicResource ErrorMessageLabel}"
+                     IsVisible="{Binding !!ErrorMessage}"
+                     Foreground="{StaticResource DangerTextBrush}"
+                     TextWrapping="Wrap"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center"
+                     Margin="24" />
+        </Grid>
+      </Border>
+      <TextBlock Classes="hint"
+                 Text="{Binding AlternativeText}"
+                 IsVisible="{Binding HasAlternativeText}"
+                 FontStyle="Italic"
+                 TextAlignment="Center"
+                 TextWrapping="Wrap" />
+    </StackPanel>
+  </Grid>
+</UserControl>

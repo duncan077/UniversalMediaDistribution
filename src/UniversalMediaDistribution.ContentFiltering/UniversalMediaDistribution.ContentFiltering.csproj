@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <!-- Required to expose a memory-mapped ruleset as Memory<byte>. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="UniversalMediaDistribution.ContentFiltering.Tests" />
+    <EmbeddedResource Include="Resources\*.js" />
+  </ItemGroup>
+</Project>

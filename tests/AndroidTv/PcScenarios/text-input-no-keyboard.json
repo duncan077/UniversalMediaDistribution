@@ -1,0 +1,18 @@
+{
+  "name": "text-input-no-keyboard",
+  "defaultDelayMs": 350,
+  "steps": [
+    { "action": "key", "key": "back" },
+    { "action": "key", "key": "left", "assert": { "focusedContains": "HomeNavButton" } },
+    { "action": "key", "key": "down", "repeat": 4, "assert": { "focusedContains": "LiveTvNavButton" } },
+    { "action": "key", "key": "center", "waitMs": 2000 },
+    { "action": "key", "key": "up", "repeat": 2, "assert": { "focusedContains": "LiveTvToolsToggleButton" } },
+    { "name": "expand-filters", "action": "key", "key": "center" },
+    { "name": "search-field", "action": "assert", "assert": { "focusedContains": "LiveTvSearchTextBox" } },
+    { "name": "edit-without-ime", "action": "key", "key": "center", "waitMs": 50, "assert": { "focusedContains": "LiveTvSearchTextBox" } },
+    { "name": "up-escapes-edit", "action": "key", "key": "up", "screenshot": true, "assert": { "focusedContains": "LiveTvToolsToggleButton" } },
+    { "name": "back-to-search", "action": "key", "key": "down", "rememberFocus": "search", "assert": { "focusedContains": "LiveTvSearchTextBox" } },
+    { "name": "edit-again", "action": "key", "key": "center", "waitMs": 50 },
+    { "name": "down-escapes-edit", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedDifferentFrom": "search" } }
+  ]
+}

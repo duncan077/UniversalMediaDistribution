@@ -1,0 +1,10 @@
+{
+  "name": "universal-media-catalog-capture",
+  "version": "1.2.1",
+  "private": true,
+  "description": "Browser extension for capturing catalog metadata and ordered images.",
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/validate-extension.mjs"
+  }
+}

@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <!-- Kept off until the authorized background-player workflow is ready to
+         be exposed. Projects remove its implementation at compile time, so
+         release packages carry none of its browser or script code. -->
+    <UmdEnableBackgroundWebVideoPlayback
+        Condition="'$(UmdEnableBackgroundWebVideoPlayback)' == ''">false</UmdEnableBackgroundWebVideoPlayback>
+  </PropertyGroup>
+</Project>

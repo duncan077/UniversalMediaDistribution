@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UMD · Estado del servidor</title>
+  <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div><p class="eyebrow">Universal Media Distribution</p><h1>Estado del servidor</h1></div>
+    <span id="connection" class="badge">Sin conectar</span>
+  </header>
+  <main>
+    <p id="error" role="alert" hidden></p>
+    <section id="signin" class="login panel">
+      <h2>Acceso administrativo</h2>
+      <p>Ingresa la clave administrativa del servidor para consultar estadísticas, logs y ejecutar el scraper.</p>
+      <form id="login">
+        <label for="token">Clave administrativa</label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+        <button id="connect" type="submit">Conectar</button>
+      </form>
+      <p class="muted">La clave se mantiene en memoria mientras esta página está abierta.</p>
+    </section>
+    <div id="dashboard" hidden>
+      <div class="toolbar">
+        <p id="updated" class="muted" aria-live="polite">Cargando datos…</p>
+        <div class="actions">
+          <label class="check"><input id="automatic" type="checkbox" checked> Actualizar automáticamente</label>
+          <button id="refresh" type="button">Actualizar</button>
+          <button id="logout" type="button" class="secondary">Salir</button>
+        </div>
+      </div>
+      <section class="panel">
+        <h2>Ejecutar scraper</h2>
+        <p class="muted">Actualiza un proveedor o todos los habilitados sin cron. Continúa en segundo plano aunque cierres esta página, respetando el intervalo guardado de cada proveedor, hasta vaciar la cola o alcanzar el tiempo máximo de ejecución.</p>
+        <form id="crawl-form" class="actions">
+          <label>Proveedor <select id="crawl-provider"><option value="">Todos los habilitados</option></select></label>
+          <label class="check"><input id="crawl-retry" type="checkbox"> Reintentar fallos pendientes</label>
+          <button id="crawl-start" type="submit">Ejecutar scraper</button>
+        </form>
+        <p class="muted">Los tiempos de espera por límites del proveedor se respetan incluso al reintentar. Solo puede haber una ejecución a la vez.</p>
+        <p id="crawl-message" role="status" aria-live="polite"></p>
+      </section>
+      <section class="stats" aria-label="Resumen del servidor">
+        <article class="panel"><h2>Títulos en catálogo</h2><p id="catalog-count" class="value">—</p><p id="catalog-date" class="muted">—</p></article>
+        <article class="panel"><h2>Scraper</h2><p id="crawl-state" class="value">—</p><p id="crawl-date" class="muted">—</p></article>
+        <article class="panel"><h2>Proveedores con incidencias</h2><p id="failure-count" class="value">—</p><p id="failed-titles" class="muted">—</p></article>
+        <article class="panel"><h2>Trabajo pendiente</h2><p id="due-count" class="value">—</p><p class="muted">Títulos listos para revisar o reintentar</p></article>
+        <article class="panel"><h2>Servidor</h2><p id="uptime" class="value">—</p><p id="memory" class="muted">—</p></article>
+        <article class="panel"><h2>Base de datos</h2><p id="database-size" class="value">—</p><p id="requests" class="muted">—</p></article>
+      </section>
+      <p id="schedule" class="notice" hidden></p>
+      <section class="panel">
+        <div class="section-title"><h2>Proveedores</h2><p class="muted">Selecciona un proveedor para ver sus logs.</p></div>
+        <p class="muted">Intervalo mínimo entre acciones y peticiones: de 1 a 60 segundos por proveedor (inicialmente 2). Guarda cada cambio; se aplicará desde la próxima ejecución manual o automática. Los límites de espera del sitio siguen teniendo prioridad.</p>
+        <p id="interval-message" role="status" aria-live="polite"></p>
+        <div class="table-scroll" tabindex="0" aria-label="Estado de los proveedores">
+          <table>
+            <thead><tr><th>Proveedor</th><th>Estado</th><th>Descubiertos / cargados</th><th>Pendientes / fallidos</th><th>Catálogo inicial</th><th>Intervalo (s)</th><th>Último intento</th><th>Último éxito</th><th>Próximo reintento</th></tr></thead>
+            <tbody id="providers"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Últimas ejecuciones</h2>
+        <p id="no-runs" class="muted" hidden>Todavía no hay ejecuciones registradas.</p>
+        <div class="table-scroll" tabindex="0" aria-label="Historial del scraper">
+          <table>
+            <thead><tr><th>Inicio</th><th>Estado</th><th>Duración</th><th>Títulos actualizados</th><th>Fallos</th></tr></thead>
+            <tbody id="runs"></tbody>
+          </table>
+        </div>
+      </section>
+      <section id="log-section" class="panel">
+        <div class="section-title">
+          <h2>Logs de fallos</h2>
+          <div class="actions">
+            <label>Proveedor <select id="provider-filter"><option value="">Todos / servidor</option></select></label>
+            <label>Nivel <select id="level-filter"><option value="error">Errores</option></select></label>
+          </div>
+        </div>
+        <p class="muted">Solo se guardan fallos del scraper y del servidor. Se eliminan automáticamente al cumplir 24 horas, con un máximo de 10.000 errores. Limpieza al iniciar y cada minuto.</p>
+        <p id="no-logs" class="muted" hidden>No hay eventos para estos filtros.</p>
+        <div class="table-scroll" tabindex="0" aria-label="Eventos recientes">
+          <table class="logs">
+            <thead><tr><th>Fecha</th><th>Nivel</th><th>Proveedor / origen</th><th>Etapa</th><th>Resultado</th><th>Detalle</th></tr></thead>
+            <tbody id="logs"></tbody>
+          </table>
+        </div>
+        <button id="older" type="button" class="secondary" hidden>Cargar eventos anteriores</button>
+      </section>
+      <p class="footer muted">Las fechas se muestran en tu hora local. Las estadísticas HTTP y de memoria corresponden al proceso actual; el historial del scraper se conserva entre reinicios.</p>
+    </div>
+  </main>
+</body>
+</html>

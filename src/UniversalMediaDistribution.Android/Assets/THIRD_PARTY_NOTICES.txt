@@ -1,0 +1,18 @@
+Android playback components
+
+LibVLCSharp 3.10.0
+Copyright its respective VideoLAN and LibVLCSharp contributors.
+License: LGPL-2.1-or-later
+Source: https://code.videolan.org/videolan/LibVLCSharp
+Package: https://www.nuget.org/packages/LibVLCSharp/3.10.0
+
+VideoLAN.LibVLC.Android 3.6.5
+Copyright its respective VideoLAN and VLC contributors.
+License: LGPL-2.1-or-later
+Source and build packaging: https://code.videolan.org/videolan/libvlc-nuget
+VLC source: https://code.videolan.org/videolan/vlc
+Package: https://www.nuget.org/packages/VideoLAN.LibVLC.Android/3.6.5
+
+License text: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+Redistributors must retain upstream notices and comply with the applicable
+licenses, including source and relinking requirements where applicable.

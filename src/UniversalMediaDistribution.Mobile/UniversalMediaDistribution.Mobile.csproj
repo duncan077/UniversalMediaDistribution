@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UniversalMediaDistribution.Catalog.Sqlite\UniversalMediaDistribution.Catalog.Sqlite.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Metadata\UniversalMediaDistribution.Metadata.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Ingestion\UniversalMediaDistribution.Torrenting.Ingestion.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.MonoTorrent\UniversalMediaDistribution.Torrenting.MonoTorrent.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.UI\UniversalMediaDistribution.UI.csproj" />
+  </ItemGroup>
+</Project>

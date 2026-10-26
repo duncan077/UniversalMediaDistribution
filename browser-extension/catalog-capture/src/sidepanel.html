@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Catalog capture</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="header">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span>
+          <span></span>
+        </div>
+        <div>
+          <p class="eyebrow">Universal Media</p>
+          <h1>Catalog capture</h1>
+        </div>
+        <span id="connectionBadge" class="badge">Connecting</span>
+      </header>
+
+      <p id="pageName" class="page-name">Reading the current page…</p>
+
+      <section class="capture-card" aria-labelledby="metadataHeading">
+        <div class="section-heading">
+          <div>
+            <p class="step">Step 1</p>
+            <h2 id="metadataHeading">Pick metadata</h2>
+          </div>
+          <span class="section-note">Click a field, then a page element</span>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="titleValue">Title</label>
+            <button class="pick-button" type="button" data-picker="title">
+              Pick element
+            </button>
+          </div>
+          <input
+            id="titleValue"
+            data-field="title"
+            type="text"
+            autocomplete="off"
+            placeholder="No title captured"
+          />
+          <p id="titleSelector" class="selector">Not selected</p>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="categoryValue">Category</label>
+            <button class="pick-button" type="button" data-picker="category">
+              Pick element
+            </button>
+          </div>
+          <input
+            id="categoryValue"
+            data-field="category"
+            type="text"
+            autocomplete="off"
+            placeholder="No category captured"
+          />
+          <p id="categorySelector" class="selector">Not selected</p>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="chapterNumberValue">Chapter number</label>
+            <button class="pick-button" type="button" data-picker="chapterNumber">
+              Pick element
+            </button>
+          </div>
+          <input
+            id="chapterNumberValue"
+            data-field="chapterNumber"
+            type="text"
+            autocomplete="off"
+            placeholder="For example: 12"
+          />
+          <p id="chapterNumberSelector" class="selector">Not selected</p>
+        </div>
+
+        <div class="field-group">
+          <div class="label-row">
+            <label for="descriptionValue">Description</label>
+            <button class="pick-button" type="button" data-picker="description">
+              Pick element
+            </button>
+          </div>
+          <textarea
+            id="descriptionValue"
+            data-field="description"
+            rows="3"
+            placeholder="No description captured"
+          ></textarea>
+          <p id="descriptionSelector" class="selector">Not selected</p>
+        </div>
+      </section>
+
+      <section class="capture-card" aria-labelledby="imagesHeading">
+        <div class="section-heading">
+          <div>
+            <p class="step">Step 2</p>
+            <h2 id="imagesHeading">Pick an image list</h2>
+          </div>
+          <div class="heading-actions">
+            <button id="clearImagesButton" class="text-button" type="button">
+              Clear images
+            </button>
+            <span id="imageCount" class="count">0 images</span>
+          </div>
+        </div>
+
+        <button
+          id="pickImagesButton"
+          class="list-picker"
+          type="button"
+          data-picker="images"
+        >
+          <span class="list-icon" aria-hidden="true">▦</span>
+          <span>
+            <strong>Add image list from page</strong>
+            <small>Images are appended in page order and retained across navigation.</small>
+          </span>
+        </button>
+
+        <p id="imageSelector" class="selector">No lists selected</p>
+        <ol id="imagePreview" class="image-preview" aria-live="polite"></ol>
+      </section>
+
+      <section class="capture-card" aria-labelledby="umdHeading">
+        <div class="section-heading">
+          <div>
+            <p class="step">Step 3</p>
+            <h2 id="umdHeading">UMD info.json</h2>
+          </div>
+          <span class="section-note">Bound to the active torrent during import</span>
+        </div>
+
+        <p class="field-help">
+          No magnet or info hash is embedded. UMD binds this manifest to the
+          torrent that contains it, avoiding a self-referential torrent hash.
+        </p>
+
+        <label class="checkbox-row" for="isPrivateValue">
+          <input
+            id="isPrivateValue"
+            data-setting="isPrivate"
+            type="checkbox"
+          />
+          <span>
+            <strong>Private torrent</strong>
+            <small>Marks the generated UMD torrent source as private.</small>
+          </span>
+        </label>
+
+        <div class="generated-path">
+          <span>Image folder inside capture</span>
+          <code id="imageDirectory">chapters/chapter</code>
+        </div>
+        <p id="downloadRequirements" class="requirements"></p>
+      </section>
+
+      <div id="statusMessage" class="status-message" role="status" hidden></div>
+
+      <footer class="actions">
+        <button id="clearButton" class="secondary-button" type="button">
+          Clear
+        </button>
+        <button id="copyButton" class="secondary-button" type="button">
+          Copy JSON
+        </button>
+        <button id="downloadButton" class="primary-button" type="button">
+          Download capture
+        </button>
+      </footer>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

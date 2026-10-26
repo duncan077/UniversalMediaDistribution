@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh UMD catalog metadata once every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+Unit=umd-catalog-crawler.service
+
+[Install]
+WantedBy=timers.target

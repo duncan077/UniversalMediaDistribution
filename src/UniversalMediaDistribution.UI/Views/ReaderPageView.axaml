@@ -1,0 +1,67 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:UniversalMediaDistribution.UI.ViewModels"
+             x:Class="UniversalMediaDistribution.UI.Views.ReaderPageView"
+             x:DataType="vm:ReaderPageViewModel"
+             d:DesignWidth="900"
+             d:DesignHeight="1100"
+             Width="{Binding DisplayWidth}"
+             HorizontalAlignment="Center"
+             UseLayoutRounding="True"
+             mc:Ignorable="d">
+  <Grid Background="{StaticResource ReaderCanvasBrush}"
+        MinHeight="{Binding PlaceholderHeight}"
+        ClipToBounds="True">
+    <Image Source="{Binding Image}"
+           AutomationProperties.Name="{Binding PageLabel}"
+           Stretch="Uniform"
+           Margin="0"
+           HorizontalAlignment="Center" />
+    <ProgressBar Width="150"
+                 AutomationProperties.Name="{DynamicResource BusyLabel}"
+                 IsIndeterminate="{Binding IsLoading}"
+                 IsVisible="{Binding IsLoading}"
+                 HorizontalAlignment="Center"
+                 VerticalAlignment="Center" />
+    <Border Background="{StaticResource OverlayBrush}"
+            BorderBrush="{StaticResource DangerBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="{StaticResource RadiusLg}"
+            Padding="20,16"
+            MaxWidth="520"
+            BoxShadow="{StaticResource ShadowSoft}"
+            IsVisible="{Binding !!ErrorMessage}"
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center">
+      <StackPanel Spacing="14">
+        <TextBlock Classes="body"
+                   Text="{Binding ErrorMessage}"
+                   AutomationProperties.Name="{DynamicResource ErrorMessageLabel}"
+                   Foreground="{StaticResource DangerTextBrush}"
+                   TextWrapping="Wrap"
+                   TextAlignment="Center" />
+        <!-- A page that timed out or was refused is usually fine on a second
+             attempt. Without this the only way past one failed page was to
+             leave the chapter and reopen it, which reloads all the others. -->
+        <Button Classes="primary"
+                MinHeight="40"
+                HorizontalAlignment="Center"
+                Content="{DynamicResource RetryPageLoad}"
+                Command="{Binding RetryCommand}"
+                IsVisible="{Binding HasFailed}" />
+      </StackPanel>
+    </Border>
+    <Border Background="{StaticResource ReaderChipBrush}"
+            CornerRadius="999"
+            Padding="11,5"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Top"
+            Margin="12">
+      <TextBlock Text="{Binding PageLabel}"
+                 Foreground="{StaticResource TextPrimaryBrush}"
+                 FontSize="{StaticResource FontSizeCaption}" />
+    </Border>
+  </Grid>
+</UserControl>

@@ -1,0 +1,23 @@
+{
+  "name": "navigation-audit",
+  "description": "Captures focus after representative menu, catalog, card, and Back transitions in the PC TV shell.",
+  "defaultDelayMs": 700,
+  "steps": [
+    { "name": "dismiss-prompt", "action": "key", "key": "back", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "open-menu", "action": "key", "key": "left", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "HomeNavButton" } },
+    { "name": "menu-movies", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "MoviesNavButton" } },
+    { "name": "open-movies-with-missing-release", "action": "key", "key": "center", "omitKeyUp": true, "waitMs": 1400, "screenshot": true, "dumpUi": true, "rememberFocus": "first-card", "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "next-card", "action": "key", "key": "right", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button", "focusedDifferentFrom": "first-card" } },
+    { "name": "next-row", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "previous-row", "action": "key", "key": "up", "screenshot": true, "dumpUi": true, "rememberFocus": "opened-card", "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "open-card", "action": "key", "key": "center", "waitMs": 1000, "screenshot": true, "dumpUi": true, "rememberFocus": "detail-action", "assert": { "focusedContains": "ControlType.Button", "focusedDifferentFrom": "opened-card" } },
+    { "name": "detail-down", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedDifferentFrom": "detail-action" } },
+    { "name": "detail-back", "action": "key", "key": "back", "waitMs": 1200, "screenshot": true, "dumpUi": true, "assert": { "focusedSameAs": "opened-card" } },
+    { "name": "menu-again", "action": "key", "key": "back", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "MoviesNavButton" } },
+    { "name": "menu-anime", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "AnimeNavButton" } },
+    { "name": "open-anime", "action": "key", "key": "center", "waitMs": 1200, "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "ControlType.Button" } },
+    { "name": "open-menu-final", "action": "key", "key": "back", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "AnimeNavButton" } },
+    { "name": "menu-books", "action": "key", "key": "down", "screenshot": true, "dumpUi": true, "assert": { "focusedContains": "BooksNavButton" } },
+    { "name": "open-books", "action": "key", "key": "center", "waitMs": 1200, "screenshot": true, "dumpUi": true, "assert": { "running": true, "uiContains": "Books", "focusedContains": "ControlType.Button" } }
+  ]
+}

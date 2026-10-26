@@ -1,0 +1,34 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/UniversalMediaDistribution.Android/UniversalMediaDistribution.Android.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Application/UniversalMediaDistribution.Application.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Catalog/UniversalMediaDistribution.Catalog.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Catalog.Sqlite/UniversalMediaDistribution.Catalog.Sqlite.csproj" />
+    <Project Path="src/UniversalMediaDistribution.ContentFiltering/UniversalMediaDistribution.ContentFiltering.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Desktop/UniversalMediaDistribution.Desktop.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Domain/UniversalMediaDistribution.Domain.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Metadata/UniversalMediaDistribution.Metadata.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Mobile/UniversalMediaDistribution.Mobile.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Playback.LibVLC/UniversalMediaDistribution.Playback.LibVLC.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Reading.Abstractions/UniversalMediaDistribution.Reading.Abstractions.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Reading.Pdfium/UniversalMediaDistribution.Reading.Pdfium.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Server/UniversalMediaDistribution.Server.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Torrenting.Abstractions/UniversalMediaDistribution.Torrenting.Abstractions.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Torrenting.Ingestion/UniversalMediaDistribution.Torrenting.Ingestion.csproj" />
+    <Project Path="src/UniversalMediaDistribution.Torrenting.MonoTorrent/UniversalMediaDistribution.Torrenting.MonoTorrent.csproj" />
+    <Project Path="src/UniversalMediaDistribution.UI/UniversalMediaDistribution.UI.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/UniversalMediaDistribution.Catalog.Sqlite.Tests/UniversalMediaDistribution.Catalog.Sqlite.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.ContentFiltering.Tests/UniversalMediaDistribution.ContentFiltering.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Domain.Tests/UniversalMediaDistribution.Domain.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Desktop.Tests/UniversalMediaDistribution.Desktop.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Metadata.Tests/UniversalMediaDistribution.Metadata.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Mobile.Tests/UniversalMediaDistribution.Mobile.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Reading.Pdfium.Tests/UniversalMediaDistribution.Reading.Pdfium.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Server.Tests/UniversalMediaDistribution.Server.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Torrenting.Ingestion.Tests/UniversalMediaDistribution.Torrenting.Ingestion.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.Torrenting.MonoTorrent.Tests/UniversalMediaDistribution.Torrenting.MonoTorrent.Tests.csproj" />
+    <Project Path="tests/UniversalMediaDistribution.UI.Tests/UniversalMediaDistribution.UI.Tests.csproj" />
+  </Folder>
+</Solution>

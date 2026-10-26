@@ -1,0 +1,13 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="using:UniversalMediaDistribution.UI.Views"
+        x:Class="UniversalMediaDistribution.UI.Views.MainWindow"
+        Width="1320"
+        Height="860"
+        MinWidth="440"
+        MinHeight="520"
+        Background="{StaticResource BackdropBrush}"
+        Icon="/Assets/app-icon.png"
+        Title="{DynamicResource AppName}">
+  <views:MainView />
+</Window>

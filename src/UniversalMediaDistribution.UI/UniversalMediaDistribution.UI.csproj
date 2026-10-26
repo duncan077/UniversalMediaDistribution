@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+  </PropertyGroup>
+
+  <!--
+    Shared branding. Both files are the Android launcher icon
+    (Resources/mipmap-xhdpi/ic_launcher.png): the PNG is what Avalonia loads
+    for the window and taskbar, the ICO is what the Win32 shell needs for the
+    executable itself and carries every size from 16 to 192.
+  -->
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' != 'true'">
+    <Compile Remove="Playback\BackgroundWebVideoPlayback.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" />
+    <PackageReference Include="Avalonia.Controls.WebView" />
+    <PackageReference Include="Avalonia.Fonts.Inter" />
+    <PackageReference Include="Avalonia.Themes.Fluent" />
+    <PackageReference Include="AvaloniaUI.DiagnosticsSupport">
+      <IncludeAssets Condition="'$(Configuration)' != 'Debug'">None</IncludeAssets>
+      <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UniversalMediaDistribution.Application\UniversalMediaDistribution.Application.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Catalog\UniversalMediaDistribution.Catalog.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.ContentFiltering\UniversalMediaDistribution.ContentFiltering.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Domain\UniversalMediaDistribution.Domain.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Reading.Abstractions\UniversalMediaDistribution.Reading.Abstractions.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Abstractions\UniversalMediaDistribution.Torrenting.Abstractions.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Ingestion\UniversalMediaDistribution.Torrenting.Ingestion.csproj" />
+  </ItemGroup>
+</Project>

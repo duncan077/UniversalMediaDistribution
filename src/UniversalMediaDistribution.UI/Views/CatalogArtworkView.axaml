@@ -1,0 +1,34 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:vm="using:UniversalMediaDistribution.UI.ViewModels"
+             x:Class="UniversalMediaDistribution.UI.Views.CatalogArtworkView"
+             x:DataType="vm:CatalogArtworkViewModel"
+             d:DesignWidth="180"
+             d:DesignHeight="240"
+             mc:Ignorable="d">
+  <Border Background="{StaticResource SurfaceRaisedBrush}"
+          BorderBrush="{StaticResource BorderSubtleBrush}"
+          BorderThickness="1"
+          CornerRadius="{StaticResource RadiusLg}"
+          ClipToBounds="True">
+    <Grid>
+      <TextBlock Text="UMD"
+                 Foreground="{StaticResource TextFaintBrush}"
+                 FontSize="15"
+                 FontWeight="Bold"
+                 HorizontalAlignment="Center"
+                 VerticalAlignment="Center" />
+      <Image Source="{Binding Image}"
+             AutomationProperties.Name="{DynamicResource ArtworkLabel}"
+             Stretch="UniformToFill" />
+      <ProgressBar Width="70"
+                   AutomationProperties.Name="{DynamicResource BusyLabel}"
+                   IsIndeterminate="{Binding IsLoading}"
+                   IsVisible="{Binding IsLoading}"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center" />
+    </Grid>
+  </Border>
+</UserControl>

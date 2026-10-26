@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Media Catalog Capture",
+  "version": "1.2.1",
+  "minimum_chrome_version": "114",
+  "description": "Pick catalog metadata and ordered image lists from a web page.",
+  "permissions": [
+    "downloads",
+    "scripting",
+    "sidePanel",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "Open catalog capture"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "src/shared.js",
+        "src/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

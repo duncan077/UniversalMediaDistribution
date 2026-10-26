@@ -1,0 +1,134 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- net11.0 so every head compiles against the same runtime the Android
+         one needs for its NativeAOT packs. -->
+    <TargetFramework>net11.0</TargetFramework>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!--
+      The same artwork Android ships as its launcher icon, so the executable
+      in Explorer, the taskbar and the installer all match the phone and TV
+      builds. Kept with the shared UI assets rather than copied here.
+    -->
+    <ApplicationIcon>..\UniversalMediaDistribution.UI\Assets\app-icon.ico</ApplicationIcon>
+    <!-- Required by the source-generated COM interop that reaches WebView2. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Native AOT. Only takes effect when publishing with a runtime
+         identifier; a plain build just gains the trim and AOT analyzers. The
+         WebView2 interop here is source-generated rather than built-in COM,
+         which is the form AOT supports, and Avalonia 12 no longer needs
+         BuiltInComInteropSupport switched off.
+
+         It compiles through the host's own native toolchain, so it cannot
+         cross compile to another operating system. The release scripts build
+         Linux inside a matching Linux container with PublishAot=true, even
+         when invoked from Windows. Direct publishes only enable AOT when the
+         target operating system matches the build host.
+
+         LibVLC playback readiness is read directly from the native player
+         state rather than inferred from its managed Playing/Error events.
+         This keeps startup, resume and failure handling deterministic in both
+         JIT and NativeAOT builds and avoids re-entering libVLC from its event
+         thread. The trim surface is clean apart from Mono.Nat. -->
+    <PublishAot>false</PublishAot>
+    <PublishAot
+        Condition="'$(RuntimeIdentifier)' == ''">true</PublishAot>
+    <PublishAot
+        Condition="'$(OS)' == 'Windows_NT' and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-'))">true</PublishAot>
+    <PublishAot
+        Condition="'$(OS)' != 'Windows_NT' and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('linux-'))">true</PublishAot>
+    <PublishAot
+        Condition="'$(OS)' != 'Windows_NT' and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('osx-'))">true</PublishAot>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <DebugType Condition="'$(Configuration)' == 'Release'">None</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' == 'true'">
+    <DefineConstants>$(DefineConstants);UMD_BACKGROUND_WEB_VIDEO</DefineConstants>
+  </PropertyGroup>
+
+  <!--
+    Only the public release-verification key is embedded. The private signing
+    key never enters the build output. Environment variables can still
+    override these values for development and self-hosted deployments.
+  -->
+  <ItemGroup>
+    <AssemblyMetadata
+        Include="UMD_UPDATE_SIGNING_KEY_ID"
+        Value="$(UmdUpdateSigningKeyId)"
+        Condition="'$(UmdUpdateSigningKeyId)' != ''" />
+    <AssemblyMetadata
+        Include="UMD_UPDATE_SIGNING_PUBLIC_KEY"
+        Value="$(UmdUpdateSigningPublicKey)"
+        Condition="'$(UmdUpdateSigningPublicKey)' != ''" />
+    <AssemblyMetadata
+        Include="UMD_UPDATE_SERVICE_URL"
+        Value="$(UmdUpdateServiceUrl)"
+        Condition="'$(UmdUpdateServiceUrl)' != ''" />
+    <AssemblyMetadata
+        Include="UMD_UPDATE_CHANNEL"
+        Value="$(UmdUpdateChannel)"
+        Condition="'$(UmdUpdateChannel)' != ''" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Desktop" />
+    <PackageReference Include="Avalonia.Controls.WebView" />
+    <PackageReference
+        Include="VideoLAN.LibVLC.Windows"
+        Condition="('$(RuntimeIdentifier)' == '' and '$(OS)' == 'Windows_NT') or $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-'))" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UmdEnableBackgroundWebVideoPlayback)' != 'true'">
+    <Compile Remove="Web\DesktopBackgroundWebVideoPlayer.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\UniversalMediaDistribution.Catalog\UniversalMediaDistribution.Catalog.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Catalog.Sqlite\UniversalMediaDistribution.Catalog.Sqlite.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Metadata\UniversalMediaDistribution.Metadata.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Playback.LibVLC\UniversalMediaDistribution.Playback.LibVLC.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Reading.Pdfium\UniversalMediaDistribution.Reading.Pdfium.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Ingestion\UniversalMediaDistribution.Torrenting.Ingestion.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.MonoTorrent\UniversalMediaDistribution.Torrenting.MonoTorrent.csproj" />
+    <ProjectReference Include="..\UniversalMediaDistribution.UI\UniversalMediaDistribution.UI.csproj" />
+  </ItemGroup>
+
+  <!--
+    VideoLAN.LibVLC.Windows ships all Windows CPU architectures in one
+    package, and Skia/HarfBuzz ship large native PDBs. A runtime-specific
+    release can use only its matching VLC directory; symbol files are not
+    needed for execution and are retained by normal Debug builds.
+  -->
+  <Target
+      Name="OptimizePublishedDesktopPayload"
+      AfterTargets="Publish"
+      Condition="'$(Configuration)' == 'Release'">
+    <ItemGroup>
+      <_PublishedSymbols Include="$(PublishDir)**\*.pdb" />
+      <_UnusedVlcX64
+          Include="$(PublishDir)libvlc\win-x64\**\*"
+          Condition="'$(RuntimeIdentifier)' != 'win-x64'" />
+      <_UnusedVlcX86
+          Include="$(PublishDir)libvlc\win-x86\**\*"
+          Condition="'$(RuntimeIdentifier)' != 'win-x86'" />
+      <_UnusedVlcArm64
+          Include="$(PublishDir)libvlc\win-arm64\**\*"
+          Condition="'$(RuntimeIdentifier)' != 'win-arm64'" />
+    </ItemGroup>
+    <Delete Files="@(_PublishedSymbols)" />
+    <Delete Files="@(_UnusedVlcX64)" />
+    <Delete Files="@(_UnusedVlcX86)" />
+    <Delete Files="@(_UnusedVlcArm64)" />
+    <RemoveDir
+        Directories="$(PublishDir)libvlc\win-x64"
+        Condition="'$(RuntimeIdentifier)' != 'win-x64' and Exists('$(PublishDir)libvlc\win-x64')" />
+    <RemoveDir
+        Directories="$(PublishDir)libvlc\win-x86"
+        Condition="'$(RuntimeIdentifier)' != 'win-x86' and Exists('$(PublishDir)libvlc\win-x86')" />
+    <RemoveDir
+        Directories="$(PublishDir)libvlc\win-arm64"
+        Condition="'$(RuntimeIdentifier)' != 'win-arm64' and Exists('$(PublishDir)libvlc\win-arm64')" />
+  </Target>
+</Project>
