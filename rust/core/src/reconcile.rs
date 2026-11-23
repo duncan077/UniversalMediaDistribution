@@ -216,6 +216,25 @@ impl Titles {
             return Ok(None);
         }
         let Some(title) = self.names.get(&key) else {
+            if let Some(matched) = self.resolve_by_name(reference) {
+                let mut resolved = matched;
+                let mut seen_name = HashSet::new();
+                while let Some(next) = self.redirects.get(&resolved) {
+                    if !seen_name.insert(resolved) {
+                        return Err(invalid("El respaldo tiene redirecciones circulares."));
+                    }
+                    resolved = *next;
+                }
+                if self.deleted.contains(&resolved) {
+                    return Ok(None);
+                }
+                if let Some(found) = self.names.get(&resolved) {
+                    for field in ["itemId", "mediaType", "name", "subtype"] {
+                        reference[field] = found[field].clone();
+                    }
+                    return Ok(Some(CanonicalRef::Item(resolved)));
+                }
+            }
             if allow_missing {
                 reference["itemId"] = json!(key);
                 return Ok(Some(CanonicalRef::Item(key)));

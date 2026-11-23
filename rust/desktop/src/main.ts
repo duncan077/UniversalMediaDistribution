@@ -5,7 +5,7 @@ import {invoke} from "./bridge";
 import "@fontsource-variable/archivo/wdth.css";
 import "./style.css";
 import {contentControls, flushProgress, formatTime, playDownload} from "./player";
-import {remoteUrl, safeMediaClass} from "./safety";
+import {remoteUrl, safeEpubImage, safeMediaClass} from "./safety";
 import {setupDownloads} from "./downloads";
 import {setupAccount} from "./account";
 import {setupProvider, hiddenTitle} from "./provider";
@@ -96,13 +96,17 @@ let resumeRequest = 0;
 let featured: CatalogItem | null = null;
 let featuredUnit: ContentUnit | undefined;
 
-// Abort controller for active Detail page async work
+// Abort controller & active context for Detail page async work
 let detailAbort: AbortController | null = null;
 let detailSequence = 0;
+let currentDetail: { id: string; unit?: ContentUnit; onlineServer?: string } | null = null;
+const itemRefreshTimes = new Map<string, number>();
+const artworkProxyCache = new Map<string, Promise<string | null>>();
 
 onPageLeave("detail", () => {
   detailAbort?.abort();
   detailAbort = null;
+  currentDetail = null;
   setTimeout(() => void flushProgress().then(refreshContinue).catch(() => {}), 0);
 });
 
@@ -186,9 +190,10 @@ function renderFeature() {
   if (url) {
     const img = node("img");
     img.alt = "";
-    img.referrerPolicy = "no-referrer";
-    img.onerror = () => { img.remove(); hero.classList.remove("has-art"); };
-    img.src = url;
+    attachArtworkImage(img, url, Object.keys(featured?.onlineProviders ?? {}), () => {
+      img.remove();
+      hero.classList.remove("has-art");
+    });
     art.append(img);
   }
   element("feature-label").textContent = latest ? ui("Continuar") : featured ? mediaLabel(featured) : ui("Tu biblioteca");
@@ -343,6 +348,7 @@ async function load(append = false) {
     const shown = append ? items.length : 0;
     items = append ? [...items, ...page.document.items] : page.document.items;
     favorites = new Set(page.favoriteIds);
+    syncAllFavoriteButtons();
     cursor = page.continuationToken;
     element("result-count").textContent = `${page.total} ${page.total === 1 ? ui("título") : ui("títulos")}`;
     syncFilterCount();
@@ -361,7 +367,58 @@ async function load(append = false) {
 }
 
 function safeImage(value: unknown): string | null {
-  return remoteUrl(value);
+  const remote = remoteUrl(value);
+  if (remote) return remote;
+  const embedded = safeEpubImage(value);
+  if (embedded) return embedded;
+  if (typeof value === "string" && serverAddress) {
+    const trimmed = value.trim();
+    if (trimmed && !trimmed.startsWith("//") && !trimmed.includes("\\") && !trimmed.split("/").includes("..")) {
+      try {
+        const resolved = new URL(trimmed, serverAddress);
+        if ((resolved.protocol === "http:" || resolved.protocol === "https:") && !resolved.username && !resolved.password) {
+          return resolved.href;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function loadProxiedArtwork(url: string, providers: string[]): Promise<string | null> {
+  const key = `${url}\n${providers.slice().sort().join(",")}`;
+  const cached = artworkProxyCache.get(key);
+  if (cached) return cached;
+  const pending = invoke<string>("fetch_artwork", { url, providers })
+    .then(dataUrl => safeEpubImage(dataUrl))
+    .catch(() => null);
+  artworkProxyCache.set(key, pending);
+  if (artworkProxyCache.size > 256) {
+    const first = artworkProxyCache.keys().next().value;
+    if (first !== undefined) artworkProxyCache.delete(first);
+  }
+  return pending;
+}
+
+function attachArtworkImage(img: HTMLImageElement, url: string, providers: string[], onExhausted: () => void) {
+  img.decoding = "async";
+  img.referrerPolicy = "no-referrer";
+  if (url.startsWith("data:")) {
+    img.addEventListener("error", onExhausted, { once: true });
+    img.src = url;
+    return;
+  }
+  img.addEventListener("error", () => {
+    void loadProxiedArtwork(url, providers).then(proxied => {
+      if (!img.isConnected) return;
+      if (!proxied) { onExhausted(); return; }
+      img.addEventListener("error", onExhausted, { once: true });
+      img.src = proxied;
+    });
+  }, { once: true });
+  img.src = url;
 }
 
 function tone(item: CatalogItem) {
@@ -375,12 +432,9 @@ function artwork(item: CatalogItem, showBadge = false) {
   const url = safeImage(item.thumbnailRef);
   if (url) {
     const image = node("img");
-    image.src = url;
     image.alt = "";
     image.loading = "lazy";
-    image.decoding = "async";
-    image.referrerPolicy = "no-referrer";
-    image.addEventListener("error", () => image.remove(), { once: true });
+    attachArtworkImage(image, url, Object.keys(item.onlineProviders ?? {}), () => image.remove());
     cover.append(image);
   }
   if (showBadge) {
@@ -409,23 +463,33 @@ function statusLabel(raw: string | null | undefined): string {
   }
 }
 
-function syncFavoriteButton(button: HTMLButtonElement, item: CatalogItem, withText = false) {
-  const enabled = favorites.has(item.syncId);
+function syncFavoriteButton(button: HTMLButtonElement, title: string, id: string, withText = false) {
+  const enabled = favorites.has(id);
   button.dataset.icon = enabled ? "heart-filled" : "heart";
   button.classList.toggle("selected", enabled);
   if (withText) {
     button.textContent = enabled ? ui("En favoritos") : ui("Agregar a favoritos");
   }
-  button.setAttribute("aria-label", enabled ? ui("Quitar {0} de favoritos", displayTitle(item)) : ui("Agregar {0} a favoritos", displayTitle(item)));
+  button.setAttribute("aria-label", enabled ? ui("Quitar {0} de favoritos", title) : ui("Agregar {0} a favoritos", title));
   button.setAttribute("aria-pressed", String(enabled));
+}
+
+function syncAllFavoriteButtons() {
+  for (const control of document.querySelectorAll<HTMLButtonElement>("button[data-favorite-id]")) {
+    const id = control.dataset.favoriteId;
+    if (!id) continue;
+    syncFavoriteButton(control, control.dataset.favoriteTitle ?? "", id, control.dataset.withText === "true");
+  }
 }
 
 function favoriteButton(item: CatalogItem, withText = false) {
   const button = node("button", undefined, withText ? "favorite-pill" : "favorite");
+  const title = displayTitle(item);
   button.type = "button";
   button.dataset.favoriteId = item.syncId;
+  button.dataset.favoriteTitle = title;
   if (withText) button.dataset.withText = "true";
-  syncFavoriteButton(button, item, withText);
+  syncFavoriteButton(button, title, item.syncId, withText);
   button.addEventListener("click", async () => {
     const nextEnabled = !favorites.has(item.syncId);
     button.disabled = true;
@@ -434,7 +498,7 @@ function favoriteButton(item: CatalogItem, withText = false) {
       if (nextEnabled) favorites.add(item.syncId); else favorites.delete(item.syncId);
       for (const control of document.querySelectorAll<HTMLButtonElement>("button[data-favorite-id]")) {
         if (control.dataset.favoriteId === item.syncId) {
-          syncFavoriteButton(control, item, control.dataset.withText === "true");
+          syncFavoriteButton(control, title, item.syncId, control.dataset.withText === "true");
         }
       }
       window.dispatchEvent(new Event("umd-profile-changed"));
@@ -762,25 +826,86 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
 
   const content = element("detail");
   content.dataset.tone = tone(item);
+  currentDetail = { id: item.syncId, unit, onlineServer };
 
-  // Top Back bar (Avalonia DetailsBackButton)
+  // Top Back bar (Avalonia DetailsBackButton + Refresh)
   const topBar = node("div", undefined, "detail-topbar");
   const backBtn = node("button", "← " + ui("Volver"), "quiet-btn detail-back-btn");
   backBtn.type = "button";
   backBtn.onclick = () => goBack();
   topBar.append(backBtn);
 
+  const feedback = node("p", undefined, "detail-feedback");
+  feedback.setAttribute("role", "status");
+
+  interface RefreshItemResult {
+    item: CatalogItem;
+    changed: boolean;
+    sourcesChecked: string[];
+    errors: string[];
+  }
+
+  let refreshBtn: HTMLButtonElement | null = null;
+  if (!onlineServer) {
+    const topActions = node("div", undefined, "detail-topbar-actions");
+    refreshBtn = node("button", ui("Actualizar"), "quiet-btn detail-refresh-btn");
+    refreshBtn.type = "button";
+    refreshBtn.onclick = async () => {
+      if (!refreshBtn) return;
+      refreshBtn.disabled = true;
+      feedback.classList.remove("error");
+      feedback.textContent = ui("Actualizando ficha…");
+      try {
+        const res = await invoke<RefreshItemResult>("refresh_item", {
+          id: item.syncId,
+          hideAdult: hideAdult(),
+          discover: true,
+        });
+        itemRefreshTimes.set(item.syncId, Date.now());
+        if (seq !== detailSequence || signal.aborted) return;
+        if (res.changed) {
+          await load();
+          void refreshContinue().catch(() => {});
+          if (seq === detailSequence && !signal.aborted && isPageActive("detail")) {
+            await showDetails(res.item, unit);
+            const activeFeedback = element("detail").querySelector<HTMLElement>(".detail-feedback");
+            if (activeFeedback) {
+              activeFeedback.classList.remove("error");
+              activeFeedback.textContent = ui("Ficha actualizada.");
+            }
+          }
+          return;
+        }
+        if (res.sourcesChecked.length > 0) {
+          feedback.textContent = ui("La ficha ya está al día.");
+        } else if (res.errors.length > 0) {
+          feedback.textContent = ui("No se pudo actualizar la ficha.");
+          feedback.classList.add("error");
+        } else {
+          feedback.textContent = ui("No se encontraron cambios nuevos.");
+        }
+      } catch (err) {
+        if (seq === detailSequence && !signal.aborted) {
+          feedback.textContent = String(err);
+          feedback.classList.add("error");
+        }
+      } finally {
+        if (refreshBtn && refreshBtn.isConnected) refreshBtn.disabled = false;
+      }
+    };
+    topActions.append(refreshBtn);
+    topBar.append(topActions);
+  }
+
   // Cinematic Hero Banner (Avalonia DetailsBackdropHost + Poster + Info + Primary CTA)
   const hero = node("section", undefined, "detail-hero-banner");
-  const posterUrl = safeImage(item.thumbnailRef);
-  if (posterUrl) {
+  const backdropUrl = safeImage((item.backdropRef as string | null | undefined) || item.thumbnailRef);
+  if (backdropUrl) {
     const backdrop = node("div", undefined, "detail-backdrop");
     backdrop.setAttribute("aria-hidden", "true");
     const bgImg = node("img");
-    bgImg.src = posterUrl;
     bgImg.alt = "";
-    bgImg.referrerPolicy = "no-referrer";
-    bgImg.onerror = () => backdrop.remove();
+    attachArtworkImage(bgImg, backdropUrl, Object.keys(item.onlineProviders ?? {}), () => backdrop.remove());
     backdrop.append(bgImg);
     hero.append(backdrop);
   }
@@ -894,8 +1019,6 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   hero.append(heroGrid);
 
   const body = node("div", undefined, "detail-body");
-  const feedback = node("p", undefined, "detail-feedback");
-  feedback.setAttribute("role", "status");
 
   if (onlineServer) {
     const saveBtn = node("button", ui("Agregar a mi biblioteca"), "primary");
@@ -1004,6 +1127,28 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   requestAnimationFrame(() => {
     more.hidden = description.scrollHeight <= description.clientHeight + 1;
   });
+
+  // Quietly refresh chapters, metadata, and artwork in the background (throttled per item)
+  if (!onlineServer) {
+    const lastRefresh = itemRefreshTimes.get(item.syncId) ?? 0;
+    const hasProviders = Object.keys(item.onlineProviders ?? {}).length > 0;
+    const needsArtwork = !safeImage(item.thumbnailRef);
+    if (Date.now() - lastRefresh > 5 * 60_000 && (serverAddress || hasProviders || needsArtwork)) {
+      itemRefreshTimes.set(item.syncId, Date.now());
+      void invoke<RefreshItemResult>("refresh_item", {
+        id: item.syncId,
+        hideAdult: hideAdult(),
+        discover: !hasProviders && needsArtwork,
+      }).then(async res => {
+        if (!res.changed) return;
+        await load();
+        void refreshContinue().catch(() => {});
+        if (seq === detailSequence && !signal.aborted && isPageActive("detail")) {
+          void showDetails(res.item, unit);
+        }
+      }).catch(() => {});
+    }
+  }
 }
 
 async function importCatalog() {
@@ -1178,6 +1323,15 @@ setupAccount(async () => {
   await load();
   void refreshContinue().catch(() => {});
   void refreshListFilterOptions();
+  if (isPageActive("detail") && currentDetail && !currentDetail.onlineServer) {
+    const { id, unit } = currentDetail;
+    try {
+      const fresh = await invoke<CatalogItem>("library_item", { id });
+      if (isPageActive("detail") && currentDetail?.id === id) {
+        void showDetails(fresh, unit);
+      }
+    } catch { /* Item may have been removed by sync */ }
+  }
 }, status);
 setupNavigation();
 setupProfiles();

@@ -363,6 +363,105 @@ impl CatalogStore {
         self.store_provider_title(provider, external, item, true, Some((id, key)))
             .map(|_| ())
     }
+    pub fn item_bindings(&self, id: Uuid) -> Result<Vec<(String, String)>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut stmt = db.prepare(
+            "SELECT provider, external FROM rust_crawl_bindings WHERE item_id=?1 ORDER BY provider",
+        )?;
+        let rows = stmt
+            .query_map([id.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+    /// Merge updated metadata, chapters, seasons, and artwork from a connected server
+    /// into a local catalog entry without discarding local sources, provider links, or
+    /// existing artwork when the server response omits them.
+    pub fn merge_remote_item(
+        &self,
+        id: Uuid,
+        incoming: CatalogItem,
+    ) -> Result<(CatalogItem, bool)> {
+        if incoming.deleted {
+            return Err(Error::Invalid("Título eliminado".into()));
+        }
+        let server_art: Vec<(String, Value)> = ["thumbnailRef", "backdropRef"]
+            .into_iter()
+            .filter_map(|key| {
+                let raw = incoming.metadata.get(key)?.as_str()?.trim();
+                if raw.is_empty() || raw.len() > 2048 || raw.chars().any(char::is_control) {
+                    return None;
+                }
+                let allowed = if let Ok(url) = url::Url::parse(raw) {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.host_str().is_some()
+                } else {
+                    !raw.starts_with("//")
+                        && !raw.contains('\\')
+                        && !raw.split('/').any(|seg| seg == "..")
+                        && !raw
+                            .trim_start_matches('/')
+                            .split('/')
+                            .next()
+                            .unwrap_or("")
+                            .contains(':')
+                };
+                allowed.then(|| (key.to_owned(), Value::String(raw.to_owned())))
+            })
+            .collect();
+        let mut clean = catalog_metadata_only(incoming);
+        for (key, value) in server_art {
+            clean.metadata.entry(key).or_insert(value);
+        }
+        clean.sync_id = Some(id);
+        clean.validate()?;
+        let mut db = self.0.lock().map_err(|_| Error::Lock)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = Self::item_from(&tx, id)?;
+        let merged = if let Some(old) = &previous {
+            let mut item = old.clone();
+            if item.name.trim().is_empty() && !clean.name.trim().is_empty() {
+                item.name = clean.name;
+            }
+            let existing_known_status = item
+                .metadata
+                .get("publicationStatus")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("unknown"));
+            for (k, v) in clean.metadata {
+                if k == "publicationStatus"
+                    && existing_known_status
+                    && v.as_str()
+                        .is_some_and(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("unknown"))
+                {
+                    continue;
+                }
+                if matches!(k.as_str(), "thumbnailRef" | "backdropRef")
+                    && v.as_str().is_none_or(|s| s.trim().is_empty())
+                {
+                    continue;
+                }
+                overlay(
+                    &k,
+                    item.metadata.entry(k.clone()).or_insert(Value::Null),
+                    v,
+                );
+            }
+            item
+        } else {
+            clean
+        };
+        let changed = previous.as_ref().map(serde_json::to_value).transpose()?
+            != Some(serde_json::to_value(&merged)?);
+        if changed {
+            Self::import_into(&tx, &CatalogDocument::new(vec![merged.clone()]), false)?;
+        }
+        tx.commit()?;
+        Ok((merged, changed))
+    }
     fn store_provider_title(
         &self,
         provider: &str,
@@ -680,5 +779,73 @@ mod tests {
             patched.metadata["thumbnailRef"],
             "https://cdn.example.org/cover.jpg"
         );
+    }
+
+    #[test]
+    fn merge_remote_item_updates_chapters_and_thumbnail_while_preserving_local_data() {
+        let store = CatalogStore::in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let local: CatalogItem = serde_json::from_value(json!({
+            "syncId": id,
+            "name": "Heroe, regresa",
+            "mediaType": "book",
+            "subtype": "manga",
+            "publicationStatus": "ongoing",
+            "onlineProviders": {"olympusxyz": "hero-returns"},
+            "units": [
+                {"kind": "chapter", "displayNumber": "1", "sources": [{"filePath": "local/ch1.cbz"}]}
+            ]
+        }))
+        .unwrap();
+        store
+            .import(&CatalogDocument::new(vec![local]), false)
+            .unwrap();
+
+        let remote: CatalogItem = serde_json::from_value(json!({
+            "syncId": id,
+            "name": "Heroe, regresa",
+            "mediaType": "book",
+            "subtype": "manga",
+            "publicationStatus": "unknown",
+            "description": "Sinopsis nueva",
+            "thumbnailRef": "https://cdn.example.org/hero.webp",
+            "units": [
+                {"kind": "chapter", "displayNumber": "1"},
+                {"kind": "chapter", "displayNumber": "2"}
+            ]
+        }))
+        .unwrap();
+
+        let (merged, changed) = store.merge_remote_item(id, remote).unwrap();
+        assert!(changed);
+        assert_eq!(merged.metadata["description"], "Sinopsis nueva");
+        assert_eq!(
+            merged.metadata["thumbnailRef"],
+            "https://cdn.example.org/hero.webp"
+        );
+        assert_eq!(merged.metadata["publicationStatus"], "ongoing");
+        assert_eq!(merged.metadata["onlineProviders"]["olympusxyz"], "hero-returns");
+        let units = merged.metadata["units"].as_array().unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0]["sources"][0]["filePath"], "local/ch1.cbz");
+
+        // A later server payload without thumbnailRef must not erase the existing cover.
+        let without_art: CatalogItem = serde_json::from_value(json!({
+            "syncId": id,
+            "name": "Heroe, regresa",
+            "mediaType": "book",
+            "subtype": "manga",
+            "units": [
+                {"kind": "chapter", "displayNumber": "3"}
+            ]
+        }))
+        .unwrap();
+        let (merged2, changed2) = store.merge_remote_item(id, without_art).unwrap();
+        assert!(changed2);
+        assert_eq!(
+            merged2.metadata["thumbnailRef"],
+            "https://cdn.example.org/hero.webp"
+        );
+        assert_eq!(merged2.metadata["units"].as_array().unwrap().len(), 3);
     }
 }

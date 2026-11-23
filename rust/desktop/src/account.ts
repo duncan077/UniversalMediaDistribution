@@ -28,7 +28,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       const result = await invokeProfile<{changed: boolean; backup?: BackupInfo}>("account_sync", {background});
       if (logged?.username !== username) return;
       if (result.backup) logged.backup = result.backup;
-      if (result.changed) await reloaded();
+      if (result.changed || !background) await reloaded();
       if (dialog.open) { render(); message.textContent = ui("Perfil sincronizado."); }
     } catch (error) {
       try {

@@ -179,11 +179,23 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       thumb.className = "provider-thumb";
       if (coverUrl) {
         const img = document.createElement("img");
-        img.src = coverUrl;
         img.alt = "";
         img.loading = "lazy";
+        img.decoding = "async";
         img.referrerPolicy = "no-referrer";
-        img.onerror = () => img.remove();
+        img.addEventListener("error", () => {
+          void invoke<string>("fetch_artwork", { url: coverUrl, providers: [provider] })
+            .then(dataUrl => {
+              if (!img.isConnected) return;
+              img.addEventListener("error", () => { img.remove(); thumb.textContent = hit.title.slice(0, 2).toUpperCase(); }, { once: true });
+              img.src = dataUrl;
+            })
+            .catch(() => {
+              img.remove();
+              thumb.textContent = hit.title.slice(0, 2).toUpperCase();
+            });
+        }, { once: true });
+        img.src = coverUrl;
         thumb.append(img);
       } else {
         thumb.textContent = hit.title.slice(0, 2).toUpperCase();

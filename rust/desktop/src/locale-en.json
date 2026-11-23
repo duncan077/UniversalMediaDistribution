@@ -604,5 +604,11 @@
   "Volumen": "Volume",
   "{0} ediciones": "{0} editions",
   "Índice": "Table of contents",
-  "Usar el reproductor de UMD": "Use the UMD player"
+  "Usar el reproductor de UMD": "Use the UMD player",
+  "Actualizar": "Refresh",
+  "Actualizando ficha…": "Refreshing details…",
+  "Ficha actualizada.": "Details updated.",
+  "La ficha ya está al día.": "Details are already up to date.",
+  "No se encontraron cambios nuevos.": "No new updates found.",
+  "No se pudo actualizar la ficha.": "Could not refresh details."
 }

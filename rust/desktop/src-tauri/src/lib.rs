@@ -5,6 +5,7 @@
 unsafe extern "C" {}
 
 mod ad_filter;
+mod artwork;
 mod capibara;
 mod chapter_lookup;
 mod database;
@@ -394,7 +395,7 @@ async fn search_remote_catalog(
     Ok((page.items, page.next))
 }
 
-async fn remote_item_document(
+pub(crate) async fn remote_item_document(
     store: &CatalogStore,
     id: Uuid,
     hide_adult: bool,
@@ -447,14 +448,17 @@ async fn import_remote_item(
 ) -> CommandResult<umd_core::CatalogItem> {
     let doc =
         remote_item_document(&store, id, hide_adult.unwrap_or(false), server.as_deref()).await?;
+    let incoming = doc
+        .items
+        .into_iter()
+        .next()
+        .ok_or("El servidor devolvió una ficha vacía.")?;
     let store = store.inner().clone();
     work(move || {
-        store.import(&doc, false).map_err(|e| e.to_string())?;
-        store
-            .item(id)
-            .map_err(|e| e.to_string())?
-            .and_then(|d| d.items.into_iter().next())
-            .ok_or("Título desconocido.".into())
+        let (merged, _) = store
+            .merge_remote_item(id, incoming)
+            .map_err(|e| e.to_string())?;
+        Ok(merged)
     })
     .await
 }
@@ -693,6 +697,8 @@ pub fn run() {
             providers::provider_search,
             providers::provider_updates,
             providers::refresh_saved_editions,
+            providers::refresh_item,
+            artwork::fetch_artwork,
             providers::provider_interactive,
             chapter_lookup::find_chapter,
             providers::provider_add,

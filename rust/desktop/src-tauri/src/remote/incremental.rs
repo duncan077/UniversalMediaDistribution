@@ -108,6 +108,9 @@ pub(super) async fn send_patch(
     .map_err(|e| e.to_string())?;
     match response.status() {
         StatusCode::CONFLICT
+        | StatusCode::BAD_REQUEST
+        | StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::UNPROCESSABLE_ENTITY
         | StatusCode::NOT_FOUND
         | StatusCode::METHOD_NOT_ALLOWED
         | StatusCode::NOT_IMPLEMENTED => Ok(Write::Full),

@@ -145,6 +145,15 @@ fn location(id: &str) -> Option<reqwest::Url> {
         .find(|s| s.id == id)
         .and_then(|s| reqwest::Url::parse(&s.base).ok())
 }
+pub(crate) fn provider_referer(id: &str) -> Option<reqwest::Url> {
+    if let Some(url) = location(id) {
+        return Some(url);
+    }
+    if id == "capibaratraductor" {
+        return reqwest::Url::parse("https://capibaratraductor.com/").ok();
+    }
+    Site::parse(id).and_then(|site| reqwest::Url::parse(site.base()).ok())
+}
 #[tauri::command]
 pub async fn json_provider_search(
     site: String,
@@ -447,6 +456,221 @@ pub async fn refresh_saved_editions(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(updated)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshItemResult {
+    pub item: CatalogItem,
+    pub changed: bool,
+    pub sources_checked: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+async fn fetch_linked_provider_detail(
+    id: Uuid,
+    item: &CatalogItem,
+    site: &str,
+    external: &str,
+    capibara: &crate::capibara::Capibara,
+) -> CommandResult<CatalogItem> {
+    if site == "capibaratraductor" {
+        let edition = if let Some(e) = item
+            .metadata
+            .get("capibaraEdition")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            e
+        } else {
+            let target = umd_core::capibara::edition_id(id)
+                .or_else(|| external.parse().ok())
+                .ok_or("Edición desconocida.")?;
+            capibara
+                .search(&item.name, 1)
+                .await?
+                .items
+                .into_iter()
+                .map(|h| h.edition)
+                .find(|e| e.id == target)
+                .ok_or("Edición desconocida.")?
+        };
+        let mut fresh = capibara.edition_detail(&edition).await?;
+        fresh.metadata.insert(
+            "capibaraEdition".into(),
+            serde_json::to_value(edition).map_err(|e| e.to_string())?,
+        );
+        Ok(fresh)
+    } else if site.starts_with("json-") {
+        let root = location(site).ok_or("Proveedor desconocido.")?;
+        let url = root
+            .join(&format!("items/{id}"))
+            .map_err(|e| e.to_string())?;
+        let response = crate::streams::get_public(url, std::time::Duration::from_secs(20)).await?;
+        let text = crate::streams::bounded_text(response, 8 << 20).await?;
+        let doc = umd_core::CatalogDocument::parse(text.as_bytes()).map_err(|e| e.to_string())?;
+        doc.items
+            .into_iter()
+            .next()
+            .ok_or("El proveedor devolvió una ficha vacía.".into())
+    } else {
+        open(site)
+            .await?
+            .detail(&Entry {
+                external_id: external.to_owned(),
+                preview: serde_json::json!({"name": item.name}),
+            })
+            .await
+            .map_err(explain)
+    }
+}
+
+#[tauri::command]
+pub async fn refresh_item(
+    id: Uuid,
+    hide_adult: Option<bool>,
+    discover: Option<bool>,
+    store: State<'_, CatalogStore>,
+    capibara: State<'_, crate::capibara::Capibara>,
+) -> CommandResult<RefreshItemResult> {
+    let hide_adult = hide_adult.unwrap_or(false);
+    let discover = discover.unwrap_or(false);
+    let db = store.inner().clone();
+    let mut item = work(move || {
+        db.item(id)
+            .map_err(|e| e.to_string())?
+            .and_then(|d| d.items.into_iter().next())
+            .ok_or("El título ya no está en la biblioteca.".into())
+    })
+    .await?;
+    let initial_snapshot = serde_json::to_value(&item).map_err(|e| e.to_string())?;
+    let mut sources_checked = Vec::new();
+    let mut errors = Vec::new();
+
+    // 1. Refresh from connected UMD server if configured.
+    if store
+        .setting("server_url")
+        .ok()
+        .flatten()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        match crate::remote_item_document(&store, id, hide_adult, None).await {
+            Ok(doc) => {
+                if let Some(incoming) = doc.items.into_iter().next() {
+                    let db = store.inner().clone();
+                    match work(move || db.merge_remote_item(id, incoming).map_err(|e| e.to_string()))
+                        .await
+                    {
+                        Ok((merged, _)) => {
+                            item = merged;
+                            sources_checked.push("server".into());
+                        }
+                        Err(err) => errors.push(format!("server: {err}")),
+                    }
+                }
+            }
+            Err(err) => errors.push(format!("server: {err}")),
+        }
+    }
+
+    // 2. Collect all linked providers (onlineProviders metadata + crawl bindings + capibara).
+    let mut linked: Vec<(String, String)> = Vec::new();
+    if let Some(map) = item.metadata.get("onlineProviders").and_then(Value::as_object) {
+        for (site, ext) in map {
+            if let Some(ext_str) = ext.as_str().filter(|s| !s.trim().is_empty()) {
+                linked.push((site.clone(), ext_str.to_owned()));
+            }
+        }
+    }
+    let db_bindings = store.inner().clone();
+    if let Ok(bindings) =
+        work(move || db_bindings.item_bindings(id).map_err(|e| e.to_string())).await
+    {
+        for (site, ext) in bindings {
+            if !linked.iter().any(|(s, _)| s == &site) {
+                linked.push((site, ext));
+            }
+        }
+    }
+    if !linked.iter().any(|(s, _)| s == "capibaratraductor") {
+        if let Some(cap_id) = umd_core::capibara::edition_id(id) {
+            linked.push(("capibaratraductor".into(), cap_id.to_string()));
+        }
+    }
+
+    // 3. Refresh each linked provider edition.
+    for (site, external) in &linked {
+        if site != "capibaratraductor"
+            && !site.starts_with("json-")
+            && Site::parse(site).is_none()
+        {
+            continue;
+        }
+        match fetch_linked_provider_detail(id, &item, site, external, &capibara).await {
+            Ok(fresh) => {
+                if hide_adult && fresh.adult() {
+                    continue;
+                }
+                let db = store.inner().clone();
+                let key = item.key();
+                let (site_c, ext_c) = (site.clone(), external.clone());
+                if let Ok(Some(updated)) = work(move || {
+                    db.link_provider_edition(id, &key, &site_c, &ext_c, fresh)
+                        .map_err(|e| e.to_string())?;
+                    Ok(db
+                        .item(id)
+                        .map_err(|e| e.to_string())?
+                        .and_then(|d| d.items.into_iter().next()))
+                })
+                .await
+                {
+                    item = updated;
+                    sources_checked.push(site.clone());
+                }
+            }
+            Err(err) => errors.push(format!("{site}: {err}")),
+        }
+    }
+
+    // 4. If manually requested (or still missing artwork with no linked providers),
+    //    try a strict high-confidence provider match to populate chapters and cover.
+    let missing_artwork = item
+        .metadata
+        .get("thumbnailRef")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty());
+    if (discover && linked.is_empty()) || (discover && missing_artwork && sources_checked.is_empty())
+    {
+        if let Some((site, external, fresh)) =
+            crate::chapter_lookup::discover_best_match(&item, &capibara).await
+        {
+            if !(hide_adult && fresh.adult()) {
+                let db = store.inner().clone();
+                let key = item.key();
+                let site_owned = site.to_owned();
+                if let Ok(Some(updated)) = work(move || {
+                    db.link_provider_edition(id, &key, &site_owned, &external, fresh)
+                        .map_err(|e| e.to_string())?;
+                    Ok(db
+                        .item(id)
+                        .map_err(|e| e.to_string())?
+                        .and_then(|d| d.items.into_iter().next()))
+                })
+                .await
+                {
+                    item = updated;
+                    sources_checked.push(site.to_owned());
+                }
+            }
+        }
+    }
+
+    let final_snapshot = serde_json::to_value(&item).map_err(|e| e.to_string())?;
+    Ok(RefreshItemResult {
+        item,
+        changed: final_snapshot != initial_snapshot,
+        sources_checked,
+        errors,
+    })
 }
 
 #[tauri::command]

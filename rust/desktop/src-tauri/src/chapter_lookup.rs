@@ -236,3 +236,83 @@ pub async fn find_chapter(
     }
     Err("Los proveedores consultados no ofrecieron páginas para este capítulo.".into())
 }
+
+pub(crate) async fn discover_best_match(
+    local: &CatalogItem,
+    cap: &Capibara,
+) -> Option<(&'static str, String, CatalogItem)> {
+    let media = local.media_type.to_ascii_lowercase();
+    let sub = local
+        .subtype
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let sites: Vec<&'static str> = match (media.as_str(), sub.as_str()) {
+        ("book", "manga" | "comic") => SITES.to_vec(),
+        ("movie", "anime_series" | "anime_movie") => vec!["animeav1", "jkanime", "animetmo"],
+        ("movie", _) => vec!["pelisplus", "pelisflix-hd", "poseidon-hd2", "doramasflix"],
+        _ => return None,
+    };
+    let mut names = vec![local.name.clone()];
+    for s in local
+        .metadata
+        .get("originalName")
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(
+            local
+                .metadata
+                .get("alternativeNames")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v["name"].as_str()),
+        )
+    {
+        if !s.is_empty() && !names.iter().any(|v| v == s) && names.len() < 4 {
+            names.push(s.into());
+        }
+    }
+    let mut hits = Vec::new();
+    let futures: Vec<_> = sites
+        .iter()
+        .map(|&site| tokio::time::timeout(Duration::from_secs(15), candidates(site, &names, cap)))
+        .collect();
+    let mut jobs = stream::iter(futures).buffer_unordered(3);
+    while let Some(batch) = jobs.next().await {
+        if let Ok(batch) = batch {
+            hits.extend(batch.into_iter().filter(|c| c.score >= 900));
+        }
+    }
+    hits.sort_by_key(|h| {
+        (
+            std::cmp::Reverse(h.score),
+            sites.iter().position(|s| *s == h.site),
+        )
+    });
+    for c in hits.into_iter().take(4) {
+        let fetched = tokio::time::timeout(Duration::from_secs(15), async {
+            match c.edition {
+                EditionRef::Capibara(edition) => {
+                    let external = edition.id.to_string();
+                    let mut item = cap.edition_detail(&edition).await.ok()?;
+                    item.metadata
+                        .insert("capibaraEdition".into(), serde_json::to_value(edition).ok()?);
+                    Some((c.site, external, item))
+                }
+                EditionRef::Native(entry) => {
+                    let site = Site::parse(c.site)?;
+                    let mut provider = Provider::open(site).await.ok()?;
+                    let item = provider.detail(&entry).await.ok()?;
+                    Some((c.site, entry.external_id, item))
+                }
+            }
+        })
+        .await;
+        if let Ok(Some(found)) = fetched {
+            return Some(found);
+        }
+    }
+    None
+}

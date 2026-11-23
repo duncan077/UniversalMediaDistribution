@@ -406,6 +406,7 @@ export function contentControls(
           const rawUrls = capibaraLinked
             ? await invoke<string[]>("capibara_pages", { id: item.syncId, chapter: entry.target.displayNumber })
             : await invoke<string[]>("find_chapter", { id: item.syncId, number: entry.target.displayNumber });
+          if (!capibaraLinked) window.dispatchEvent(new Event("umd-catalog-changed"));
           const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
           if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
           listStatus.textContent = "";
@@ -740,6 +741,7 @@ export function contentControls(
             const rawUrls = capibaraLinked
               ? await invoke<string[]>("capibara_pages", { id: item.syncId, chapter: entry.target.displayNumber })
               : await invoke<string[]>("find_chapter", { id: item.syncId, number: entry.target.displayNumber });
+            if (!capibaraLinked) window.dispatchEvent(new Event("umd-catalog-changed"));
             const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
             if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
             listStatus.textContent = "";

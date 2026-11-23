@@ -186,7 +186,7 @@ progress {
   gap: 18px;
   background: var(--deep);
   border-right: 1px solid var(--line-soft);
-  z-index: 2;
+  z-index: 20;
 }
 .brand {
   display: flex;
@@ -262,7 +262,7 @@ main {
 .toolbar {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 15;
   display: flex;
   align-items: center;
   gap: 10px;
