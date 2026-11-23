@@ -87,6 +87,7 @@ internal sealed partial class SqliteOnlineCatalogStore
             WriteItem(connection, transaction, savedItem, revision, now);
             savedItems.Add(savedItem);
         }
+        using (var prune = Command(connection, transaction, "DELETE FROM catalog_arrivals WHERE id NOT IN (SELECT id FROM catalog_items)")) prune.ExecuteNonQuery();
         WriteState(connection, transaction, revision, now, document.SourceLabel);
         var savedDocument = Document((revision, now, document.SourceLabel), savedItems.OrderBy(item => item.Id).ToArray());
         var saved = new OnlineCatalogState(revision, now, ComputeDocumentHash(savedDocument), savedDocument);
@@ -124,20 +125,9 @@ internal sealed partial class SqliteOnlineCatalogStore
 
     public CatalogTransferDocument SearchDatabase(string query, string? mediaType, int limit, CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(query);
-        if (query.Trim().Length > 200 || limit is < 1 or > 500) throw new ArgumentException("Invalid catalog search bounds.");
-        var media = string.IsNullOrWhiteSpace(mediaType) ? null : CatalogSubtypeResolver.ParseMediaType(mediaType).ToString().ToLowerInvariant();
-        using var connection = _database.Open();
-        using var transaction = connection.BeginTransaction(deferred: true);
-        var state = ReadState(connection, transaction) ?? (0L, DateTimeOffset.UnixEpoch, SourceLabel);
-        using var command = Command(connection, transaction, """
-            SELECT payload FROM catalog_items WHERE ($media IS NULL OR media_type=$media)
-            AND instr(search_text,$query)>0 ORDER BY name,id LIMIT $limit;
-            """);
-        command.Parameters.AddWithValue("$media", (object?)media ?? DBNull.Value);
-        command.Parameters.AddWithValue("$query", SearchText(query));
-        command.Parameters.AddWithValue("$limit", limit);
-        return Document(state, ReadItemsBounded(command, cancellationToken, out _, truncate: true));
+        var request = new UniversalMediaDistribution.Catalog.ContentSources.ApiContentSearchRequest(query,
+            string.IsNullOrWhiteSpace(mediaType) ? null : CatalogSubtypeResolver.ParseMediaType(mediaType));
+        return SearchDatabasePage(request, limit, cancellationToken).Document;
     }
 
     public CatalogMergeResult MergeScraped(string providerId, string externalId, CatalogTransferItem incoming, CancellationToken cancellationToken)

@@ -97,6 +97,7 @@ configuration:
 | `UMD_SERVER_ADMIN_TOKEN` | Administrative bearer token for account provisioning, catalog/release publishing, and the `/admin` diagnostics page; at least 32 characters |
 | `UMD_SERVER_MAX_PACKAGE_BYTES` | Optional maximum installer size; defaults to 2 GiB |
 | `UMD_SERVER_MAX_JSON_BYTES` | Optional catalog/sync JSON limit; defaults to 40 MiB and must be 1 KiB to 256 MiB |
+| `UMD_SERVER_CATALOG_REQUESTS_PER_MINUTE` | Public catalog reads per client IP per minute; defaults to 60 |
 | `UMD_SERVER_PASSWORD_ITERATIONS` | Optional PBKDF2-HMAC-SHA256 work factor; defaults to 310,000 and must be 100,000 to 2,000,000 |
 | `UMD_SERVER_SESSION_DAYS` | Optional user-session lifetime; defaults to 30 and must be 1 to 365 |
 | `UMD_SERVER_ALLOW_REGISTRATION` | Enables self-service account creation when `true`; defaults to `false` |
@@ -118,8 +119,9 @@ The server stores password salts and PBKDF2 hashes, never plaintext passwords.
 Only SHA-256 hashes of random session tokens are written to disk. Account
 responses are marked `no-store`, login failures are throttled per account and
 source address, and credential requests are capped at 32 KiB. If a reverse
-proxy is used, apply an additional login rate limit there because the
-application intentionally does not trust forwarded-address headers by default.
+proxy is used, apply an additional login rate limit there. The application
+only trusts one `X-Forwarded-For` hop from loopback; see the
+[proxy configuration for catalog limits](SERVER_CATALOG_CRAWLER.md#public-catalog-access).
 
 ## Create accounts
 

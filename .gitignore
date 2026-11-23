@@ -49,3 +49,10 @@ artifacts-*.xml
 **/[Pp]ublish*.ps1
 **/[Pp]ublish*.py
 **/PublishProfiles/
+
+# Rust and frontend build output
+**/target/
+rust/desktop/dist/
+rust/desktop/public/pdfjs/
+rust/desktop/src-tauri/gen/schemas/
+/rust-server-data/

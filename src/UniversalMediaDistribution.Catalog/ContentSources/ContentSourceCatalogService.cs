@@ -1,11 +1,13 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using UniversalMediaDistribution.Application.Catalog;
 using UniversalMediaDistribution.Application.ContentSources;
 using UniversalMediaDistribution.Catalog.LiveTv;
+using UniversalMediaDistribution.Catalog.Sync;
 using UniversalMediaDistribution.Catalog.Transfer;
 using UniversalMediaDistribution.Domain.Catalog;
 
@@ -219,6 +221,7 @@ public sealed class ContentSourceCatalogService
     private readonly CatalogBrowseService _catalogBrowseService;
     private readonly CatalogJsonTransferService _catalogTransferService;
     private readonly IContentSourceProviderSettingsStore _settingsStore;
+    private readonly IRemoteServerSettingsStore? _remoteServerSettingsStore;
     private readonly HttpClient _httpClient;
     private readonly IReadOnlyDictionary<string, ApiContentProviderRegistration>
         _apiProviders;
@@ -252,7 +255,8 @@ public sealed class ContentSourceCatalogService
         TimeProvider? timeProvider = null,
         IApiTitleBindingStore? titleBindingStore = null,
         IEnumerable<LiveTvProviderDescriptor>? liveTvProviders = null,
-        Func<bool>? hideAdultContent = null)
+        Func<bool>? hideAdultContent = null,
+        IRemoteServerSettingsStore? remoteServerSettingsStore = null)
         : this(
             catalogBrowseService,
             catalogTransferService,
@@ -263,7 +267,8 @@ public sealed class ContentSourceCatalogService
             timeProvider,
             titleBindingStore,
             liveTvProviders,
-            hideAdultContent)
+            hideAdultContent,
+            remoteServerSettingsStore)
     {
     }
 
@@ -277,7 +282,8 @@ public sealed class ContentSourceCatalogService
         TimeProvider? timeProvider = null,
         IApiTitleBindingStore? titleBindingStore = null,
         IEnumerable<LiveTvProviderDescriptor>? liveTvProviders = null,
-        Func<bool>? hideAdultContent = null)
+        Func<bool>? hideAdultContent = null,
+        IRemoteServerSettingsStore? remoteServerSettingsStore = null)
     {
         _titleBindingStore = titleBindingStore;
         _catalogBrowseService = catalogBrowseService ??
@@ -286,6 +292,7 @@ public sealed class ContentSourceCatalogService
             throw new ArgumentNullException(nameof(catalogTransferService));
         _settingsStore = settingsStore ??
             throw new ArgumentNullException(nameof(settingsStore));
+        _remoteServerSettingsStore = remoteServerSettingsStore;
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         // Retain the parameter for existing compositions, but do not use it:
         // hourly refresh checkpoints are intentionally session-only.
@@ -340,10 +347,39 @@ public sealed class ContentSourceCatalogService
         var storedApis = stored.Providers
             .Where(static provider => provider.Kind is ContentSourceProviderKind.Api)
             .ToDictionary(static provider => provider.Id, StringComparer.Ordinal);
+        RemoteServerSettings? remote = null;
+        if (_remoteServerSettingsStore is not null &&
+            _apiProviders.ContainsKey(UmdJsonApiContentProvider.ProviderId))
+        {
+            try
+            {
+                remote = (await _remoteServerSettingsStore.LoadAsync(cancellationToken)).Normalize();
+            }
+            catch (ArgumentException)
+            {
+                // Invalid remote settings must not disable local browsing or
+                // send requests to a stale address from the provider store.
+                remote = new RemoteServerSettings { ServiceUrl = string.Empty };
+            }
+        }
         foreach (var registration in _apiProviders.Values.OrderBy(
                      static provider => provider.Descriptor.DisplayName,
                      StringComparer.OrdinalIgnoreCase))
         {
+            if (registration.Descriptor.Id == UmdJsonApiContentProvider.ProviderId && remote is not null)
+            {
+                providers.Add(new ContentSourceProviderConfiguration
+                {
+                    Id = registration.Descriptor.Id,
+                    DisplayName = registration.Descriptor.DisplayName,
+                    Kind = ContentSourceProviderKind.Api,
+                    IsEnabled = remote.OnlineCatalogEnabled && remote.ServiceUrl.Length > 0,
+                    BaseUrl = remote.ServiceUrl.Length == 0
+                        ? string.Empty
+                        : new Uri(new Uri(remote.ServiceUrl), "api/v1/catalog/").AbsoluteUri
+                }.Normalize());
+                continue;
+            }
             storedApis.TryGetValue(
                 registration.Descriptor.Id,
                 out var configuration);
@@ -578,6 +614,12 @@ public sealed class ContentSourceCatalogService
 
         foreach (var registration in _apiProviders.Values)
         {
+            if (registration.Descriptor.Id == UmdJsonApiContentProvider.ProviderId &&
+                _remoteServerSettingsStore is not null)
+            {
+                // The profile's server preferences are the source of truth.
+                continue;
+            }
             suppliedApis.TryGetValue(
                 registration.Descriptor.Id,
                 out var supplied);
@@ -673,7 +715,7 @@ public sealed class ContentSourceCatalogService
                 default)
     {
         ArgumentNullException.ThrowIfNull(criteria);
-        var settingsTask = LoadSettingsAsync(cancellationToken).AsTask();
+        var settingsTask = criteria.LocalOnly ? null : LoadSettingsAsync(cancellationToken).AsTask();
         var overview = await _catalogBrowseService.GetOverviewAsync(
             criteria.MediaType,
             cancellationToken);
@@ -691,7 +733,8 @@ public sealed class ContentSourceCatalogService
             localResults,
             Failure: null);
 
-        var settings = await settingsTask;
+        if (criteria.LocalOnly) yield break;
+        var settings = await settingsTask!;
         var configurations = settings.Providers
             .Where(provider =>
                 IsProviderAvailableForSearch(
@@ -750,11 +793,12 @@ public sealed class ContentSourceCatalogService
             case ContentSourceProviderKind.Api:
                 // Reading capabilities builds the provider, which is why this
                 // is only reached once a filter is actually set.
-                return !_apiProviders.TryGetValue(
+                var request = CreateApiSearchRequest(configuration, criteria);
+                return request is not null && (!_apiProviders.TryGetValue(
                         configuration.Id,
                         out var registration) ||
                     registration.GetProvider().SearchCapabilities.CanSatisfy(
-                        criteria.ToApiRequest());
+                        request));
 
             case ContentSourceProviderKind.TorrentCatalog:
                 // No upstream filtering, so it answers on text and its results
@@ -765,6 +809,19 @@ public sealed class ContentSourceCatalogService
             default:
                 return false;
         }
+    }
+
+    private static ApiContentSearchRequest? CreateApiSearchRequest(ContentSourceProviderConfiguration configuration, ContentSourceSearchCriteria criteria)
+    {
+        if (configuration.Id == UmdJsonApiContentProvider.ProviderId || criteria.ProviderName is null)
+            return criteria.ToApiRequest();
+        // A named source can still answer ordinary text/genre/year requests
+        // itself. Its own name is a source choice, not an upstream parameter.
+        if (!string.Equals(configuration.DisplayName, criteria.ProviderName, StringComparison.OrdinalIgnoreCase)) return null;
+        if (criteria.Query is null && criteria.Genre is null && criteria.ReleaseYear is null && criteria.Category is null && criteria.Status is null)
+            return null;
+        return new ApiContentSearchRequest(criteria.Query, criteria.MediaType, criteria.Genre, criteria.ReleaseYear,
+            category: criteria.Category, status: criteria.Status, subtypeGroup: criteria.SubtypeGroup);
     }
 
     /// <summary>
@@ -1414,25 +1471,32 @@ public sealed class ContentSourceCatalogService
             cancellationToken);
     }
 
+    /// <summary>
+    /// Finds exact chapter matches, or each provider's next chapter when
+    /// <paramref name="findNextChapter"/> is true and localUnit is the chapter being read.
+    /// </summary>
     public ValueTask<IReadOnlyList<ApiContentUnitImageCandidate>>
         FindApiImageCandidatesForUnitAsync(
             CatalogItemDetails localDetails,
             CatalogContentUnitDetails localUnit,
-            CancellationToken cancellationToken = default) =>
+            CancellationToken cancellationToken = default,
+            bool findNextChapter = false) =>
         ExecuteApiUnitLookupAsync(
             "chapter-discovery",
             ApiUnitDiscoveryTimeout,
             token => FindApiImageCandidatesForUnitCoreAsync(
                 localDetails,
                 localUnit,
-                token),
+                token,
+                findNextChapter),
             cancellationToken);
 
     private async ValueTask<IReadOnlyList<ApiContentUnitImageCandidate>>
         FindApiImageCandidatesForUnitCoreAsync(
             CatalogItemDetails localDetails,
             CatalogContentUnitDetails localUnit,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool findNextChapter)
     {
         ArgumentNullException.ThrowIfNull(localDetails);
         ArgumentNullException.ThrowIfNull(localUnit);
@@ -1506,7 +1570,8 @@ public sealed class ContentSourceCatalogService
                     knownUnit,
                     cancellationToken,
                     localDetails,
-                    knownBinding);
+                    knownBinding,
+                    findNextChapter);
             });
         var providerResults = (await Task.WhenAll(providerTasks)).ToList();
         var matches = providerResults
@@ -1542,12 +1607,17 @@ public sealed class ContentSourceCatalogService
                 : "No enabled API provider found a sufficiently close manga title with the selected chapter.");
     }
 
+    /// <summary>
+    /// Resolves an exact match, or a next-chapter candidate relative to localUnit.
+    /// The resolved provider chapter keeps its own identity and reading progress.
+    /// </summary>
     public ValueTask<ApiContentUnitImageResolution>
         ResolveApiImagesForUnitAsync(
             CatalogItemDetails localDetails,
             CatalogContentUnitDetails localUnit,
             ApiContentUnitImageCandidate candidate,
-            CancellationToken cancellationToken = default) =>
+            CancellationToken cancellationToken = default,
+            bool findNextChapter = false) =>
         ExecuteApiUnitLookupAsync(
             "chapter-resolution",
             ApiUnitResolutionTimeout,
@@ -1555,7 +1625,8 @@ public sealed class ContentSourceCatalogService
                 localDetails,
                 localUnit,
                 candidate,
-                token),
+                token,
+                findNextChapter),
             cancellationToken);
 
     private async ValueTask<ApiContentUnitImageResolution>
@@ -1563,7 +1634,8 @@ public sealed class ContentSourceCatalogService
             CatalogItemDetails localDetails,
             CatalogContentUnitDetails localUnit,
             ApiContentUnitImageCandidate candidate,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool findNextChapter = false)
     {
         ArgumentNullException.ThrowIfNull(localDetails);
         ArgumentNullException.ThrowIfNull(localUnit);
@@ -1581,7 +1653,11 @@ public sealed class ContentSourceCatalogService
             throw new ArgumentException(
                 "The selected chapter does not belong to the supplied catalog item.",
                 nameof(localUnit));
-        if (localDetails.Item.MediaType is not MediaType.Book ||
+        var requestedUnit = findNextChapter
+            ? FindNextProviderChapter(CatalogDetailsMapper.ToDetails(candidate.ApiItem.CatalogItem,
+                localDetails.Item.Id), knownUnit)
+            : knownUnit;
+        if (requestedUnit is null || localDetails.Item.MediaType is not MediaType.Book ||
             !MatchesLocalFormat(candidate.ApiItem.CatalogItem, localDetails) ||
             knownUnit.Kind is not ContentUnitKind.Chapter ||
             candidate.UnitRequest.Kind != knownUnit.Kind ||
@@ -1589,7 +1665,7 @@ public sealed class ContentSourceCatalogService
             knownUnit.Identity.SeasonNumber ||
             !ApiContentUnitRequest.DisplayNumbersMatch(
                 candidate.UnitRequest.DisplayNumber,
-                knownUnit.DisplayNumber))
+                requestedUnit.DisplayNumber))
         {
             throw new ArgumentException(
                 "The selected API provider result does not match this chapter.",
@@ -1622,14 +1698,15 @@ public sealed class ContentSourceCatalogService
                 localDetails,
                 knownUnit,
                 candidate,
-                cancellationToken);
+                cancellationToken,
+                findNextChapter);
         }
 
         if (imageSet is null ||
             !imageSet.Matches(
-                knownUnit.Kind,
-                knownUnit.DisplayNumber,
-                knownUnit.Identity.SeasonNumber))
+                requestedUnit.Kind,
+                requestedUnit.DisplayNumber,
+                requestedUnit.Identity.SeasonNumber))
         {
             if (candidate.UsedKnownBinding)
             {
@@ -1641,7 +1718,8 @@ public sealed class ContentSourceCatalogService
                     localDetails,
                     knownUnit,
                     candidate,
-                    cancellationToken);
+                    cancellationToken,
+                    findNextChapter);
             }
 
             throw new InvalidOperationException(
@@ -1670,7 +1748,7 @@ public sealed class ContentSourceCatalogService
             cancellationToken);
         return await MergeMatchedApiItemAsync(
             localDetails,
-            knownUnit,
+            requestedUnit,
             new MatchedApiUnit(
                 candidate.Configuration,
                 candidate.ProviderBaseUri,
@@ -1688,7 +1766,8 @@ public sealed class ContentSourceCatalogService
             CatalogItemDetails localDetails,
             CatalogContentUnitDetails localUnit,
             ApiContentUnitImageCandidate staleCandidate,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool findNextChapter)
     {
         await ForgetTitleBindingAsync(
             localDetails,
@@ -1700,7 +1779,8 @@ public sealed class ContentSourceCatalogService
             localUnit,
             cancellationToken,
             localDetails,
-            knownBinding: null);
+            knownBinding: null,
+            findNextChapter: findNextChapter);
         var match = result.Match ??
             throw new InvalidOperationException(
                 "The remembered chapter route is stale and the provider " +
@@ -1717,7 +1797,8 @@ public sealed class ContentSourceCatalogService
                 match.TitleSimilarity,
                 match.UnitRoutes,
                 UsedKnownBinding: false),
-            cancellationToken);
+            cancellationToken,
+            findNextChapter);
     }
 
     public async ValueTask<ApiContentUnitVideoResolution>
@@ -2193,23 +2274,22 @@ public sealed class ContentSourceCatalogService
     {
         try
         {
-            var results = configuration.Kind switch
+            return configuration.Kind switch
             {
                 // Only reached with query text: CanSatisfyCriteria keeps the
                 // torrent catalog out of filter-only searches.
                 ContentSourceProviderKind.TorrentCatalog =>
-                    await SearchTorrentCatalogAsync(
+                    new ProviderSearchResponse(await SearchTorrentCatalogAsync(
                         configuration,
                         criteria,
-                        cancellationToken),
+                        cancellationToken), Failure: null),
                 ContentSourceProviderKind.Api =>
                     await SearchApiAsync(
                         configuration,
                         criteria,
                         cancellationToken),
-                _ => []
+                _ => new ProviderSearchResponse([], Failure: null)
             };
-            return new ProviderSearchResponse(results, Failure: null);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -2237,7 +2317,8 @@ public sealed class ContentSourceCatalogService
             CatalogContentUnitDetails localUnit,
             CancellationToken cancellationToken,
             CatalogItemDetails? localDetails = null,
-            ApiTitleBinding? knownBinding = null)
+            ApiTitleBinding? knownBinding = null,
+            bool findNextChapter = false)
     {
         try
         {
@@ -2266,7 +2347,8 @@ public sealed class ContentSourceCatalogService
                     localUnit,
                     requireTitleSimilarity: false,
                     cancellationToken,
-                    expectedBookSubtype: localDetails.Item.SubtypeCode);
+                    expectedBookSubtype: localDetails.Item.SubtypeCode,
+                    findNextChapter: findNextChapter);
                 if (boundMatch is not null)
                 {
                     return new UnitImageProviderResolution(
@@ -2277,10 +2359,11 @@ public sealed class ContentSourceCatalogService
 
                 // The pairing no longer resolves, so it is dropped and the
                 // normal search runs below.
-                await ForgetTitleBindingAsync(
-                    localDetails,
-                    configuration,
-                    cancellationToken);
+                if (!findNextChapter)
+                    await ForgetTitleBindingAsync(
+                        localDetails,
+                        configuration,
+                        cancellationToken);
             }
             foreach (var query in localNames.Take(4))
             {
@@ -2337,7 +2420,8 @@ public sealed class ContentSourceCatalogService
                     localUnit,
                     requireTitleSimilarity: true,
                     cancellationToken,
-                    expectedBookSubtype: localDetails?.Item.SubtypeCode);
+                    expectedBookSubtype: localDetails?.Item.SubtypeCode,
+                    findNextChapter: findNextChapter);
                 if (best is not null)
                 {
                     break;
@@ -2381,7 +2465,8 @@ public sealed class ContentSourceCatalogService
         CatalogContentUnitDetails localUnit,
         bool requireTitleSimilarity,
         CancellationToken cancellationToken,
-        string? expectedBookSubtype)
+        string? expectedBookSubtype,
+        bool findNextChapter)
     {
         var unitRequest = new ApiContentUnitRequest(
             localUnit.Kind,
@@ -2392,7 +2477,11 @@ public sealed class ContentSourceCatalogService
         double titleSimilarity;
         try
         {
-            apiItem = await provider.LoadItemForUnitAsync(
+            // A unit-specific load may return only the requested chapter.
+            // Navigation needs this provider's complete chapter list instead.
+            apiItem = findNextChapter
+                ? await provider.LoadItemAsync(baseUri, searchItem, cancellationToken)
+                : await provider.LoadItemForUnitAsync(
                 baseUri,
                 searchItem,
                 unitRequest,
@@ -2419,6 +2508,13 @@ public sealed class ContentSourceCatalogService
             }
 
             ValidateImageSets(providerDetails, apiItem.ImageSets);
+            if (findNextChapter)
+            {
+                var next = FindNextProviderChapter(providerDetails, localUnit);
+                if (next is null) return null;
+                unitRequest = new ApiContentUnitRequest(next.Kind, next.DisplayNumber,
+                    next.Identity.SeasonNumber, next.Name);
+            }
             var providerNames = GetProviderTitleNames(apiItem.CatalogItem);
             titleSimilarity = GetBestTitleSimilarityFromNormalized(
                 normalizedLocalNames,
@@ -2459,6 +2555,37 @@ public sealed class ContentSourceCatalogService
             titleSimilarity,
             unitRoutes,
             UsedKnownBinding: !requireTitleSimilarity);
+    }
+
+    private static CatalogContentUnitDetails? FindNextProviderChapter(
+        CatalogItemDetails providerDetails,
+        CatalogContentUnitDetails current)
+    {
+        var chapters = providerDetails.Units
+            .Concat(providerDetails.Seasons.SelectMany(static season => season.Units))
+            .Where(unit => unit.Kind == ContentUnitKind.Chapter &&
+                unit.Identity.SeasonNumber == current.Identity.SeasonNumber)
+            .OrderBy(static unit => unit.SortOrder).ToArray();
+        const NumberStyles styles = NumberStyles.AllowDecimalPoint | NumberStyles.AllowLeadingSign;
+        if (!decimal.TryParse(current.DisplayNumber, styles, CultureInfo.InvariantCulture, out var number))
+        {
+            var index = Array.FindIndex(chapters, unit =>
+                ApiContentUnitRequest.DisplayNumbersMatch(unit.DisplayNumber, current.DisplayNumber));
+            return index >= 0 && index + 1 < chapters.Length ? chapters[index + 1] : null;
+        }
+
+        // A completed whole chapter already includes its partial editions.
+        // A partial chapter can continue with another part or the next number,
+        // but a missing chapter must not jump over a whole number silently.
+        var whole = decimal.Floor(number);
+        return chapters
+            .Select(unit => (Unit: unit, Number: decimal.TryParse(unit.DisplayNumber, styles,
+                CultureInfo.InvariantCulture, out var value) ? (decimal?)value : null))
+            .Where(candidate => candidate.Number > number && candidate.Number < whole + 2 &&
+                (number != whole || candidate.Number >= whole + 1))
+            .OrderBy(static candidate => candidate.Number)
+            .Select(static candidate => candidate.Unit)
+            .FirstOrDefault();
     }
 
     private async Task<UnitVideoProviderResolution>
@@ -3151,7 +3278,7 @@ public sealed class ContentSourceCatalogService
             })
             .Where(value =>
                 !ShouldHideAdultContent(value.Card) &&
-                criteria.Matches(value.Card))
+                criteria.Matches(value.Card, configuration.DisplayName))
             .Select(value => ContentSourceCatalogSearchResult.Online(
                 value.Card,
                 configuration,
@@ -3160,7 +3287,7 @@ public sealed class ContentSourceCatalogService
             .ToArray();
     }
 
-    private async ValueTask<IReadOnlyList<ContentSourceCatalogSearchResult>>
+    private async ValueTask<ProviderSearchResponse>
         SearchApiAsync(
             ContentSourceProviderConfiguration configuration,
             ContentSourceSearchCriteria criteria,
@@ -3168,11 +3295,36 @@ public sealed class ContentSourceCatalogService
     {
         var provider = GetApiProvider(configuration.Id);
         var baseUri = new Uri(configuration.BaseUrl, UriKind.Absolute);
-        var page = await provider.SearchAsync(
-            baseUri,
-            criteria.ToApiRequest(),
-            cancellationToken);
-        return page.Items
+        var request = CreateApiSearchRequest(configuration, criteria) ?? throw new InvalidOperationException("The provider cannot answer this selection.");
+        var items = new List<ApiContentSearchItem>();
+        var cursors = new HashSet<string>(StringComparer.Ordinal);
+        ContentSourceSearchFailure? failure = null;
+        for (var count = 0; ; count++)
+        {
+            ApiContentSearchPage page;
+            try
+            {
+                page = await provider.SearchAsync(baseUri, request, cancellationToken);
+            }
+            catch (HttpRequestException exception) when (configuration.Id == UmdJsonApiContentProvider.ProviderId &&
+                exception.StatusCode is HttpStatusCode.TooManyRequests)
+            {
+                // Do not retry in a loop or discard pages already received.
+                failure = new ContentSourceSearchFailure(configuration.Id, configuration.DisplayName, exception.Message);
+                break;
+            }
+            items.AddRange(page.Items);
+            // Other sites keep their existing single-page behavior. The UMD
+            // catalog is ours and supplies bounded keyset pages explicitly.
+            if (configuration.Id != UmdJsonApiContentProvider.ProviderId || page.ContinuationToken is null) break;
+            if (count >= 199 || !cursors.Add(page.ContinuationToken))
+                throw new InvalidDataException("The online catalog search exceeded its paging bounds; refine the filters.");
+            request = new ApiContentSearchRequest(request.Query, request.MediaType, request.Genre, request.ReleaseYear,
+                pageSize: ApiContentSearchRequest.MaximumPageSize, continuationToken: page.ContinuationToken,
+                category: request.Category, status: request.Status, providerName: request.ProviderName,
+                browse: request.Browse, subtypeGroup: request.SubtypeGroup);
+        }
+        var results = items
             .Select(result => new
             {
                 Result = result,
@@ -3193,6 +3345,7 @@ public sealed class ContentSourceCatalogService
                 value.Result.PreviewItem,
                 value.Result))
             .ToArray();
+        return new ProviderSearchResponse(results, failure);
     }
 
     private async ValueTask<CatalogImportResult> ImportDailyUpdatesAsync(

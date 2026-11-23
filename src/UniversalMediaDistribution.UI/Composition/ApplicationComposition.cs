@@ -281,6 +281,8 @@ public static class ApplicationComposition
                         "https://www.librefutbol2.com/parrilla-directo.php")),
                 hosterResolver)
         ];
+        var remoteServerSettingsStore = _remoteServerSettingsStore ??
+            new InMemoryRemoteServerSettingsStore();
         var contentSourceCatalogService = new ContentSourceCatalogService(
             catalogBrowseService,
             catalogTransferService,
@@ -292,7 +294,8 @@ public static class ApplicationComposition
             timeProvider: null,
             _apiTitleBindingStore ?? new InMemoryApiTitleBindingStore(),
             liveTvProviders.Select(static provider => provider.Descriptor),
-            hideAdultContent: () => ContentFilters.HideAdultContent);
+            hideAdultContent: () => ContentFilters.HideAdultContent,
+            remoteServerSettingsStore: remoteServerSettingsStore);
         var liveTvCatalogService = new LiveTvCatalogService(
             liveTvProviders,
             contentSourceProviderSettingsStore);
@@ -316,8 +319,7 @@ public static class ApplicationComposition
             torrentDownloadLibrary,
             _applicationUpdateService ??
                 UnavailableApplicationUpdateService.Instance,
-            _remoteServerSettingsStore ??
-                new InMemoryRemoteServerSettingsStore(),
+            remoteServerSettingsStore,
             _userSyncStore,
             _remoteMediaServerClient ??
                 new HttpRemoteMediaServerClient(),

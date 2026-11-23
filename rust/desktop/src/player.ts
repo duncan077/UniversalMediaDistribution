@@ -1,0 +1,1665 @@
+import {nativePlayer} from "./native-player";
+import {ui, displayTitle} from "./locale";
+import {readerMotion} from "./reader-motion";
+import {followProvider} from "./provider-playback";
+import {activeProfileId, getProfilePref, invokeProfile, windowProfile, writeProfilePref} from "./profile-context";
+import {invoke} from "./bridge";
+import {isHttpsUrl, mediaUrl, remoteUrl} from "./safety";
+import {convertFileSrc} from "@tauri-apps/api/core";
+import type HlsType from "hls.js";
+import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import {queueCatalogDownload} from "./downloads";
+import {continuousReader} from "./continuous";
+import {attachPartyPlayer, samePartyUnit, type ContentUnit} from "./party";
+import {isPageActive} from "./router";
+
+export interface Target { itemId: string; unitKind: string | null; displayNumber: string | null; seasonNumber: number | null }
+export interface OpenedMedia { streaming?:boolean; kind: "audio" | "video" | "pdf" | "images" | "epub"; paths: string[] }
+export interface Progress { position: number; positionKind: "page" | "seconds"; isCompleted: boolean; updatedAt?: string }
+interface ProgressRow extends Progress {
+  content: { unitKind?: string | null; displayNumber?: string | null; seasonNumber?: number | null };
+}
+interface Entry {
+  index: number;
+  target: Target;
+  label: string;
+  unitHeading: string;
+  unitName: string;
+  seasonNumber: number | null;
+  seasonLabel: string;
+  sources: Record<string, unknown>[];
+}
+export interface PlayableItem {
+  onlineProviders?: Record<string, string>;
+  syncId: string;
+  name: string;
+  mediaType: string;
+  units?: unknown[];
+  seasons?: unknown[];
+  sources?: unknown[];
+}
+export interface ContinueAction {
+  label: string;
+  run: () => void;
+}
+export interface ContentControlsOptions {
+  onContinueReady?: (cta: ContinueAction | null) => void;
+  onProgressChanged?: () => void;
+  onUnitsChanged?: () => void;
+  signal?: AbortSignal;
+}
+interface ChapterNav {
+  hasPrev: boolean;
+  hasNext: boolean;
+  prevLabel: string;
+  nextLabel: string;
+  openPrev: () => void;
+  openNext: () => void;
+}
+
+const PROVIDERS: [string, string][] = [
+  ["manhwaweb", "ManhwaWeb"],
+  ["jkanime", "JKAnime"],
+  ["doramasflix", "DoramasFlix"],
+  ["olympusxyz", "OlympusXYZ"],
+  ["framextv", "FramexTV"],
+  ["animetmo", "AnimeTMO"],
+  ["animeav1", "AnimeAV1"],
+  ["leercapitulo", "LeerCapitulo"],
+  ["zonatmo", "ZonaTMO"],
+  ["uchuujinmangas", "Uchuujin Mangas"],
+  ["pelisplus", "PelisPlus"],
+  ["pelisplus-to", "PelisPlus.to"],
+  ["pelisflix-hd", "Pelisflix HD"],
+  ["poseidon-hd2", "Poseidon HD2"],
+  ["seriesflix", "Seriesflix"],
+];
+const READER_PROVIDERS = new Set(["manhwaweb", "olympusxyz", "leercapitulo", "zonatmo", "uchuujinmangas"]);
+
+function bookArchive(url: string, mime: unknown): "cbr" | "cbz" | "epub" | null {
+  const type = typeof mime === "string" ? mime.split(";")[0].trim().toLowerCase() : "";
+  const path = new URL(url).pathname.toLowerCase();
+  if (["application/vnd.comicbook-rar","application/x-cbr","application/vnd.rar","application/x-rar-compressed"].includes(type) || /\.(cbr|rar)$/.test(path)) return "cbr";
+  if (type === "application/epub+zip" || path.endsWith(".epub")) return "epub";
+  if (["application/vnd.comicbook+zip","application/x-cbz","application/zip"].includes(type) || /\.(cbz|zip)$/.test(path)) return "cbz";
+  return null;
+}
+
+function node<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, className?: string) {
+  const el = document.createElement(tag);
+  if (text !== undefined) el.textContent = text;
+  if (className) el.className = className;
+  return el;
+}
+
+function records(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter((v): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)) : [];
+}
+
+function unitKindLabel(kind: string | null): string {
+  if (kind === "chapter") return ui("Capítulo");
+  if (kind === "track") return ui("Pista");
+  if (kind === "audio_chapter") return ui("Capítulo de audio");
+  return ui("Episodio");
+}
+
+export function formatTime(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  if (whole >= 3600) {
+    return [
+      Math.floor(whole / 3600),
+      String(Math.floor(whole / 60) % 60).padStart(2, "0"),
+      String(whole % 60).padStart(2, "0"),
+    ].join(":");
+  }
+  return Math.floor(whole / 60) + ":" + String(whole % 60).padStart(2, "0");
+}
+
+function progressBadgeText(p: Progress | undefined, isBook: boolean): { text: string; kind: "seen" | "progress" | "none" } {
+  if (!p) return { text: "", kind: "none" };
+  if (p.isCompleted) return { text: isBook ? ui("Leído") : ui("Visto"), kind: "seen" };
+  if (p.position > 0) {
+    return {
+      text: p.positionKind === "page" ? ui("Página {0}", Math.floor(p.position)) : formatTime(p.position),
+      kind: "progress",
+    };
+  }
+  return { text: "", kind: "none" };
+}
+
+function entries(item: PlayableItem): Entry[] {
+  const baseTarget: Target = { itemId: item.syncId, unitKind: null, displayNumber: null, seasonNumber: null };
+  const result: Entry[] = [];
+  const pushUnits = (values: unknown, seasonNumber: number | null, seasonTitle?: string) => {
+    const seasonLabel = seasonNumber === null
+      ? ""
+      : seasonTitle
+        ? `${ui("Temporada {0}", seasonNumber)} · ${seasonTitle}`
+        : ui("Temporada {0}", seasonNumber);
+    for (const unit of records(values)) {
+      if (typeof unit.kind !== "string" || typeof unit.displayNumber !== "string") continue;
+      const unitHeading = `${unitKindLabel(unit.kind)} ${unit.displayNumber}`;
+      const unitName = typeof unit.name === "string" ? unit.name.trim() : "";
+      const label = [seasonNumber === null ? "" : ui("Temporada {0}", seasonNumber), unitHeading, unitName].filter(Boolean).join(" · ");
+      result.push({
+        index: result.length,
+        target: { ...baseTarget, unitKind: unit.kind, displayNumber: unit.displayNumber, seasonNumber },
+        label,
+        unitHeading,
+        unitName,
+        seasonNumber,
+        seasonLabel,
+        sources: records(unit.sources),
+      });
+    }
+  };
+  pushUnits(item.units, null);
+  for (const season of records(item.seasons)) {
+    if (typeof season.number === "number") {
+      const title = typeof season.name === "string" ? season.name.trim() : undefined;
+      pushUnits(season.units, season.number, title);
+    }
+  }
+  if (records(item.sources).length || !result.length) {
+    result.unshift({
+      index: 0,
+      target: baseTarget,
+      label: displayTitle(item),
+      unitHeading: displayTitle(item),
+      unitName: "",
+      seasonNumber: null,
+      seasonLabel: "",
+      sources: records(item.sources),
+    });
+    result.forEach((entry, idx) => { entry.index = idx; });
+  }
+  return result;
+}
+
+let writes = Promise.resolve();
+export function flushProgress() { return writes; }
+function persist(target: Target, position: number, kind: string, completed: boolean, error: (e: unknown) => void) {
+  writes = writes.then(() => invokeProfile<void>("save_progress", { target, position, kind, completed })).catch(error);
+}
+
+function providerPlayerButton(name: string, address: string, external: boolean, entry: Entry, report: (message: string, error?: boolean) => void) {
+  const button = node("button", external ? ui("Abrir ") + name + ui(" en el navegador") : ui("Ver ") + name + ui(" en UMD"));
+  button.type = "button";
+  button.onclick = async () => {
+    button.disabled = true;
+    try {
+      if (external) { await invoke("open_provider_player", {address}); return; }
+      await flushProgress();
+      const saved = await invokeProfile<Progress | null>("get_progress", {target: entry.target});
+      const id = await invoke<string>("open_filtered_player", {address, language: document.documentElement.lang});
+      const resume = saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0;
+      followProvider(id, entry.target, entry.label, resume, (pos, ended) => persist(entry.target, pos, "seconds", ended, e => report(String(e), true)),
+        async stream => {await flushProgress(); await play(entry, "video", [stream.url], report, stream.hls, stream);});
+    } catch (e) {
+      report(String(e), true);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  return button;
+}
+
+export function contentControls(
+  item: PlayableItem,
+  report: (message: string, error?: boolean) => void,
+  highlightUnit?: ContentUnit,
+  options: ContentControlsOptions = {},
+): HTMLElement {
+  const isBook = item.mediaType.toLowerCase() === "book";
+  const isAudio = item.mediaType.toLowerCase() === "audio";
+  const available = entries(item);
+  const hasUnits = available.some(e => e.target.unitKind !== null);
+  const progressMap = new Map<number, Progress>();
+
+  const section = node("section", undefined, "entries-section");
+  const isAlive = () => section.isConnected && isPageActive("detail") && !options.signal?.aborted;
+
+  // Seasons available (in ascending order)
+  const seasons: { number: number; label: string }[] = [];
+  const seenSeasons = new Set<number>();
+  for (const entry of available) {
+    if (entry.seasonNumber !== null && !seenSeasons.has(entry.seasonNumber)) {
+      seenSeasons.add(entry.seasonNumber);
+      seasons.push({ number: entry.seasonNumber, label: entry.seasonLabel || ui("Temporada {0}", entry.seasonNumber) });
+    }
+  }
+
+  let selectedSeason: number | "all" =
+    highlightUnit?.seasonNumber != null && seenSeasons.has(highlightUnit.seasonNumber)
+      ? highlightUnit.seasonNumber
+      : "all";
+  let descending = false;
+  let searchFilter = "";
+  let visibleLimit = 80;
+  let capibaraLinked = !!item.onlineProviders?.capibaratraductor;
+
+  // Header row (Avalonia-style: heading + count + order toggle + mark-all-seen + local file tools)
+  const headerBar = node("div", undefined, "entries-header");
+  const titleGroup = node("div", undefined, "entries-title-group");
+  const headingText = hasUnits
+    ? (isBook ? ui("Capítulos") : isAudio ? ui("Pistas") : ui("Episodios"))
+    : (isBook ? ui("Leer") : ui("Reproducir"));
+  const headingEl = node("h2", headingText);
+  const countBadge = node("span", hasUnits ? String(available.length) : "", "entries-count");
+  countBadge.hidden = !hasUnits;
+  titleGroup.append(headingEl, countBadge);
+
+  const headerActions = node("div", undefined, "entries-toolbar-actions");
+
+  const filterInput = node("input", undefined, "entries-filter-input") as HTMLInputElement;
+  filterInput.type = "search";
+  filterInput.placeholder = isBook ? ui("Buscar capítulo…") : isAudio ? ui("Buscar pista…") : ui("Buscar episodio…");
+  filterInput.setAttribute("aria-label", filterInput.placeholder);
+  filterInput.hidden = available.length <= 10;
+
+  const orderBtn = node("button", ui("↑ Ascendente"), "quiet-btn");
+  orderBtn.type = "button";
+  orderBtn.hidden = available.length <= 1;
+
+  const toggleAllBtn = node("button", isBook ? ui("Marcar todo leído") : ui("Marcar todo visto"), "quiet-btn");
+  toggleAllBtn.type = "button";
+  toggleAllBtn.hidden = !hasUnits;
+
+  const pickBtn = node("button", ui("Abrir archivo…"), "quiet-btn");
+  pickBtn.type = "button";
+  const folderBtn = node("button", /Android|iP(?:ad|hone|od)/i.test(navigator.userAgent) ? ui("Elegir imágenes…") : ui("Carpeta de imágenes…"), "quiet-btn");
+  folderBtn.type = "button";
+
+  const hideDocPicker = isBook && navigator.userAgent.includes("UMD-NoDocumentPicker");
+  if (!hideDocPicker) headerActions.append(pickBtn);
+  if (isBook) headerActions.append(folderBtn);
+  if (available.length > 1) headerActions.append(orderBtn);
+  if (hasUnits) headerActions.append(toggleAllBtn);
+
+  headerBar.append(titleGroup, filterInput, headerActions);
+  section.append(headerBar);
+
+  if (hideDocPicker) {
+    const hint = node("p", ui("Para abrir un libro en este televisor, elegí una fuente del catálogo o un archivo de Descargas."), "muted");
+    section.append(hint);
+  }
+
+  // Season pill selector (Avalonia style: wrap of buttons, NOT a dropdown!)
+  const seasonBar = node("div", undefined, "season-bar");
+  seasonBar.hidden = seasons.length <= 1;
+  section.append(seasonBar);
+
+  const listStatus = node("p", undefined, "entries-status");
+  listStatus.setAttribute("role", "status");
+  section.append(listStatus);
+
+  const listHost = node("div", undefined, "entries-list");
+  section.append(listHost);
+
+  const showMoreBtn = node("button", ui("Mostrar más"), "load-more");
+  showMoreBtn.type = "button";
+  showMoreBtn.hidden = true;
+  section.append(showMoreBtn);
+
+  const launchLocalFile = async (entry: Entry, isFolder: boolean) => {
+    pickBtn.disabled = folderBtn.disabled = true;
+    try {
+      const opened = await invoke<OpenedMedia | null>("open_media", { folder: isFolder });
+      if (opened && isAlive()) {
+        await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, makeChapterNav(entry));
+      }
+    } catch (e) {
+      report(String(e), true);
+    } finally {
+      pickBtn.disabled = folderBtn.disabled = false;
+    }
+  };
+
+  pickBtn.onclick = () => void launchLocalFile(bestDefaultEntry(), false);
+  folderBtn.onclick = () => void launchLocalFile(bestDefaultEntry(), true);
+
+  function matchProgressRow(entry: Entry, rows: ProgressRow[]): Progress | undefined {
+    for (const row of rows) {
+      const c = row.content ?? {};
+      const targetMatch = entry.target.unitKind === null
+        ? !c.unitKind && !c.displayNumber
+        : samePartyUnit(entry.target, {
+            unitKind: c.unitKind ?? null,
+            seasonNumber: c.seasonNumber ?? null,
+            displayNumber: c.displayNumber ?? null,
+          });
+      if (targetMatch) {
+        return {
+          position: row.position,
+          positionKind: row.positionKind,
+          isCompleted: row.isCompleted,
+          updatedAt: row.updatedAt,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  function bestDefaultEntry(): Entry {
+    if (highlightUnit) {
+      const found = available.find(e => samePartyUnit(e.target, highlightUnit));
+      if (found) return found;
+    }
+    let latestInProgress: { entry: Entry; ts: number } | null = null;
+    let highestCompletedIdx = -1;
+    for (const entry of available) {
+      const p = progressMap.get(entry.index);
+      if (!p) continue;
+      if (!p.isCompleted && p.position > 0) {
+        const ts = p.updatedAt ? Date.parse(p.updatedAt) || 0 : 0;
+        if (!latestInProgress || ts >= latestInProgress.ts) latestInProgress = { entry, ts };
+      } else if (p.isCompleted) {
+        highestCompletedIdx = Math.max(highestCompletedIdx, entry.index);
+      }
+    }
+    if (latestInProgress) return latestInProgress.entry;
+    if (highestCompletedIdx >= 0 && highestCompletedIdx + 1 < available.length) {
+      return available[highestCompletedIdx + 1];
+    }
+    return available[0];
+  }
+
+  // Primary launcher for an entry (used both by the entry card and by prev/next chapter navigation & hero CTA!)
+  function primaryProviderFor(entry: Entry): { id: string; name: string; reader: boolean } | null {
+    const number = entry.target.displayNumber;
+    if (!number) return null;
+    for (const [id, name] of PROVIDERS) {
+      if (!item.onlineProviders?.[id]) continue;
+      const reader = READER_PROVIDERS.has(id);
+      if (entry.target.unitKind !== (reader ? "chapter" : "episode")) continue;
+      return { id, name, reader };
+    }
+    return null;
+  }
+
+  async function openEntryQuick(entry: Entry, cardEl?: HTMLElement): Promise<boolean> {
+    const nav = makeChapterNav(entry);
+    // 1. Reader provider (direct images -> opens right into Reader!)
+    const prov = primaryProviderFor(entry);
+    if (prov && prov.reader && entry.target.displayNumber) {
+      listStatus.textContent = ui("Abriendo {0}…", entry.unitHeading);
+      try {
+        const urls = (await invoke<string[]>("provider_unit", {
+          site: prov.id, id: item.syncId, number: entry.target.displayNumber, season: entry.target.seasonNumber,
+        })).map(remoteUrl).filter((u): u is string => u !== null);
+        if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
+        listStatus.textContent = "";
+        if (isAlive()) await play(entry, "images", urls, report, false, undefined, nav);
+        return true;
+      } catch (e) {
+        listStatus.textContent = "";
+        report(String(e), true);
+        return false;
+      }
+    }
+    // 2. CapibaraTraductor or chapter lookup for books
+    if (isBook && entry.target.unitKind === "chapter" && entry.target.seasonNumber === null && entry.target.displayNumber) {
+      if (capibaraLinked || Object.keys(item.onlineProviders ?? {}).length === 0) {
+        listStatus.textContent = ui("Abriendo {0}…", entry.unitHeading);
+        try {
+          const rawUrls = capibaraLinked
+            ? await invoke<string[]>("capibara_pages", { id: item.syncId, chapter: entry.target.displayNumber })
+            : await invoke<string[]>("find_chapter", { id: item.syncId, number: entry.target.displayNumber });
+          const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
+          if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
+          listStatus.textContent = "";
+          if (isAlive()) await play(entry, "images", urls, report, false, undefined, nav);
+          return true;
+        } catch (e) {
+          listStatus.textContent = "";
+          report(String(e), true);
+          return false;
+        }
+      }
+    }
+    // 3. Direct catalog source URL
+    for (const source of entry.sources) {
+      const url = remoteUrl(source.filePath);
+      if (!url) continue;
+      await openCatalogSource(entry, source, url, nav);
+      return true;
+    }
+    // 4. Video provider -> trigger inline picker on card or scroll card into view
+    if (prov && !prov.reader) {
+      const targetCard = cardEl ?? listHost.querySelector<HTMLElement>(`[data-entry-index="${entry.index}"]`);
+      if (targetCard) {
+        targetCard.scrollIntoView({ behavior: "smooth", block: "center" });
+        const trigger = targetCard.querySelector<HTMLButtonElement>("[data-provider-trigger]");
+        trigger?.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function openCatalogSource(entry: Entry, source: Record<string, unknown>, url: string, nav?: ChapterNav) {
+    const format = isBook ? bookArchive(url, source.mimeType) : null;
+    const kind = source.mimeType === "application/pdf" || new URL(url).pathname.toLowerCase().endsWith(".pdf")
+      ? "pdf"
+      : isAudio
+        ? "audio"
+        : "video";
+    try {
+      if (format) {
+        listStatus.textContent = ui("Abriendo libro…");
+        const opened = await invoke<OpenedMedia>("open_catalog_book", { address: url, format });
+        listStatus.textContent = "";
+        if (isAlive()) await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, nav);
+      } else if (kind === "video" && source.mimeType === "text/html") {
+        listStatus.textContent = ui("Buscando video…");
+        const stream = await invoke<Stream>("resolve_video", { address: url });
+        listStatus.textContent = "";
+        const safeUrl = remoteUrl(stream.url);
+        if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
+        const tracks = (stream.tracks ?? []).flatMap(track => {
+          const trackUrl = remoteUrl(track.url);
+          return trackUrl ? [{ ...track, url: trackUrl }] : [];
+        });
+        if (isAlive()) await play(entry, kind, [safeUrl], report, stream.hls, { ...stream, url: safeUrl, tracks }, nav);
+      } else {
+        const tracks: Subtitle[] = records(source.tracks ?? source.subtitles).slice(0, 100).flatMap(raw => {
+          const address = remoteUrl(raw.url ?? raw.source);
+          if (!address) return [];
+          const language = typeof raw.language === "string" ? raw.language : "und";
+          return [{
+            url: address,
+            language,
+            label: typeof raw.label === "string" ? raw.label : language,
+            default: raw.default === true || raw.isDefault === true,
+          }];
+        });
+        await play(entry, kind, [url], report, false, tracks.length ? { url, hls: /\.m3u8$/i.test(new URL(url).pathname), tracks } : undefined, nav);
+      }
+    } catch (e) {
+      listStatus.textContent = "";
+      report(String(e), true);
+    }
+  }
+
+  function makeChapterNav(entry: Entry): ChapterNav | undefined {
+    if (available.length <= 1) return undefined;
+    const prevEntry = entry.index > 0 ? available[entry.index - 1] : null;
+    const nextEntry = entry.index + 1 < available.length ? available[entry.index + 1] : null;
+    return {
+      hasPrev: !!prevEntry,
+      hasNext: !!nextEntry,
+      prevLabel: prevEntry ? prevEntry.unitHeading : "",
+      nextLabel: nextEntry ? nextEntry.unitHeading : "",
+      openPrev: () => { if (prevEntry) void openEntryQuick(prevEntry); },
+      openNext: () => { if (nextEntry) void openEntryQuick(nextEntry); },
+    };
+  }
+
+  function updateContinueCta() {
+    if (!options.onContinueReady) return;
+    if (!available.length) {
+      options.onContinueReady(null);
+      return;
+    }
+    const targetEntry = bestDefaultEntry();
+    const p = progressMap.get(targetEntry.index);
+    let label: string;
+    if (p && !p.isCompleted && p.position > 0) {
+      const detail = p.positionKind === "page" ? ui("Pág. {0}", Math.floor(p.position)) : formatTime(p.position);
+      label = hasUnits
+        ? ui("Continuar · {0} · {1}", targetEntry.unitHeading, detail)
+        : ui("Continuar · {0}", detail);
+    } else if (hasUnits && progressMap.size > 0 && targetEntry.index > 0) {
+      label = ui("Siguiente · {0}", targetEntry.unitHeading);
+    } else if (hasUnits) {
+      label = isBook
+        ? ui("Empezar · {0}", targetEntry.unitHeading)
+        : ui("Reproducir · {0}", targetEntry.unitHeading);
+    } else {
+      label = isBook ? ui("Leer") : ui("Reproducir");
+    }
+    options.onContinueReady({
+      label,
+      run: () => {
+        if (targetEntry.seasonNumber !== null && selectedSeason !== "all" && selectedSeason !== targetEntry.seasonNumber) {
+          selectedSeason = targetEntry.seasonNumber;
+          renderSeasons();
+          renderEntries();
+        }
+        void openEntryQuick(targetEntry).then(opened => {
+          if (!opened) {
+            const card = listHost.querySelector<HTMLElement>(`[data-entry-index="${targetEntry.index}"]`);
+            if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+            else void launchLocalFile(targetEntry, false);
+          }
+        });
+      },
+    });
+  }
+
+  function filteredEntries(): Entry[] {
+    let list = available;
+    if (selectedSeason !== "all") {
+      list = list.filter(e => e.seasonNumber === selectedSeason);
+    }
+    const q = searchFilter.trim().toLocaleLowerCase();
+    if (q) {
+      list = list.filter(e =>
+        e.label.toLocaleLowerCase().includes(q) ||
+        (e.target.displayNumber ?? "").toLocaleLowerCase().includes(q)
+      );
+    }
+    return descending ? [...list].reverse() : list;
+  }
+
+  function updateToggleAllLabel() {
+    const scope = filteredEntries().filter(e => e.target.unitKind !== null);
+    if (!scope.length) {
+      toggleAllBtn.hidden = true;
+      return;
+    }
+    toggleAllBtn.hidden = false;
+    const allSeen = scope.every(e => progressMap.get(e.index)?.isCompleted === true);
+    toggleAllBtn.textContent = allSeen
+      ? (isBook ? ui("Desmarcar leídos") : ui("Desmarcar vistos"))
+      : (isBook ? ui("Marcar todo leído") : ui("Marcar todo visto"));
+  }
+
+  function renderSeasons() {
+    seasonBar.replaceChildren();
+    if (seasons.length <= 1) {
+      seasonBar.hidden = true;
+      return;
+    }
+    seasonBar.hidden = false;
+    const allBtn = node("button", ui("Todas las temporadas"), "season-chip" + (selectedSeason === "all" ? " active" : ""));
+    allBtn.type = "button";
+    allBtn.setAttribute("aria-pressed", String(selectedSeason === "all"));
+    allBtn.onclick = () => {
+      selectedSeason = "all";
+      visibleLimit = 80;
+      renderSeasons();
+      renderEntries();
+    };
+    seasonBar.append(allBtn);
+    for (const s of seasons) {
+      const btn = node("button", s.label, "season-chip" + (selectedSeason === s.number ? " active" : ""));
+      btn.type = "button";
+      btn.setAttribute("aria-pressed", String(selectedSeason === s.number));
+      btn.onclick = () => {
+        selectedSeason = s.number;
+        visibleLimit = 80;
+        renderSeasons();
+        renderEntries();
+      };
+      seasonBar.append(btn);
+    }
+  }
+
+  function buildEntryCard(entry: Entry): HTMLElement {
+    const p = progressMap.get(entry.index);
+    const badge = progressBadgeText(p, isBook);
+    const isHighlighted = !!highlightUnit && samePartyUnit(entry.target, highlightUnit);
+
+    const card = node(
+      "article",
+      undefined,
+      "entry-card" +
+        (badge.kind === "seen" ? " is-seen" : badge.kind === "progress" ? " is-in-progress" : "") +
+        (isHighlighted ? " is-highlighted" : ""),
+    );
+    card.dataset.entryIndex = String(entry.index);
+
+    const topRow = node("div", undefined, "entry-card-top");
+
+    // Number badge
+    const numPill = node(
+      "div",
+      entry.target.displayNumber ?? (isBook ? "📖" : "▶"),
+      "entry-number",
+    );
+    topRow.append(numPill);
+
+    // Title & meta
+    const meta = node("div", undefined, "entry-meta");
+    const titleRow = node("div", undefined, "entry-heading-row");
+    titleRow.append(node("h3", entry.unitHeading));
+    if (badge.text) {
+      titleRow.append(node("span", (badge.kind === "seen" ? "✓ " : "") + badge.text, `entry-badge ${badge.kind}`));
+    }
+    meta.append(titleRow);
+    if (entry.unitName) {
+      meta.append(node("p", entry.unitName, "entry-subtitle"));
+    }
+    topRow.append(meta);
+
+    // Action buttons
+    const actions = node("div", undefined, "entry-actions");
+    const serverTray = node("div", undefined, "entry-servers");
+    serverTray.hidden = true;
+    const number = entry.target.displayNumber;
+    let hasRemoteAction = false;
+
+    // 1. Online providers (manga readers + video providers)
+    for (const [provider, name] of PROVIDERS) {
+      if (!item.onlineProviders?.[provider] || !number) continue;
+      const reader = READER_PROVIDERS.has(provider);
+      if (entry.target.unitKind !== (reader ? "chapter" : "episode")) continue;
+      hasRemoteAction = true;
+      const openBtn = node("button", reader ? ui("Leer en ") + name : ui("Ver en ") + name, "primary entry-primary");
+      openBtn.type = "button";
+      openBtn.dataset.providerTrigger = provider;
+      openBtn.onclick = async () => {
+        openBtn.disabled = true;
+        serverTray.replaceChildren();
+        serverTray.hidden = true;
+        const args = { site: provider, id: item.syncId, number, season: entry.target.seasonNumber };
+        try {
+          if (reader) {
+            const urls = (await invoke<string[]>("provider_unit", args))
+              .map(remoteUrl)
+              .filter((u): u is string => u !== null);
+            if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
+            if (isAlive()) await play(entry, "images", urls, report, false, undefined, makeChapterNav(entry));
+          } else {
+            const choices = await invoke<(Stream & { label: string; embed?: boolean })[]>("provider_unit", args);
+            if (!isAlive()) return;
+            if (!choices.length) {
+              report(ui("No se encontraron servidores para este episodio."), true);
+              return;
+            }
+            const header = node("div", undefined, "entry-servers-header");
+            header.append(node("span", ui("Servidores disponibles ({0})", name)));
+            const closeTray = node("button", ui("Cerrar"), "quiet-btn");
+            closeTray.type = "button";
+            closeTray.onclick = () => { serverTray.replaceChildren(); serverTray.hidden = true; };
+            header.append(closeTray);
+            serverTray.append(header);
+
+            const row = node("div", undefined, "button-row");
+            for (const source of choices) {
+              const needsExtraction = source.external || source.embed;
+              const choice = node("button", source.external ? ui("Buscar video para reproducir en UMD") : source.label, "primary");
+              choice.type = "button";
+              choice.onclick = async () => {
+                choice.disabled = true;
+                try {
+                  const media = needsExtraction ? await invoke<Stream>("resolve_video", { address: source.url }) : source;
+                  const safeUrl = remoteUrl(media.url);
+                  if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
+                  const rawTracks = media.tracks?.length ? media.tracks : source.tracks;
+                  const tracks = (rawTracks ?? []).flatMap(track => {
+                    const trackUrl = remoteUrl(track.url);
+                    return trackUrl ? [{ ...track, url: trackUrl }] : [];
+                  });
+                  if (isAlive()) {
+                    await play(entry, "video", [safeUrl], report, media.hls, { ...media, url: safeUrl, tracks }, makeChapterNav(entry), {sources:choices,index:choices.indexOf(source),attempted:new Set([choices.indexOf(source)])});
+                  }
+                } catch (e) {
+                  if (isAlive()) report(String(e), true);
+                } finally {
+                  choice.disabled = false;
+                }
+              };
+              row.append(choice);
+              if (needsExtraction) {
+                row.append(
+                  providerPlayerButton(source.label, source.url, false, entry, report),
+                  providerPlayerButton(source.label, source.url, true, entry, report),
+                );
+              }
+            }
+            serverTray.append(row);
+            serverTray.hidden = false;
+          }
+        } catch (e) {
+          if (isAlive()) report(String(e), true);
+        } finally {
+          openBtn.disabled = false;
+        }
+      };
+      actions.append(openBtn);
+    }
+
+    // 2. CapibaraTraductor / chapter lookup for books
+    if (isBook && entry.target.unitKind === "chapter" && entry.target.seasonNumber === null) {
+      const showLookup = capibaraLinked || Object.keys(item.onlineProviders ?? {}).length === 0;
+      if (showLookup) {
+        hasRemoteAction = true;
+        const readBtn = node(
+          "button",
+          capibaraLinked ? ui("Leer en CapibaraTraductor") : ui("Buscar capítulo en proveedores"),
+          capibaraLinked ? "primary entry-primary" : "quiet-btn",
+        );
+        readBtn.type = "button";
+        readBtn.onclick = async () => {
+          readBtn.disabled = true;
+          listStatus.textContent = ui("Abriendo capítulo…");
+          try {
+            const rawUrls = capibaraLinked
+              ? await invoke<string[]>("capibara_pages", { id: item.syncId, chapter: entry.target.displayNumber })
+              : await invoke<string[]>("find_chapter", { id: item.syncId, number: entry.target.displayNumber });
+            const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
+            if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
+            listStatus.textContent = "";
+            if (isAlive()) await play(entry, "images", urls, report, false, undefined, makeChapterNav(entry));
+          } catch (e) {
+            listStatus.textContent = "";
+            if (isAlive()) report(String(e), true);
+          } finally {
+            readBtn.disabled = false;
+          }
+        };
+        actions.append(readBtn);
+      }
+    }
+
+    // 3. Direct catalog sources (filePath / torrent / downloaded torrent files)
+    for (const source of entry.sources) {
+      const specs = [source.videoQuality, source.container || source.mimeType, typeof source.sizeBytes === "number" && source.sizeBytes > 0 ? (source.sizeBytes / 1048576).toLocaleString(undefined,{maximumFractionDigits:1}) + " MiB" : ""].filter(v => typeof v === "string" && v);
+      if (specs.length) actions.append(node("small", specs.join(" · "), "muted"));
+      const torrent = source.torrent as Record<string, unknown> | undefined;
+      const magnet = typeof torrent?.magnetUri === "string" ? torrent.magnetUri : null;
+      const metadata = typeof torrent?.torrentMetadataBase64 === "string" ? torrent.torrentMetadataBase64 : null;
+      const sequence = Array.isArray(source.umdFileIndices);
+      const indices = sequence ? source.umdFileIndices : typeof source.fileIndex === "number" ? [source.fileIndex] : [];
+      if (torrent && typeof torrent.infoHashV1 === "string" && Array.isArray(indices) && indices.length) {
+        hasRemoteAction = true;
+        const localBtn = node("button", sequence ? ui("Leer imágenes descargadas") : ui("Abrir archivo descargado"), "primary");
+        localBtn.type = "button";
+        localBtn.onclick = async () => {
+          localBtn.disabled = true;
+          try {
+            const media = await invoke<OpenedMedia>("catalog_download_files", {
+              hash: torrent.infoHashV1,
+              private: torrent.isPrivate === true,
+              indices,
+              sequence,
+            });
+            if (isAlive()) await play(entry, media.kind, media.paths.map(p => convertFileSrc(p, media.streaming ? "umdstream" : "asset")), report, false, undefined, makeChapterNav(entry));
+          } catch (e) {
+            report(String(e), true);
+          } finally {
+            localBtn.disabled = false;
+          }
+        };
+        actions.append(localBtn);
+      }
+      if (magnet || metadata) {
+        hasRemoteAction = true;
+        const downloadBtn = node("button", ui("Descargar por BitTorrent"), "quiet-btn");
+        downloadBtn.type = "button";
+        downloadBtn.onclick = () => {
+          const marked = magnet ? /[?&]x\.umd\.private=(?:1|true)(?:&|$)/i.test(magnet) : false;
+          const routes = records(torrent?.trackers).filter(t => t.clientFamily !== "browser" && t.transport !== "wss");
+          const trackers = torrent?.isPrivate || marked
+            ? routes.flatMap(t => typeof t.endpoint === "string"
+                ? [{ endpoint: t.endpoint, requiresAuthentication: t.requiresAuthentication === true, credentialKey: typeof t.credentialKey === "string" ? t.credentialKey : undefined }]
+                : [])
+            : null;
+          queueCatalogDownload(magnet, metadata, entry.target, trackers);
+        };
+        actions.append(downloadBtn);
+      }
+      const url = remoteUrl(source.filePath);
+      if (!url) continue;
+      hasRemoteAction = true;
+      const format = isBook ? bookArchive(url, source.mimeType) : null;
+      const label = format ? ui("Leer {0}", format.toUpperCase()) : ui("Abrir fuente {0}", typeof source.language === "string" ? source.language : "online");
+      const openBtn = node("button", label, "primary");
+      openBtn.type = "button";
+      openBtn.onclick = async () => {
+        openBtn.disabled = true;
+        try {
+          await openCatalogSource(entry, source, url, makeChapterNav(entry));
+        } finally {
+          openBtn.disabled = false;
+        }
+      };
+      actions.append(openBtn);
+      if (!isBook && source.mimeType === "text/html" && isHttpsUrl(url)) {
+        actions.append(providerPlayerButton(ui("la página del proveedor"), url, false, entry, report));
+      }
+    }
+
+    // Fallback: open local file for this specific entry if no remote sources exist
+    if (!hasRemoteAction && !hideDocPicker) {
+      const localPick = node("button", ui("Abrir archivo…"), "quiet-btn");
+      localPick.type = "button";
+      localPick.onclick = () => void launchLocalFile(entry, false);
+      actions.append(localPick);
+    }
+
+    // 4. Mark Seen / Unseen toggle (Avalonia parity!)
+    const seenBtn = node(
+      "button",
+      badge.kind === "seen"
+        ? (isBook ? ui("✓ Leído") : ui("✓ Visto"))
+        : (isBook ? ui("Marcar leído") : ui("Marcar visto")),
+      "seen-toggle" + (badge.kind === "seen" ? " active" : ""),
+    );
+    seenBtn.type = "button";
+    seenBtn.setAttribute("aria-pressed", String(badge.kind === "seen"));
+    seenBtn.onclick = async () => {
+      const nextCompleted = !(progressMap.get(entry.index)?.isCompleted === true);
+      const kind = isBook ? "page" : "seconds";
+      seenBtn.disabled = true;
+      try {
+        const scope = nextCompleted && entry.target.unitKind ? available.filter(e => e.index <= entry.index && e.target.unitKind === entry.target.unitKind && !progressMap.get(e.index)?.isCompleted) : [entry];
+        const batch = scope.map(e => ({ target:e.target, position:nextCompleted ? Math.max(1,progressMap.get(e.index)?.position || 1) : 0, kind, completed:nextCompleted }));
+        await invokeProfile("save_progress_batch", { entries:batch });
+        scope.forEach((e,i) => progressMap.set(e.index, {position:batch[i].position, positionKind:kind, isCompleted:nextCompleted, updatedAt:new Date().toISOString()}));
+        renderEntries();
+        updateToggleAllLabel();
+        updateContinueCta();
+        options.onProgressChanged?.();
+      } catch (e) {
+        report(String(e), true);
+        seenBtn.disabled = false;
+      }
+    };
+    actions.append(seenBtn);
+    if (entry.target.unitKind && options.onUnitsChanged) {
+      const remove = node("button", ui("Eliminar unidad"), "danger-ghost-btn");
+      remove.type = "button";
+      remove.onclick = () => {
+        const confirm = node("button", ui("Confirmar eliminación"), "danger-btn");
+        confirm.type = "button";
+        const cancel = node("button", ui("Cancelar"), "quiet-btn");
+        cancel.type = "button";
+        cancel.onclick = () => { confirm.replaceWith(remove); cancel.remove(); };
+        confirm.onclick = async () => {
+          confirm.disabled = cancel.disabled = true;
+          try { await invoke("delete_unit",{target:entry.target}); options.onUnitsChanged?.(); }
+          catch(e) { report(String(e),true); confirm.disabled = cancel.disabled = false; }
+        };
+        remove.replaceWith(confirm,cancel); cancel.focus();
+      };
+      actions.append(remove);
+    }
+
+    topRow.append(actions);
+    card.append(topRow, serverTray);
+    return card;
+  }
+
+  function renderEntries() {
+    listHost.replaceChildren();
+    const list = filteredEntries();
+    if (!list.length) {
+      listHost.append(node("p", ui("No se encontraron resultados con este filtro."), "muted"));
+      showMoreBtn.hidden = true;
+      updateToggleAllLabel();
+      return;
+    }
+
+    // Ensure highlighted unit is within visibleLimit
+    if (highlightUnit) {
+      const idx = list.findIndex(e => samePartyUnit(e.target, highlightUnit));
+      if (idx >= visibleLimit) visibleLimit = idx + 20;
+    }
+
+    const slice = list.slice(0, visibleLimit);
+    const frag = document.createDocumentFragment();
+    let lastSeason: number | null | undefined = undefined;
+    const showSeasonDividers = selectedSeason === "all" && seasons.length > 0;
+
+    for (const entry of slice) {
+      if (showSeasonDividers && entry.seasonNumber !== null && entry.seasonNumber !== lastSeason) {
+        lastSeason = entry.seasonNumber;
+        const divider = node("div", entry.seasonLabel || ui("Temporada {0}", entry.seasonNumber), "season-divider");
+        frag.append(divider);
+      }
+      frag.append(buildEntryCard(entry));
+    }
+    listHost.append(frag);
+
+    const remaining = list.length - slice.length;
+    showMoreBtn.hidden = remaining <= 0;
+    if (remaining > 0) {
+      showMoreBtn.textContent = ui("Mostrar más ({0} restantes)", remaining);
+    }
+    updateToggleAllLabel();
+  }
+
+  filterInput.oninput = () => {
+    searchFilter = filterInput.value;
+    visibleLimit = 80;
+    renderEntries();
+  };
+
+  orderBtn.onclick = () => {
+    descending = !descending;
+    orderBtn.textContent = descending ? ui("↓ Descendente") : ui("↑ Ascendente");
+    renderEntries();
+  };
+
+  showMoreBtn.onclick = () => {
+    visibleLimit += 100;
+    renderEntries();
+  };
+
+  toggleAllBtn.onclick = async () => {
+    const scope = filteredEntries().filter(e => e.target.unitKind !== null);
+    if (!scope.length) return;
+    const allSeen = scope.every(e => progressMap.get(e.index)?.isCompleted === true);
+    const nextCompleted = !allSeen;
+    const kind = isBook ? "page" : "seconds";
+    toggleAllBtn.disabled = true;
+    try {
+      const batch = scope.map(e => ({
+        target: e.target,
+        position: nextCompleted ? Math.max(1, progressMap.get(e.index)?.position ?? 1) : 0,
+        kind,
+        completed: nextCompleted,
+      }));
+      await invokeProfile("save_progress_batch", { entries: batch });
+      const stamp = new Date().toISOString();
+      for (const e of scope) {
+        progressMap.set(e.index, {
+          position: nextCompleted ? Math.max(1, progressMap.get(e.index)?.position ?? 1) : 0,
+          positionKind: kind,
+          isCompleted: nextCompleted,
+          updatedAt: stamp,
+        });
+      }
+      renderEntries();
+      updateContinueCta();
+      options.onProgressChanged?.();
+    } catch (e) {
+      report(String(e), true);
+    } finally {
+      toggleAllBtn.disabled = false;
+    }
+  };
+
+  async function refreshProgress() {
+    try {
+      await writes;
+      const rows = await invokeProfile<ProgressRow[]>("item_progress", { itemId: item.syncId });
+      if (!isAlive()) return;
+      progressMap.clear();
+      for (const entry of available) {
+        const matched = matchProgressRow(entry, rows);
+        if (matched) progressMap.set(entry.index, matched);
+      }
+      renderEntries();
+      updateContinueCta();
+    } catch {
+      /* Progress lookup failure does not block viewing entries. */
+    }
+  }
+
+  // Refresh progress badges whenever a player dialog closes while we're still on this detail page
+  const onDialogClose = (event: Event) => {
+    if ((event.target as Element)?.matches?.(".player-dialog")) {
+      setTimeout(() => {
+        if (isAlive()) void refreshProgress();
+      }, 60);
+    }
+  };
+  document.addEventListener("close", onDialogClose, { capture: true, signal: options.signal });
+
+  if (highlightUnit && !available.some(e => samePartyUnit(e.target, highlightUnit))) {
+    listStatus.textContent = ui("Esta edición no incluye la unidad de la sala.");
+  }
+
+  renderSeasons();
+  renderEntries();
+  updateContinueCta();
+
+  // Scroll highlighted card into view if opened from Watch Party or Continue
+  if (highlightUnit) {
+    requestAnimationFrame(() => {
+      listHost.querySelector<HTMLElement>(".entry-card.is-highlighted")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }
+
+  // Async: load saved progress for all chapters/episodes + capibara link state
+  void refreshProgress();
+  if (isBook && available.some(e => e.target.unitKind === "chapter")) {
+    void invoke<boolean>("capibara_linked", { id: item.syncId })
+      .then(value => {
+        const next = value || !!item.onlineProviders?.capibaratraductor;
+        if (next !== capibaraLinked && isAlive()) {
+          capibaraLinked = next;
+          renderEntries();
+        }
+      })
+      .catch(() => {});
+  }
+
+  return section;
+}
+
+interface Subtitle { url: string; language: string; label: string; default: boolean }
+type VideoChoice = Stream & {label:string;embed?:boolean};
+interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; engine?:string; dialog?:HTMLDialogElement }
+export interface Stream { referer?:string;live?:boolean; url: string; hls: boolean; dash?: boolean; external?: boolean; tracks?: Subtitle[] }
+
+export function playDownload(name: string, media: OpenedMedia, target: Target | null, report: (message: string, error?: boolean) => void) {
+  return play({ label: name, target }, media.kind, media.paths.map(p => convertFileSrc(p, media.streaming ? "umdstream" : "asset")), report);
+}
+
+export function playBroadcast(name: string, stream: Stream, report: (message: string, error?: boolean) => void) {
+  return play({ label: name, target: null }, "video", [stream.url], report, stream.hls, stream);
+}
+
+async function toggleFullscreen(el: HTMLElement, btn: HTMLButtonElement) {
+  try {
+    if (document.fullscreenElement) {
+      await document.exitFullscreen();
+      btn.setAttribute("aria-pressed", "false");
+    } else if (el.requestFullscreen) {
+      await el.requestFullscreen();
+      btn.setAttribute("aria-pressed", "true");
+    }
+  } catch { /* Fullscreen unsupported in this webview */ }
+}
+
+async function play(
+  entry: { label: string; target: Target | null },
+  kind: OpenedMedia["kind"],
+  urls: string[],
+  report: (message: string, error?: boolean) => void,
+  hlsHint = false,
+  stream?: Stream,
+  chapterNav?: ChapterNav,
+  choices?: PlaybackChoices,
+) {
+  const safeUrls = urls.map(mediaUrl).filter((u): u is string => u !== null);
+  if (!safeUrls.length) {
+    report(ui("La fuente devolvió una dirección inválida."), true);
+    return;
+  }
+  const validTracks = (stream?.tracks ?? []).flatMap(track => {
+    const trackUrl = mediaUrl(track.url);
+    return trackUrl ? [{ ...track, url: trackUrl }] : [];
+  });
+  await writes;
+  const profileId = (await windowProfile().catch(() => null))?.activeId ?? activeProfileId();
+  const saved = entry.target ? await invokeProfile<Progress | null>("get_progress", { target: entry.target }) : null;
+
+  if (choices?.dialog && !choices.dialog.open) return;
+  const dialog = choices?.dialog ?? node("dialog", undefined, "player-dialog");
+  if (kind === "epub" || kind === "images") {
+    const source = new URL(safeUrls[0]);
+    if (source.protocol === "umdstream:" || source.hostname === "umdstream.localhost") {
+      const id = decodeURIComponent(source.pathname.slice(1)).split("/")[0];
+      dialog.addEventListener("close", () => {void invoke("close_book", {id}).catch(() => {});}, {once:true});
+    }
+  }
+  const header = node("header", undefined, "dialog-header");
+
+  const backBtn = node("button", "← " + ui("Volver"), "player-back");
+  backBtn.type = "button";
+  backBtn.onclick = () => dialog.close();
+
+  const heading = node("h2", entry.label);
+  heading.id = "player-title-" + crypto.randomUUID();
+  dialog.setAttribute("aria-labelledby", heading.id);
+
+  const fsBtn = node("button", "⛶", "player-icon-btn");
+  fsBtn.type = "button";
+  fsBtn.setAttribute("aria-label", ui("Pantalla completa"));
+  fsBtn.title = ui("Pantalla completa");
+  fsBtn.setAttribute("aria-pressed", "false");
+  fsBtn.onclick = () => void toggleFullscreen(dialog, fsBtn);
+
+  const close = node("button", "×", "close");
+  close.type = "button";
+  close.setAttribute("aria-label", ui("Cerrar reproductor"));
+  close.addEventListener("click", () => dialog.close());
+
+  header.append(backBtn, heading);
+
+  // Prev / Next Episode or Chapter buttons right in the Player/Reader chrome (Avalonia parity!)
+  if (chapterNav) {
+    const prevUnit = node("button", "⏮ " + ui("Anterior"), "player-nav-btn");
+    prevUnit.type = "button";
+    prevUnit.disabled = !chapterNav.hasPrev;
+    prevUnit.title = chapterNav.prevLabel || ui("Anterior");
+    prevUnit.onclick = () => {
+      dialog.addEventListener("close", () => chapterNav.openPrev(), { once: true });
+      dialog.close();
+    };
+    const nextUnit = node("button", ui("Siguiente") + " ⏭", "player-nav-btn");
+    nextUnit.type = "button";
+    nextUnit.disabled = !chapterNav.hasNext;
+    nextUnit.title = chapterNav.nextLabel || ui("Siguiente");
+    nextUnit.onclick = () => {
+      dialog.addEventListener("close", () => chapterNav.openNext(), { once: true });
+      dialog.close();
+    };
+    header.append(prevUnit, nextUnit);
+  }
+
+  header.append(fsBtn, close);
+
+  const output = node("p");
+  output.setAttribute("role", "status");
+  const viewport = node("div", undefined, "player-viewport");
+  dialog.append(header, output, viewport);
+  if (!dialog.isConnected) document.body.append(dialog);
+  if (!dialog.open) dialog.showModal();
+
+  const error = (e: unknown) => { if (dialog.open) output.textContent = String(e); else report(String(e), true); };
+  let cleanup = () => {};
+  const onClose = () => {
+    if (document.fullscreenElement === dialog) void document.exitFullscreen().catch(() => {});
+    cleanup();
+    dialog.remove();
+  };
+  dialog.addEventListener("close", onClose, {once:true});
+
+  if (kind === "video" || kind === "audio") {
+    const primaryUrl = safeUrls[0];
+    const engines = node("select") as HTMLSelectElement;
+    engines.setAttribute("aria-label", ui("Motor de reproducción"));
+    const android = /Android/i.test(navigator.userAgent);
+    engines.add(new Option(ui("Reproductor web"), "web"));
+    if (android) engines.add(new Option("Android", "android"));
+    engines.add(new Option("VLC", "vlc"));
+    const playback: PlaybackChoices = choices ?? {sources:[],index:0,attempted:new Set()};
+    engines.value = playback.engine || getProfilePref(profileId, "umd-video-engine") || "web";
+    if (!engines.value) engines.value = "web";
+    header.insertBefore(engines, fsBtn);
+
+    let switching = false;
+    const switchTo = async (next:Stream,index:number,engine:string) => {
+      if (!dialog.open) return;
+      dialog.removeEventListener("close",onClose);
+      cleanup(); dialog.replaceChildren();
+      try {
+        await play(entry,kind,[next.url],report,next.hls,next,chapterNav,{...playback, dialog, index, engine});
+      } catch(e){ dialog.close();dialog.remove();report(String(e),true); }
+    };
+    const currentStream=stream ?? {url:primaryUrl,hls:hlsHint};
+    const changeSource=async (start:number,automatic:boolean) => {
+      if(switching || !dialog.open)return;
+      switching=true;
+      const ordered=[start,...playback.sources.map((_,i)=>i).filter(i=>i!==start)];
+      try {
+        for(const i of ordered) {
+          if(automatic && playback.attempted.has(i))continue;
+          const choice=playback.sources[i]; if(!choice)continue;
+          playback.attempted.add(i);
+          try {
+            const next=choice.embed || choice.external ? await invoke<Stream>("resolve_video",{address:choice.url}) : choice;
+            await switchTo({...next, tracks:next.tracks?.length? next.tracks : choice.tracks}, i, engines.value);return;
+          } catch(e) { if(!automatic)throw e; }
+        }
+        error(ui("No quedan servidores disponibles para este título."));
+      }catch(e){error(e);}finally{switching=false;}
+    };
+    const failed = (message:string) => {
+      if(switching || !dialog.open || !header.isConnected)return;
+      if(engines.value!=="web") {switching=true; void switchTo(currentStream,playback.index,"web");return;}
+      const next=playback.sources.findIndex((_,i)=>!playback.attempted.has(i));
+      if(next>=0){void changeSource(next,true);return;}
+      error(message);
+    };
+    engines.onchange=()=>{ if(switching)return;switching=true;void writeProfilePref("umd-video-engine",engines.value).then(()=>switchTo(currentStream,playback.index,engines.value)).catch(e=>{switching=false;error(e);}); };
+    if(playback.sources.length>1){
+      const select=node("select");select.setAttribute("aria-label",ui("Servidor de reproducción"));
+      playback.sources.forEach((s,i)=>select.add(new Option(s.label || ui("Servidor {0}",i+1),String(i))));
+      select.value=String(playback.index);
+      select.onchange=()=>{void changeSource(Number(select.value),false).finally(()=>{if(select.isConnected)select.value=String(playback.index);});};
+      header.insertBefore(select,engines);
+    }
+    if (/Windows|Android/i.test(navigator.userAgent)) {
+      const wireless = node("button", ui("Pantalla inalámbrica"), "quiet-btn");
+      wireless.type = "button";
+      wireless.onclick = async () => {
+        try {
+          const result = await invoke<{error?:string}>("native_playback", {operation:"wireless", args:{id:crypto.randomUUID()}});
+          if (result.error) throw Error(ui("El sistema no tiene una pantalla inalámbrica disponible."));
+        } catch (e) {error(e);}
+      };
+      header.insertBefore(wireless, engines);
+    }
+    if(stream?.live) header.insertBefore(node("span","● LIVE","live-pill"),engines);
+    if (engines.value !== "web") {
+      cleanup = nativePlayer(
+        engines.value, primaryUrl, viewport, header, output, entry.label, entry.target, validTracks,
+        saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0,
+        (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, stream?.hls ? stream.referer : undefined,
+      );
+      return;
+    }
+
+    const media = node(kind);
+    media.controls = true;
+    const remote = (media as HTMLVideoElement & {remote?:{prompt:()=>Promise<void>}}).remote;
+    if(remote && typeof remote.prompt==="function"){
+      const cast=node("button",ui("Transmitir a una pantalla"),"quiet-btn");cast.type="button";cast.onclick=()=>void remote.prompt().catch(error);header.insertBefore(cast,fsBtn);
+    }
+    media.preload = "metadata";
+    media.setAttribute("aria-label", entry.label);
+    media.setAttribute("referrerpolicy", "no-referrer");
+    let ready = false;
+    let lastSave = Date.now();
+    let hls: HlsType | null = null;
+    const save = () => {
+      if (entry.target && ready && !media.seeking && Number.isFinite(media.currentTime)) {
+        persist(entry.target, media.currentTime, "seconds", media.ended, error);
+      }
+    };
+    media.addEventListener("loadedmetadata", () => {
+      output.textContent = "";
+      const shouldResume = saved?.positionKind === "seconds" && !saved.isCompleted && saved.position > 0 && (!Number.isFinite(media.duration) || saved.position < media.duration);
+      if (shouldResume && Math.abs(media.currentTime - saved.position) >= 0.01) {
+        media.addEventListener("seeked", () => { ready = true; lastSave = Date.now(); }, { once: true });
+        media.currentTime = saved.position;
+      } else {
+        ready = true;
+        lastSave = Date.now();
+      }
+    }, { once: true });
+    media.addEventListener("timeupdate", () => { if (Date.now() - lastSave > 10_000) { lastSave = Date.now(); save(); } });
+    media.addEventListener("pause", save);
+    media.addEventListener("ended", save);
+    media.addEventListener("error", () => failed(ui("No se pudo reproducir esta fuente. El formato o códec puede no ser compatible con el reproductor del sistema.")));
+
+    let dash: import("dashjs").MediaPlayerClass | undefined;
+    if (validTracks.length) {
+      media.crossOrigin = "anonymous";
+      let hasDefault = false;
+      for (const track of validTracks) {
+        const el = node("track");
+        el.kind = "subtitles";
+        el.src = track.url;
+        el.srclang = track.language;
+        el.label = track.label;
+        el.default = !hasDefault && track.default;
+        hasDefault ||= el.default;
+        media.append(el);
+      }
+    }
+    if ((stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl)) && kind === "video") {
+      const {MediaPlayer} = await import("dashjs");
+      if (!dialog.open) return;
+      dash = MediaPlayer().create();
+      dash.on(MediaPlayer.events.ERROR, () => failed(ui("La transmisión DASH se interrumpió.")));
+      dash.initialize(media as HTMLVideoElement, primaryUrl, false);
+    } else if ((hlsHint || /\.m3u8(?:\?|$)/i.test(primaryUrl)) && !media.canPlayType("application/vnd.apple.mpegurl")) {
+      const {default: Hls} = await import("hls.js");
+      if (!dialog.open) return;
+      if (Hls.isSupported()) {
+        hls = new Hls();
+        hls.loadSource(primaryUrl);
+        hls.attachMedia(media);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (!hls || !header.isConnected || hls.levels.length < 2) return;
+          const quality=node("select");quality.setAttribute("aria-label",ui("Calidad de video"));
+          quality.add(new Option(ui("Calidad automática"),"-1"));
+          hls.levels.forEach((l,i)=>quality.add(new Option(l.height ? l.height+"p" : Math.round(l.bitrate/1000)+" kb/s",String(i))));
+          quality.onchange=()=>{if(hls)hls.currentLevel=Number(quality.value);}; header.insertBefore(quality,engines);
+        });
+        hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) failed(ui("La transmisión HLS se interrumpió. Volvé a abrir la fuente para reintentar.")); });
+      } else {
+        media.src = primaryUrl;
+      }
+    } else {
+      media.src = primaryUrl;
+    }
+    viewport.append(media);
+    output.textContent = ui("Elegí reproducir para comenzar.");
+    const background = () => { if (document.hidden) save(); };
+    document.addEventListener("visibilitychange", background);
+    const detachParty = entry.target ? attachPartyPlayer(media, entry.target, entry.label, header, output) : () => {};
+    cleanup = () => {
+      detachParty();
+      document.removeEventListener("visibilitychange", background);
+      save();
+      ready = false;
+      media.pause();
+      hls?.destroy();
+      dash?.reset();
+      media.removeAttribute("src");
+      media.load();
+    };
+    return;
+  }
+
+  // Reader (Images / Manga / PDF / EPUB)
+  let pdf: PDFDocumentProxy | null = null;
+  let closed = false;
+  let rendering = false;
+  let continuous: ReturnType<typeof continuousReader> | undefined;
+  const tasks = new Map<number, RenderTask>();
+  const cancelPage = (pageNum: number) => {
+    const existing = tasks.get(pageNum);
+    if (existing) {
+      tasks.delete(pageNum);
+      existing.cancel();
+    }
+  };
+  const cancelAllTasks = () => {
+    for (const task of tasks.values()) task.cancel();
+    tasks.clear();
+  };
+  const clearViewport = () => {
+    for (const canvas of viewport.querySelectorAll("canvas")) { canvas.width = 0; canvas.height = 0; }
+    for (const img of viewport.querySelectorAll("img")) { img.src = ""; }
+    viewport.replaceChildren();
+  };
+
+  let page = Math.max(1, Math.floor(saved?.positionKind === "page" ? saved.position : 1));
+  let pages = safeUrls.length;
+  let shownPage = 0;
+  let readingMode: "paged" | "continuous" = "paged";
+  let zoomPercent = Math.min(200, Math.max(50, Number(getProfilePref(activeProfileId(),"reader-zoom")) || 100));
+  let epubFontRem = Math.min(2,Math.max(.85,Number(getProfilePref(activeProfileId(),"epub-font")) || 1.12));
+
+  const toolbar = node("div", undefined, "reader-controls");
+  viewport.tabIndex = 0;
+  viewport.setAttribute("aria-label", ui("Contenido de lectura"));
+
+  const prev = node("button", ui("← Anterior"));
+  prev.type = "button";
+  const next = node("button", ui("Siguiente →"));
+  next.type = "button";
+  const position = node("input") as HTMLInputElement;
+  position.type = "number";
+  position.min = "1";
+  position.setAttribute("aria-label", ui("Página"));
+  const total = node("span");
+
+  // Segmented mode switch (Avalonia-style: Una página | Continua)
+  const modeGroup = node("div", undefined, "segmented-control");
+  modeGroup.setAttribute("role", "group");
+  modeGroup.setAttribute("aria-label", ui("Modo de lectura"));
+  const pagedBtn = node("button", ui("Una página"), "seg-btn active");
+  pagedBtn.type = "button";
+  pagedBtn.setAttribute("aria-pressed", "true");
+  const contBtn = node("button", ui("Continua"), "seg-btn");
+  contBtn.type = "button";
+  contBtn.setAttribute("aria-pressed", "false");
+  modeGroup.append(pagedBtn, contBtn);
+
+  // Zoom controls (images / pdf) OR Font size controls (EPUB)
+  const scaleGroup = node("div", undefined, "segmented-control");
+  const applyScale = () => {
+    viewport.style.setProperty("--reader-zoom", `${zoomPercent}%`);
+    viewport.style.setProperty("--reader-zoom-scale", String(zoomPercent / 100));
+    viewport.style.setProperty("--epub-font", `${epubFontRem.toFixed(2)}rem`);
+  };
+  if (kind === "epub") {
+    const smaller = node("button", "A−", "seg-btn");
+    smaller.type = "button";
+    smaller.setAttribute("aria-label", ui("Reducir letra"));
+    const resetFont = node("button", "100%", "seg-btn");
+    resetFont.type = "button";
+    const larger = node("button", "A+", "seg-btn");
+    larger.type = "button";
+    larger.setAttribute("aria-label", ui("Aumentar letra"));
+    const updateFont = () => {
+      resetFont.textContent = Math.round((epubFontRem / 1.12) * 100) + "%";
+      applyScale(); void writeProfilePref("epub-font",String(epubFontRem));
+    };
+    smaller.onclick = () => { epubFontRem = Math.max(0.85, epubFontRem - 0.12); updateFont(); };
+    resetFont.onclick = () => { epubFontRem = 1.12; updateFont(); };
+    larger.onclick = () => { epubFontRem = Math.min(2.0, epubFontRem + 0.12); updateFont(); };
+    resetFont.textContent=Math.round(epubFontRem / 1.12 * 100)+"%";
+    scaleGroup.append(smaller, resetFont, larger);
+  } else {
+    const zoomOut = node("button", "−", "seg-btn");
+    zoomOut.type = "button";
+    zoomOut.setAttribute("aria-label", ui("Alejar"));
+    const zoomReset = node("button", "100%", "seg-btn");
+    zoomReset.type = "button";
+    zoomReset.setAttribute("aria-label", ui("Restablecer zoom"));
+    const zoomIn = node("button", "+", "seg-btn");
+    zoomIn.type = "button";
+    zoomIn.setAttribute("aria-label", ui("Acercar"));
+    const updateZoom = () => {
+      zoomReset.textContent = `${zoomPercent}%`;
+      zoomOut.disabled = zoomPercent <= 50;
+      zoomIn.disabled = zoomPercent >= 200;
+      applyScale(); void writeProfilePref("reader-zoom",String(zoomPercent));
+    };
+    zoomOut.onclick = () => { zoomPercent = Math.max(50, zoomPercent - 15); updateZoom(); };
+    zoomReset.onclick = () => { zoomPercent = 100; updateZoom(); };
+    zoomIn.onclick = () => { zoomPercent = Math.min(200, zoomPercent + 15); updateZoom(); };
+    zoomReset.textContent=zoomPercent+"%";
+    scaleGroup.append(zoomOut, zoomReset, zoomIn);
+  }
+  applyScale();
+
+  toolbar.append(prev, position, total, next, modeGroup, scaleGroup);
+  dialog.insertBefore(toolbar, viewport);
+
+  // Floating scroll-to-top button for continuous mode (Avalonia parity)
+  const scrollTopBtn = node("button", "↑", "scroll-top-fab");
+  scrollTopBtn.type = "button";
+  scrollTopBtn.setAttribute("aria-label", ui("Ir al principio"));
+  scrollTopBtn.title = ui("Ir al principio");
+  scrollTopBtn.hidden = true;
+  scrollTopBtn.onclick = () => viewport.scrollTo({ top: 0, behavior: "smooth" });
+  dialog.append(scrollTopBtn);
+
+  viewport.addEventListener("scroll", () => {
+    scrollTopBtn.hidden = readingMode !== "continuous" || viewport.scrollTop < 420;
+  }, { passive: true });
+
+  dialog.classList.add("immersive-reader");
+  const motion = readerMotion(viewport, toolbar);
+  dialog.addEventListener("close", () => motion.close(), { once: true });
+
+  const pdfjs = kind === "pdf" ? await import("pdfjs-dist") : null;
+  if (!dialog.open) return;
+  if (pdfjs) pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
+  const readerRequests = new AbortController();
+  const partialPdf = pdfjs && (new URL(safeUrls[0]).hostname === "umdstream.localhost" || safeUrls[0].startsWith("umdstream:"));
+  let range;
+  if (partialPdf) {
+    dialog.addEventListener("close", () => readerRequests.abort(), {once:true});
+    let length: number;
+    try {
+      const head = await fetch(safeUrls[0], {method:"HEAD",signal:readerRequests.signal});
+      length = Number(head.headers.get("Content-Length"));
+      if (!head.ok || !Number.isSafeInteger(length) || length <= 0) throw Error(ui("No se pudo abrir el PDF."));
+    } catch (e) {
+      if (!readerRequests.signal.aborted) error(e);
+      return;
+    }
+    if (readerRequests.signal.aborted) return;
+    range = new pdfjs.PDFDataRangeTransport(length, new Uint8Array());
+    const transport = range;
+    transport.requestDataRange = (begin,end) => {
+      void (async () => {
+        const bytes = new Uint8Array(end - begin);
+        let cursor = begin;
+        while (cursor < end && !readerRequests.signal.aborted) {
+          const last = Math.min(cursor + 1048576, end);
+          const res = await fetch(safeUrls[0], {headers:{Range:"bytes=" + cursor + "-" + (last-1)}, signal: readerRequests.signal});
+          const data = new Uint8Array(await res.arrayBuffer());
+          if (res.status !== 206 || data.length !== last-cursor) throw Error(ui("La descarga del PDF quedó incompleta."));
+          bytes.set(data, cursor - begin);
+          cursor = last;
+        }
+        if (!readerRequests.signal.aborted) transport.onDataRange(begin, bytes);
+      })().catch(e => { if (!readerRequests.signal.aborted) {error(e); void loading?.destroy();} });
+    };
+  }
+  const loading = pdfjs ? pdfjs.getDocument({ ...(range ? {range,disableAutoFetch:true,disableStream:true} : {url:safeUrls[0]}), maxImageSize: 16_000_000, cMapUrl: "/pdfjs/cmaps/", standardFontDataUrl: "/pdfjs/standard_fonts/", wasmUrl: "/pdfjs/wasm/", iccUrl: "/pdfjs/iccs/" }) : null;
+  cleanup = () => { closed = true; continuous?.close(); cancelAllTasks(); clearViewport(); void loading?.destroy().catch(() => {}); };
+
+  try {
+    if (loading) { output.textContent = ui("Abriendo PDF…"); pdf = await loading.promise; pages = pdf.numPages; }
+    if (closed) return;
+    if (pages > 10_000) throw new Error(ui("El documento supera el límite de 10.000 páginas."));
+    page = Math.min(page, pages);
+    position.max = String(pages);
+    total.textContent = kind === "epub" ? ui("de {0} secciones", pages) : ui("de {0}", pages);
+
+    let chapterSelect: HTMLSelectElement | undefined;
+    const draw = async (pageNum: number, container: HTMLElement) => {
+      if (pdf) {
+        cancelPage(pageNum);
+        const source = await pdf.getPage(pageNum);
+        if (closed || !container.isConnected) { source.cleanup(); return; }
+        const native = source.getViewport({ scale: 1 });
+        const scale = Math.min(2, Math.max(0.1, (viewport.clientWidth - 40) / native.width), Math.sqrt(16_000_000 / (native.width * native.height)));
+        const size = source.getViewport({ scale });
+        const canvas = node("canvas");
+        canvas.width = Math.ceil(size.width);
+        canvas.height = Math.ceil(size.height);
+        canvas.setAttribute("aria-label", ui("Página {0}", pageNum));
+        container.append(canvas);
+        const task = source.render({ canvas, viewport: size });
+        tasks.set(pageNum, task);
+        try { await task.promise; }
+        catch (e) { if (e && typeof e === "object" && (e as { name?: string }).name === "RenderingCancelledException") return; throw e; }
+        finally { if (tasks.get(pageNum) === task) tasks.delete(pageNum); source.cleanup(); }
+      } else if (kind === "epub") {
+        const response = await fetch(safeUrls[pageNum - 1]);
+        if (!response.ok) throw new Error(ui("No se pudo abrir la sección del EPUB."));
+        const blocks: { text?: string; tag?: string; image?: string; alt?: string }[] = await response.json();
+        if (closed || !container.isConnected) return;
+        const article = node("article", undefined, "epub-section");
+        for (const block of blocks) {
+          if (block.text) article.append(node((["h1","h2","h3","h4","h5","h6","li","blockquote"].includes(block.tag ?? "") ? block.tag : "p") as "p", block.text));
+          else if (block.image) {
+            const safeSrc = /^image-\d+\.(png|jpe?g|webp|gif|avif)$/.test(block.image) ? safeUrls[pageNum - 1].replace(/section-\d+\.json$/, block.image) : "";
+            if (safeSrc) { const img = node("img"); img.loading="lazy"; img.alt = block.alt || ""; img.src = safeSrc; article.append(img); }
+          }
+        }
+        container.append(article);
+      } else {
+        if (closed || !container.isConnected) return;
+        const pageUrl = mediaUrl(safeUrls[pageNum - 1]);
+        if (!pageUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
+        const image = node("img");
+        image.alt = ui("Página {0}", pageNum);
+        image.referrerPolicy = "no-referrer";
+        image.src = pageUrl;
+        container.append(image);
+        await image.decode();
+      }
+    };
+
+    const update = (value: number) => {
+      page = shownPage = value;
+      position.value = String(page);
+      if (chapterSelect) chapterSelect.value = String(page);
+      prev.disabled = page <= 1;
+      next.disabled = page >= pages;
+      if (entry.target) persist(entry.target, page, "page", page === pages, error);
+    };
+
+    const render = async () => {
+      if (closed || rendering) return;
+      rendering = true;
+      prev.disabled = next.disabled = position.disabled = pagedBtn.disabled = contBtn.disabled = true;
+      try {
+        cancelAllTasks();
+        clearViewport();
+        output.textContent = "";
+        await draw(page, viewport);
+        if (closed) return;
+        viewport.scrollTop = 0;
+        update(page);
+      } catch (e) {
+        if (!closed) { page = shownPage || 1; position.value = String(page); error(e); }
+      } finally {
+        rendering = false;
+        if (!closed) {
+          prev.disabled = page <= 1;
+          next.disabled = page >= pages;
+          position.disabled = pagedBtn.disabled = contBtn.disabled = false;
+        }
+      }
+    };
+
+    const go = (value: number) => {
+      if (rendering) return;
+      page = Math.max(1, Math.min(pages, Number.isFinite(value) ? Math.floor(value) : page));
+      if (continuous) continuous.go(page);
+      else void render();
+    };
+
+    prev.addEventListener("click", () => go(page - 1));
+    next.addEventListener("click", () => go(page + 1));
+    if(kind==="epub"){
+      const contents=node("select");contents.setAttribute("aria-label",ui("Índice"));
+      const response=await fetch(safeUrls[0].replace(/section-\d+\.json$/, "contents.json"));
+      if(response.ok && dialog.open){
+        const titles:string[]=await response.json();
+        titles.forEach((title,i)=>contents.add(new Option(title || ui("Capítulo {0}",i+1),String(i+1))));
+        contents.value=String(page);contents.onchange=()=>go(Number(contents.value));toolbar.prepend(contents);
+        chapterSelect = contents;
+      }
+    }
+    position.addEventListener("change", () => go(Number(position.value)));
+
+    dialog.addEventListener("keydown", event => {
+      const target = event.target as HTMLElement | null;
+      if (target?.matches("input,select")) return;
+      const isTv = document.documentElement.classList.contains("television");
+      if (isTv && (continuous || target !== viewport)) return;
+      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+        event.preventDefault();
+        go(page + (event.key === "ArrowRight" ? 1 : -1));
+      } else if (chapterNav && event.key === "[" && chapterNav.hasPrev) {
+        event.preventDefault();
+        dialog.addEventListener("close", () => chapterNav.openPrev(), { once: true });
+        dialog.close();
+      } else if (chapterNav && event.key === "]" && chapterNav.hasNext) {
+        event.preventDefault();
+        dialog.addEventListener("close", () => chapterNav.openNext(), { once: true });
+        dialog.close();
+      }
+    });
+
+    const syncModeButtons = () => {
+      pagedBtn.classList.toggle("active", readingMode === "paged");
+      pagedBtn.setAttribute("aria-pressed", String(readingMode === "paged"));
+      contBtn.classList.toggle("active", readingMode === "continuous");
+      contBtn.setAttribute("aria-pressed", String(readingMode === "continuous"));
+      scrollTopBtn.hidden = readingMode !== "continuous" || viewport.scrollTop < 420;
+    };
+
+    const applyMode = async () => {
+      continuous?.close();
+      continuous = undefined;
+      cancelAllTasks();
+      clearViewport();
+      syncModeButtons();
+      motion.enable(readingMode === "continuous");
+      if (readingMode === "continuous") {
+        continuous = continuousReader(viewport, pages, page, draw, update, cancelPage);
+      } else {
+        await render();
+      }
+    };
+
+    const switchMode = async (nextMode: "paged" | "continuous") => {
+      if (readingMode === nextMode) return;
+      readingMode = nextMode;
+      pagedBtn.disabled = contBtn.disabled = true;
+      try {
+        if (entry.target) await invokeProfile("reader_mode", { id: entry.target.itemId, mode: readingMode });
+        if (!closed) await applyMode();
+      } catch (e) {
+        error(e);
+      } finally {
+        pagedBtn.disabled = contBtn.disabled = false;
+      }
+    };
+
+    pagedBtn.onclick = () => void switchMode("paged");
+    contBtn.onclick = () => void switchMode("continuous");
+
+    if (entry.target) {
+      const savedMode = await invokeProfile<string>("reader_mode", { id: entry.target.itemId, mode: null });
+      readingMode = savedMode === "continuous" ? "continuous" : "paged";
+    }
+    if (closed) return;
+    await applyMode();
+  } catch (e) {
+    if (!closed) error(e);
+  }
+}

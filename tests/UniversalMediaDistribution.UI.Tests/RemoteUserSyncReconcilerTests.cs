@@ -7,6 +7,32 @@ namespace UniversalMediaDistribution.UI.Tests;
 public sealed class RemoteUserSyncReconcilerTests
 {
     [Fact]
+    public async Task DeletedBackupIsRecreatedOnlyByExplicitUploadAtTheObservedRevision()
+    {
+        var client = new DeletedSnapshotClient();
+        var store = new ReconciliatingStore(CreateDocument("local", "organization:local", 1));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            RemoteUserSyncReconciler.SynchronizeAsync(client, store, "local", "Local").AsTask());
+        Assert.Null(client.ExpectedRevision);
+        var result = await RemoteUserSyncReconciler.SynchronizeAsync(
+            client, store, "local", "Local", recreateDeletedSnapshot: true);
+        Assert.Equal(7, client.ExpectedRevision);
+        Assert.Equal(8, result.BaselineRevision);
+    }
+
+    private sealed class DeletedSnapshotClient : StubRemoteMediaServerClient, IRemoteMediaServerClient
+    {
+        public long? ExpectedRevision { get; private set; }
+        public ValueTask<RemoteSnapshotState> ReadSnapshotStateAsync(CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(new RemoteSnapshotState(7, null));
+        public override ValueTask<RemoteSyncWriteResult> UploadSnapshotAsync(
+            UserSyncDocument document, long expectedRevision, CancellationToken cancellationToken = default)
+        {
+            ExpectedRevision = expectedRevision;
+            return ValueTask.FromResult(new RemoteSyncWriteResult(8, DateTimeOffset.UtcNow, document.DeviceId));
+        }
+    }
+    [Fact]
     public async Task ConcurrentWrite_PullsMergesAndRetries()
     {
         var local = CreateDocument("local", "organization:local", 1);

@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Universal Media Distribution</title>
+  </head>
+  <body>
+    <div id="rail-host">
+      <aside class="sidebar" id="rail" aria-label="Navegación">
+        <div class="brand"><img src="/umd-icon.png" alt="" width="38" height="38"><div><strong>UMD</strong><small>Universal Media Distribution</small></div></div>
+        <nav aria-label="Biblioteca">
+          <button class="nav-item active" data-icon="home" id="all" aria-pressed="true" aria-current="page">Inicio</button>
+          <button class="nav-item" data-icon="movies" id="movies" aria-pressed="false">Cine y series</button>
+          <button class="nav-item" data-icon="anime" id="anime" aria-pressed="false">Anime</button>
+          <button class="nav-item" data-icon="books" id="books" aria-pressed="false">Libros y manga</button>
+          <button class="nav-item" data-icon="audio" id="audio" aria-pressed="false">Audio</button>
+          <button class="nav-item" data-icon="live-tv" id="streams-open">TV y video online</button>
+          <button class="nav-item" data-icon="compass" id="provider-nav" data-open="provider-open">Explorar proveedores</button>
+        </nav>
+        <nav aria-label="Colección personal" class="nav-group">
+          <p>Colección personal</p>
+          <button class="nav-item" data-icon="heart" id="favorites" aria-pressed="false">Favoritos</button>
+          <button class="nav-item" data-icon="lists" id="lists-open">Mis listas</button>
+          <button class="nav-item" data-icon="downloads" id="downloads-open">Descargas</button>
+        </nav>
+        <nav aria-label="Comunidad" class="nav-group">
+          <p>Comunidad</p>
+          <button class="nav-item" data-icon="friends" id="friends-open">Amigos</button>
+          <button class="nav-item" data-icon="party" id="party-open">Sala de reproducción</button>
+        </nav>
+        <div class="sidebar-bottom"><button class="nav-item" data-icon="settings" id="settings-open">Configuración</button></div>
+      </aside>
+    </div>
+    <dialog id="mobile-nav" aria-label="Navegación"><button class="close" data-close aria-label="Cerrar">×</button></dialog>
+    <main>
+      <header class="toolbar">
+        <button class="icon-button" data-icon="menu" id="menu-open" aria-label="Abrir menú" aria-haspopup="dialog"></button>
+        <label class="search" data-icon="search">
+          <input id="search" type="search" placeholder="Buscar en tu biblioteca" aria-label="Buscar en el catálogo" maxlength="200" />
+          <kbd>Ctrl F</kbd>
+        </label>
+        <button id="provider-open" class="search-providers" data-icon="compass">Buscar en proveedores</button>
+        <button id="profiles-open" class="profile-trigger" data-icon="profile">Perfiles</button>
+      </header>
+      <span id="activity" role="status" hidden>Cargando…</span>
+      <p id="status" role="status" aria-live="polite"></p>
+      <div class="workspace">
+        <!-- Page: Catalog / Home / Sections -->
+        <section id="page-catalog" data-page="catalog">
+          <div class="page-heading">
+            <h1 id="heading">Inicio</h1>
+          </div>
+          <section id="feature" class="feature" hidden>
+            <div class="feature-art" aria-hidden="true"></div>
+            <div class="feature-copy">
+              <p id="feature-label" class="feature-label"></p>
+              <h2 id="feature-title"></h2>
+              <p id="feature-description"></p>
+              <div class="feature-actions">
+                <button class="primary" id="feature-action" data-icon="play"></button>
+                <button id="empty-import" data-icon="import">Importar catálogo</button>
+              </div>
+            </div>
+          </section>
+          <section id="shortcuts" class="shortcuts" aria-label="Accesos rápidos" hidden>
+            <button data-open="provider-open" data-icon="compass">Buscar en proveedores</button>
+            <button data-open="streams-open" data-icon="live-tv">TV y video online</button>
+            <button data-open="lists-open" data-icon="lists">Mis listas</button>
+          </section>
+
+          <!-- Home Continue Shelf -->
+          <section id="continue-shelf" class="shelf-section" aria-labelledby="continue-heading" hidden>
+            <div class="collection-heading">
+              <div><h2 id="continue-heading">Seguir viendo y leyendo</h2><span id="continue-count"></span></div>
+            </div>
+            <div class="shelf-host">
+              <div id="continue-cards" class="shelf-row"></div>
+              <button type="button" class="shelf-nav shelf-prev" aria-label="Desplazar a la izquierda">‹</button>
+              <button type="button" class="shelf-nav shelf-next" aria-label="Desplazar a la derecha">›</button>
+            </div>
+          </section>
+
+          <!-- Online Server Shelf -->
+          <section id="online-shelf" class="shelf-section" aria-labelledby="online-heading" hidden>
+            <div class="collection-heading">
+              <div><h2 id="online-heading">Catálogo del servidor</h2></div>
+            </div>
+            <p id="online-status" role="status"></p>
+            <div class="shelf-host">
+              <div id="online-cards" class="catalog"></div>
+              <button type="button" class="shelf-nav shelf-prev" aria-label="Desplazar a la izquierda">‹</button>
+              <button type="button" class="shelf-nav shelf-next" aria-label="Desplazar a la derecha">›</button>
+            </div>
+            <button type="button" id="online-more" class="load-more" hidden>Ver más del servidor</button>
+          </section>
+
+          <!-- Home Media Shelves (shown on Home in shelf mode) -->
+          <div id="home-shelves" hidden></div>
+
+          <!-- Home Live TV Banner (Avalonia parity) -->
+          <section id="home-livetv-card" class="surface-banner" hidden>
+            <div>
+              <h2>TV y video online</h2>
+              <p class="muted">Cargá canales en vivo desde listas M3U o fuentes integradas con bloqueo de anuncios.</p>
+            </div>
+            <button type="button" class="primary" data-open="streams-open" data-icon="live-tv">Abrir TV en vivo</button>
+          </section>
+
+          <!-- Catalog Bar & Filters -->
+          <div class="collection-heading" id="collection-bar">
+            <div><h2 id="collection-title">Tu biblioteca</h2><span id="result-count"></span></div>
+            <div class="collection-controls">
+              <button type="button" id="shelves-toggle" class="chip-button" hidden>Ver todo en cuadrícula</button>
+              <button type="button" id="filters-toggle" class="chip-button" data-icon="filters" aria-expanded="false" aria-controls="advanced">Filtros<span id="filters-count" class="count" hidden></span></button>
+              <div role="group" aria-label="Vista del catálogo" class="view-switch">
+                <button id="grid-view" data-icon="grid" aria-label="Vista de portadas" title="Vista de portadas" aria-pressed="true"></button>
+                <button id="list-view" data-icon="lists" aria-label="Vista de lista" title="Vista de lista" aria-pressed="false"></button>
+              </div>
+            </div>
+          </div>
+          <div id="advanced" hidden>
+            <label>Medio<select id="media-type"><option value="">Todos los medios</option><option value="movie">Películas y series</option><option value="book">Libros y manga</option><option value="audio">Audio</option></select></label>
+            <label>Género<select id="genre"><option value="">Todos</option><option value="action">Acción</option><option value="adventure">Aventura</option><option value="comedy">Comedia</option><option value="crime">Crimen</option><option value="documentary">Documental</option><option value="drama">Drama</option><option value="ecchi">Ecchi</option><option value="family">Familiar</option><option value="fantasy">Fantasía</option><option value="harem">Harem</option><option value="historical">Histórico</option><option value="horror">Terror</option><option value="isekai">Isekai</option><option value="josei">Josei</option><option value="magic">Magia</option><option value="martial-arts">Artes marciales</option><option value="mecha">Mecha</option><option value="military">Militar</option><option value="music">Música</option><option value="mystery">Misterio</option><option value="psychological">Psicológico</option><option value="reality">Telerrealidad</option><option value="romance">Romance</option><option value="school">Escolar</option><option value="science-fiction">Ciencia ficción</option><option value="seinen">Seinen</option><option value="shoujo">Shoujo</option><option value="shounen">Shounen</option><option value="slice-of-life">Cosas de la vida</option><option value="sports">Deportes</option><option value="supernatural">Sobrenatural</option><option value="suspense">Suspenso</option><option value="thriller">Thriller</option><option value="tragedy">Tragedia</option><option value="war">Guerra</option><option value="western">Oeste</option></select></label>
+            <label>Año<datalist id="year-choices"></datalist><input list="year-choices" id="year" type="number" min="1800" max="2200"></label>
+            <label>Categoría<datalist id="category-choices"></datalist><input list="category-choices" id="category" maxlength="100"></label>
+            <label>Distribuidor<datalist id="distributor-choices"></datalist><input list="distributor-choices" id="distributor" maxlength="100"></label>
+            <label>Estado<select id="publication"><option value="">Todos</option><option value="announced">Anunciado</option><option value="ongoing">En curso</option><option value="completed">Finalizado</option><option value="paused">En pausa</option><option value="cancelled">Cancelado</option></select></label>
+            <label>Cine y series<select id="subtype-group"><option value="">Todos</option><option value="anime">Anime</option><option value="liveAction">Acción real</option></select></label>
+            <label id="list-filter-wrap" hidden>Lista<select id="list-filter"><option value="">Todas las listas</option></select></label>
+            <label class="toggle-row filter-toggle"><input type="checkbox" id="favorites-only"><span>Solo títulos favoritos</span></label>
+            <button type="button" id="filters-clear">Limpiar filtros</button>
+          </div>
+          <section id="catalog" class="catalog" aria-label="Títulos"></section>
+          <section id="empty" class="empty" hidden>
+            <h2 id="empty-title"></h2><p id="empty-description"></p>
+            <button id="empty-reset">Limpiar filtros</button>
+            <button id="empty-browse" data-open="provider-open">Buscar en proveedores</button>
+          </section>
+          <button id="more" class="load-more" hidden>Cargar más</button>
+        </section>
+
+        <!-- Page: Item Detail (Full Page, NOT a modal!) -->
+        <section id="page-detail" data-page="detail" aria-labelledby="detail-title" hidden>
+          <div id="detail" class="detail-page"></div>
+        </section>
+
+        <!-- Page: Live TV & Online Video -->
+        <section id="page-streams" data-page="streams" aria-labelledby="streams-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="streams-title">TV y video online</h1>
+              <p class="muted">Reproducí listas IPTV M3U, canales en vivo o enlaces de video directos con filtro de anuncios.</p>
+            </div>
+            <label class="inline-field">Bloqueo de anuncios
+              <select id="player-ad-filter" disabled>
+                <option value="basic">Básica</option>
+                <option value="standard">Estándar</option>
+                <option value="complete">Completa</option>
+                <option value="off">Desactivada</option>
+              </select>
+            </label>
+          </header>
+          <div class="surface-panel">
+            <form id="streams-form" class="streams-form-grid">
+              <label class="field">Fuente<select id="streams-kind"><option value="all">Todas las fuentes</option><option value="playlist">Lista de canales M3U</option><option value="cablevision">CableVisionHD</option><option value="tv-internet">TV por Internet HD</option><option value="futbol">TV Libre Fútbol</option><option value="video">Enlace de video</option></select></label>
+              <label class="field">Dirección<input type="url" id="streams-address" required maxlength="4096" /></label>
+              <div class="streams-form-actions">
+                <button class="primary" id="streams-submit">Cargar canales</button>
+                <button type="button" id="streams-web" hidden>Abrir página en UMD</button>
+              </div>
+            </form>
+          </div>
+          <p id="streams-status" class="page-status" role="status" aria-live="polite"></p>
+          <section id="streams-channels" hidden>
+            <div class="surface-panel streams-filter-bar">
+              <label class="field">Buscar canal<input type="search" id="streams-filter" placeholder="Filtrar por nombre o grupo…"></label>
+              <label class="field">Proveedor<select id="streams-provider"><option value="">Todos los proveedores</option></select></label>
+              <label class="field">Grupo<select id="streams-group"><option value="">Todos los grupos</option></select></label>
+              <span id="streams-count" class="muted"></span>
+            </div>
+            <div id="streams-results" class="channel-grid"></div>
+            <button id="streams-more" class="load-more" hidden>Mostrar más</button>
+          </section>
+        </section>
+
+        <!-- Page: Explore Providers -->
+        <section id="page-provider" data-page="provider" aria-labelledby="provider-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="provider-title">Explorar proveedores</h1>
+              <p class="muted">Buscá títulos en tu biblioteca, tu servidor y proveedores en línea para agregarlos a tu catálogo.</p>
+            </div>
+            <button type="button" id="provider-daily" data-icon="anime">Novedades del día</button>
+          </header>
+          <div class="surface-panel">
+            <form id="provider-form">
+              <label class="field">Proveedor<select id="provider-site"><option value="all">Biblioteca, servidor y proveedores</option><option value="local">Biblioteca</option><option value="server">Servidor</option><option value="capibaratraductor">CapibaraTraductor</option><option value="olympusxyz">OlympusXYZ</option><option value="animetmo">AnimeTMO</option><option value="animeav1">AnimeAV1</option><option value="leercapitulo">LeerCapitulo</option><option value="zonatmo">ZonaTMO</option><option value="uchuujinmangas">Uchuujin Mangas</option><option value="manhwaweb">ManhwaWeb</option><option value="jkanime">JKAnime</option><option value="doramasflix">DoramasFlix</option><option value="framextv">FramexTV</option><option value="pelisplus">PelisPlus</option><option value="pelisplus-to">PelisPlus.to</option><option value="pelisflix-hd">Pelisflix HD</option><option value="poseidon-hd2">Poseidon HD2</option><option value="seriesflix">Seriesflix</option></select></label>
+              <label class="field">Título<input id="provider-query" type="search" placeholder="Nombre del anime, película, serie o manga…" maxlength="200" required /></label>
+              <button type="submit" class="primary">Buscar</button>
+            </form>
+            <details class="provider-prefs-box"><summary>Preferencias de búsqueda y filtro +18</summary>
+              <label class="toggle-row"><input type="checkbox" id="hide-adult"> Ocultar contenido +18</label>
+              <div id="provider-preferences"></div>
+            </details>
+          </div>
+          <p id="provider-status" class="page-status" role="status" aria-live="polite"></p>
+          <ul id="provider-results"></ul>
+          <button id="provider-more" class="load-more" hidden>Cargar más</button>
+        </section>
+
+        <!-- Page: My Lists -->
+        <section id="page-lists" data-page="lists" aria-labelledby="lists-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="lists-title">Mis listas</h1>
+              <p class="muted">Organizá tus títulos en colecciones personales y compartilas con un enlace público.</p>
+            </div>
+            <div id="list-links" class="button-row">
+              <button type="button" id="shared-open">Abrir enlace</button>
+              <button type="button" id="shared-owned">Mis enlaces publicados</button>
+            </div>
+          </header>
+          <div class="surface-panel">
+            <form id="lists-create">
+              <label class="field">Nueva lista<input maxlength="80" placeholder="Ej. Para ver el fin de semana" required></label>
+              <button type="submit" class="primary">Crear lista</button>
+            </form>
+          </div>
+          <p id="lists-status" class="page-status" role="status"></p>
+          <div id="lists-content"></div>
+        </section>
+
+        <!-- Page: BitTorrent Downloads -->
+        <section id="page-downloads" data-page="downloads" aria-labelledby="downloads-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="downloads-title">Descargas BitTorrent</h1>
+              <p class="muted">Descargá, elegí archivos y reproducí video o audio mientras se descargan.</p>
+            </div>
+            <button type="button" id="downloads-refresh">Actualizar</button>
+          </header>
+          <div class="stats-grid" id="downloads-stats">
+            <div class="stat-tile"><span class="stat-label">Descargas</span><strong id="stat-downloads-total">0</strong></div>
+            <div class="stat-tile"><span class="stat-label">Activas</span><strong id="stat-downloads-active" class="accent-mint">0</strong></div>
+            <div class="stat-tile"><span class="stat-label">Descargado</span><strong id="stat-downloads-size" class="accent-blue">0 MiB</strong></div>
+          </div>
+          <div class="surface-panel">
+            <form id="downloads-form" class="downloads-form-row">
+              <label class="field">Enlace magnet<input id="magnet" placeholder="magnet:?xt=urn:btih:…" required maxlength="16384"></label>
+              <div class="button-row">
+                <button class="primary">Descargar</button>
+                <button type="button" id="torrent-file">Abrir .torrent…</button>
+              </div>
+            </form>
+          </div>
+          <p id="downloads-status" class="page-status" role="status"></p>
+          <div id="downloads-results"></div>
+        </section>
+
+        <!-- Page: Friends -->
+        <section id="page-friends" data-page="friends" aria-labelledby="friends-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="friends-title">Amigos</h1>
+              <p class="muted">Compará bibliotecas, compartí progreso y mirá títulos juntos en una sala.</p>
+            </div>
+            <button type="button" class="primary" data-open="party-open" data-icon="party">Sala de reproducción</button>
+          </header>
+          <p id="friends-status" class="page-status" role="status"></p>
+          <div id="friends-content"></div>
+        </section>
+
+        <!-- Page: Watch Party -->
+        <section id="page-party" data-page="party" aria-labelledby="party-title" hidden>
+          <header class="page-header">
+            <div>
+              <h1 id="party-title">Sala de reproducción</h1>
+              <p class="muted">Sincronizá la reproducción con tus amigos en tiempo real.</p>
+            </div>
+          </header>
+          <p id="party-status" class="page-status" role="status"></p>
+          <div id="party-content"></div>
+        </section>
+      </div>
+    </main>
+
+    <!-- Overlays / Modals (only genuine modal overlays) -->
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <header class="dialog-header"><h2 id="settings-title">Configuración</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
+      <div class="settings-sections">
+        <section class="settings-group"><h3>Biblioteca y servidor</h3>
+          <label class="toggle-row"><input type="checkbox" id="online-enabled" checked><span>Consultar el catálogo online en la biblioteca</span></label>
+          <button type="button" id="connect" data-icon="server">Conectar servidor</button>
+          <button type="button" id="import" data-icon="import">Importar catálogo</button>
+          <button type="button" id="export" data-icon="export">Exportar catálogo</button>
+        </section>
+        <section class="settings-group"><h3>Bloqueo de anuncios</h3>
+          <label class="field">Protección del reproductor<select id="settings-filter-mode"><option value="off">Desactivada</option><option value="basic">Básica</option><option value="standard">Estándar</option><option value="complete">Completa</option></select></label>
+          <div class="button-row"><button type="button" id="filters-update" class="quiet-btn">Actualizar listas de filtros</button></div>
+          <output id="filters-status" class="settings-output"></output>
+          <details class="settings-details"><summary>Listas del bloqueador</summary><ul id="filters-sources" class="settings-list"></ul></details>
+        </section>
+        <section class="settings-group"><h3>BitTorrent</h3>
+          <label class="toggle-row"><input id="torrent-auto" type="checkbox"><span>Iniciar automáticamente los enlaces magnet abiertos con UMD</span></label>
+          <label class="toggle-row"><input id="torrent-info" type="checkbox"><span>Importar info.json al agregar una descarga</span></label>
+          <label class="toggle-row"><input id="torrent-private" type="checkbox"><span>Aceptar solo torrents privados con tracker HTTPS</span></label>
+          <label class="toggle-row"><input id="torrent-purge" type="checkbox"><span>Borrar los archivos de descargas exclusivas de este perfil al cerrar sesión</span></label>
+          <label class="toggle-row"><input id="torrent-resume" type="checkbox"><span>Reanudar rápidamente al reiniciar</span></label>
+          <div class="button-row"><button id="torrent-register" type="button" class="quiet-btn">Abrir enlaces magnet con UMD en este equipo</button></div>
+          <output id="torrent-settings-status" class="settings-output"></output>
+        </section>
+        <form id="source-settings" class="settings-group"><h3>Proveedores de contenido</h3>
+          <label class="field">Proveedor<select id="source-settings-site"></select></label>
+          <label class="field">Nombre<input id="source-settings-name" required maxlength="100"></label>
+          <label class="field">Dirección base<input id="source-settings-base" type="url" required placeholder="https://ejemplo.org/api/v1/catalog/"></label>
+          <div class="button-row">
+            <button type="submit" class="primary">Guardar proveedor</button>
+            <button type="button" id="source-settings-remove" class="quiet-btn">Restablecer o quitar</button>
+          </div>
+          <output id="source-settings-status" class="settings-output"></output>
+        </form>
+        <form id="metadata-settings" class="settings-group"><h3>Metadatos</h3>
+          <label class="field">Idioma de los metadatos<select id="metadata-language"><option value="">Idioma de la aplicación</option><option value="es-AR">Español</option><option value="en-US">English</option><option value="ja-JP">日本語</option></select></label>
+          <label class="field">Clave de API de TMDb<input id="metadata-tmdb" type="password" maxlength="4096" autocomplete="off"></label>
+          <label class="field">ID de cliente de MyAnimeList<input id="metadata-mal" type="password" maxlength="4096" autocomplete="off"></label>
+          <div class="button-row">
+            <button type="submit" class="primary">Guardar preferencias</button>
+            <button type="button" id="metadata-clear" class="quiet-btn">Quitar credenciales guardadas</button>
+          </div>
+          <p id="metadata-setting-status" class="settings-output" role="status"></p>
+          <small class="muted">This product uses the TMDB API but is not endorsed or certified by TMDB.</small>
+        </form>
+        <section class="settings-group"><h3>Cuenta y aplicación</h3>
+          <button type="button" id="account" data-icon="profile">Cuenta y respaldo</button>
+          <button type="button" id="updates-open" data-icon="downloads" hidden>Actualizaciones</button>
+        </section>
+      </div>
+    </dialog>
+    <dialog id="profiles-dialog" aria-labelledby="profiles-title">
+      <header class="dialog-header"><h2 id="profiles-title">Perfiles locales</h2><button type="button" class="close" data-close aria-label="Cerrar perfiles">×</button></header>
+      <label class="field">Idioma<select id="ui-language"><option value="es">Español</option><option value="en">English</option></select></label>
+      <div id="profiles-list"></div>
+      <button type="button" id="profile-new">Crear perfil</button>
+      <form id="profile-form" hidden>
+        <label class="field">Nombre del perfil<input id="profile-name" maxlength="40" required></label>
+        <div class="button-row"><button class="primary">Guardar</button><button type="button" id="profile-cancel">Cancelar</button></div>
+      </form>
+      <div id="profile-confirm" hidden>
+        <p id="profile-warning"></p>
+        <div class="button-row"><button type="button" id="profile-delete">Eliminar perfil</button><button type="button" id="profile-keep">Conservar</button></div>
+      </div>
+      <details><summary>Respaldo de la biblioteca</summary>
+        <p>Podés restaurar una copia de UMD (.umddb) o del cliente .NET (.umdbackup). De .NET se importan el catálogo y los datos personales de cada perfil. La conversión excluye las sesiones, los ajustes de la aplicación, el historial de títulos eliminados y las descargas.</p>
+        <div class="button-row"><button type="button" id="copy-library">Guardar copia completa…</button><button type="button" id="restore-library">Restaurar copia…</button></div>
+        <p id="database-result" role="status"></p>
+      </details>
+      <p id="profiles-status" role="status"></p>
+    </dialog>
+    <dialog id="updates-dialog" aria-labelledby="updates-title">
+      <header class="dialog-header"><h2 id="updates-title">Actualizaciones</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
+      <p id="updates-current"></p>
+      <p id="updates-status" role="status" aria-live="polite"></p>
+      <p id="updates-notes" hidden></p>
+      <progress id="updates-progress" aria-label="Descarga de la actualización" hidden></progress>
+      <div class="button-row">
+        <button type="button" id="updates-install" class="primary" hidden>Descargar e instalar</button>
+        <button type="button" id="updates-check">Volver a buscar</button>
+      </div>
+    </dialog>
+    <dialog id="server-dialog" aria-labelledby="server-title">
+      <form id="server-form">
+        <header class="dialog-header"><h2 id="server-title">Conectar servidor</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
+        <p>Consultá el catálogo del servidor y guardá en tu biblioteca los títulos que elijas.</p>
+        <label class="field">Dirección del servidor
+          <input id="server-address" type="url" placeholder="http://127.0.0.1:9005" required maxlength="2048" />
+        </label>
+        <p id="server-error" role="alert"></p>
+        <p id="server-progress" role="status"></p>
+        <button type="submit" class="primary" id="server-submit">Conectar</button>
+      </form>
+    </dialog>
+    <dialog id="party-overlay-dialog" aria-labelledby="party-overlay-title">
+      <header class="dialog-header"><h2 id="party-overlay-title">Sala de reproducción</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
+      <p id="party-overlay-status" role="status"></p>
+      <div id="party-overlay-content"></div>
+    </dialog>
+    <div id="app-notice-stack" class="app-notice-stack" aria-live="polite"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

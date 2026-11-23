@@ -1,9 +1,12 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.IO.Compression;
 using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.RateLimiting;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using UniversalMediaDistribution.Catalog.Sync;
 using UniversalMediaDistribution.Catalog.Transfer;
 using UniversalMediaDistribution.Server;
@@ -12,6 +15,38 @@ if (await ServerMaintenance.TryRunAsync(args)) return;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 builder.Logging.AddConsole();
+const string publicCatalogPolicy = "public-catalog";
+var catalogRequestsPerMinute = ReadCatalogRequestsPerMinute();
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    // CloudPanel's local reverse proxy is the only trusted forwarding hop.
+    // Keep the framework's loopback-only trusted networks/proxies.
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor;
+    options.ForwardLimit = 1;
+});
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy(publicCatalogPolicy, context =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            context.Connection.RemoteIpAddress?.MapToIPv6() ?? System.Net.IPAddress.IPv6None,
+            _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = catalogRequestsPerMinute,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 6,
+                QueueLimit = 0
+            }));
+    options.OnRejected = (context, _) =>
+    {
+        var retryAfter = context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var delay)
+            ? Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds))
+            : 60;
+        context.HttpContext.Response.Headers.RetryAfter = retryAfter.ToString(CultureInfo.InvariantCulture);
+        context.HttpContext.Response.Headers.CacheControl = "no-store";
+        return ValueTask.CompletedTask;
+    };
+});
 builder.Services.AddRequestDecompression();
 builder.Services.AddResponseCompression(options =>
 {
@@ -78,6 +113,9 @@ builder.Services.AddHostedService(_ => new ServerDiagnosticsRetention(diagnostic
 builder.Services.AddSingleton(_ => new ManualCatalogCrawler(serverDatabase));
 builder.Services.AddHostedService(services => services.GetRequiredService<ManualCatalogCrawler>());
 var app = builder.Build();
+app.UseForwardedHeaders();
+app.UseRouting();
+app.UseRateLimiter();
 
 app.Use(async (context, next) =>
 {
@@ -335,7 +373,7 @@ app.MapGet(
             return Results.Json(new ErrorResponse("catalog_requires_pagination", exception.Message),
                 ServerJsonSerializerContext.Default.ErrorResponse, statusCode: StatusCodes.Status413PayloadTooLarge);
         }
-    });
+    }).RequireRateLimiting(publicCatalogPolicy);
 
 app.MapGet(
     "/api/v1/catalog/metadata",
@@ -343,7 +381,7 @@ app.MapGet(
     {
         var metadata = onlineCatalog.Metadata(cancellationToken);
         return metadata is null ? Results.NotFound() : Results.Ok(metadata);
-    });
+    }).RequireRateLimiting(publicCatalogPolicy);
 
 app.MapGet(
     "/api/v1/catalog/search",
@@ -351,11 +389,30 @@ app.MapGet(
         string? q,
         string? mediaType,
         int? limit,
+        string? genre,
+        int? year,
+        string? category,
+        string? status,
+        string? provider,
+        bool? browse,
+        bool? summary,
+        string? subtypeGroup,
+        string? cursor,
+        HttpContext context,
         CancellationToken cancellationToken) =>
     {
         try
         {
-            return Results.Ok(onlineCatalog.SearchDatabase(q ?? string.Empty, mediaType, limit ?? 100, cancellationToken));
+            var request = new UniversalMediaDistribution.Catalog.ContentSources.ApiContentSearchRequest(q,
+                string.IsNullOrWhiteSpace(mediaType) ? null : CatalogSubtypeResolver.ParseMediaType(mediaType),
+                string.IsNullOrWhiteSpace(genre) ? null : UniversalMediaDistribution.Catalog.ContentSources.ApiContentGenre.Parse(genre),
+                year, continuationToken: cursor, category: category, providerName: provider, browse: browse ?? false,
+                status: ParseSearchEnum<UniversalMediaDistribution.Domain.Catalog.PublicationStatus>(status),
+                subtypeGroup: ParseSearchEnum<UniversalMediaDistribution.Domain.Catalog.MediaSubtypeGroup>(subtypeGroup));
+            var page = onlineCatalog.SearchDatabasePage(request, limit ?? 100, cancellationToken, summary ?? false);
+            if (page.ContinuationToken is { } next) context.Response.Headers["X-UMD-Next-Cursor"] = next;
+            if (summary is true) context.Response.Headers["X-UMD-Summary"] = "true";
+            return Results.Ok(page.Document);
         }
         catch (CatalogSnapshotTooLargeException)
         {
@@ -371,7 +428,24 @@ app.MapGet(
                     "invalid_catalog_search",
                     exception.Message));
         }
-    });
+    }).RequireRateLimiting(publicCatalogPolicy);
+
+app.MapGet("/api/v1/catalog/recent", (CancellationToken cancellationToken) =>
+    Results.Ok(onlineCatalog.RecentlyAdded(cancellationToken))).RequireRateLimiting(publicCatalogPolicy);
+
+app.MapGet("/api/v1/catalog/items/{id:guid}", (Guid id, CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var document = onlineCatalog.ReadPublicItem(id, cancellationToken);
+        return document is null ? Results.NotFound() : Results.Ok(document);
+    }
+    catch (CatalogSnapshotTooLargeException)
+    {
+        return Results.Json(new ErrorResponse("catalog_item_too_large", "A catalog item exceeds the response size limit."),
+            ServerJsonSerializerContext.Default.ErrorResponse, statusCode: StatusCodes.Status413PayloadTooLarge);
+    }
+}).RequireRateLimiting(publicCatalogPolicy);
 
 app.MapGet("/api/v1/catalog/items", (string? cursor, int? limit, CancellationToken cancellationToken) =>
 {
@@ -382,7 +456,7 @@ app.MapGet("/api/v1/catalog/items", (string? cursor, int? limit, CancellationTok
         return Results.Json(new ErrorResponse("catalog_item_too_large", "A catalog item exceeds the response size limit."),
             ServerJsonSerializerContext.Default.ErrorResponse, statusCode: StatusCodes.Status413PayloadTooLarge);
     }
-});
+}).RequireRateLimiting(publicCatalogPolicy);
 
 app.MapGet(
     "/api/v1/sync/snapshot",
@@ -461,9 +535,8 @@ app.MapPatch(
             // anyone can see — which is the whole reason this endpoint exists.
             try
             {
-                await friendStore.SynchronizeAsync(
-                    authenticated.Account,
-                    saved,
+                await friendStore.RefreshActivityAsync(
+                    authenticated.Account.AccountId,
                     cancellationToken);
             }
             catch (Exception exception)
@@ -547,9 +620,8 @@ app.MapPut(
             // real payload and the projection is rebuilt by the next one.
             try
             {
-                await friendStore.SynchronizeAsync(
-                    authenticated.Account,
-                    saved,
+                await friendStore.RefreshActivityAsync(
+                    authenticated.Account.AccountId,
                     cancellationToken);
             }
             catch (Exception exception)
@@ -1499,6 +1571,13 @@ static string GetClientAddress(HttpContext context) =>
         .ToString() ??
     "unknown";
 
+static T? ParseSearchEnum<T>(string? value) where T : struct, Enum
+{
+    if (string.IsNullOrWhiteSpace(value)) return null;
+    return Enum.TryParse<T>(value, ignoreCase: true, out var parsed) && Enum.IsDefined(parsed)
+        ? parsed : throw new ArgumentException("Invalid catalog filter value.");
+}
+
 static long ReadMaximumPackageBytes()
 {
     const long defaultValue = 2L * 1024 * 1024 * 1024;
@@ -1553,6 +1632,16 @@ static int ReadSessionLifetimeDays()
             ? value
             : throw new InvalidOperationException(
                 "UMD_SERVER_SESSION_DAYS must be between 1 and 365.");
+}
+
+static int ReadCatalogRequestsPerMinute()
+{
+    const string name = "UMD_SERVER_CATALOG_REQUESTS_PER_MINUTE";
+    var configured = Environment.GetEnvironmentVariable(name);
+    return string.IsNullOrWhiteSpace(configured) ? 60 :
+        int.TryParse(configured, NumberStyles.None, CultureInfo.InvariantCulture, out var limit) &&
+        limit is >= 1 and <= 6000 ? limit :
+        throw new InvalidOperationException($"{name} must be an integer between 1 and 6000.");
 }
 
 static bool ReadBoolean(string name, bool defaultValue)
@@ -2074,6 +2163,8 @@ namespace UniversalMediaDistribution.Server
     [JsonSerializable(typeof(ServerCapabilitiesResponse))]
     [JsonSerializable(typeof(ErrorResponse))]
     [JsonSerializable(typeof(Microsoft.AspNetCore.Mvc.ProblemDetails))]
+    [JsonSerializable(typeof(ProviderCommand))]
+    [JsonSerializable(typeof(ProviderReply))]
     [JsonSerializable(typeof(ServerDiagnosticSnapshot))]
     [JsonSerializable(typeof(ServerDiagnosticLogPage))]
     [JsonSerializable(typeof(ManualCrawlRequest))]

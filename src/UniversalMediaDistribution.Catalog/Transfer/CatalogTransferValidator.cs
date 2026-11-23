@@ -593,11 +593,14 @@ public static class CatalogTransferValidator
                 errors.Add($"{path}.filePath is required for an image sequence.");
             }
 
+            var directMedia = Uri.TryCreate(source.FilePath, UriKind.Absolute, out var address) &&
+                address.Scheme is "http" or "https" && address.Host.Length > 0 &&
+                source.Torrent is { IsPrivate: false, Trackers.Count: 0 };
             ValidateTorrent(
                 source.Torrent,
                 $"{path}.torrent",
                 errors,
-                allowMissingTorrentIdentity);
+                allowMissingTorrentIdentity || directMedia);
         }
     }
 

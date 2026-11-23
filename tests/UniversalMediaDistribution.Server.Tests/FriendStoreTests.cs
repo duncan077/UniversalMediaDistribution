@@ -254,7 +254,7 @@ public sealed class FriendStoreTests
         var friends = new SqliteFriendStore(scope.Path);
         var (alice, bruno) = await CreateFriendsAsync(accounts, friends);
         var itemKey = SqliteFriendStore.CreateItemKey("book", "Copper Skies");
-        var snapshot = await PublishProgressAsync(
+        await PublishProgressAsync(
             scope,
             friends,
             bruno,
@@ -269,15 +269,38 @@ public sealed class FriendStoreTests
             bruno.AccountId,
             new FriendVisibilityUpdateRequest(false, true, []),
             CancellationToken.None);
-        await friends.SynchronizeAsync(
-            bruno,
-            snapshot,
-            CancellationToken.None);
 
         Assert.Empty(await friends.LookupActivityAsync(
             alice.AccountId,
             [itemKey],
             CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LegacyActivityRespectsCurrentSettingsAndBackupDeletion()
+    {
+        using var scope = TestDirectory.Create();
+        var friends = new SqliteFriendStore(scope.Path);
+        var (alice, bruno) = await CreateFriendsAsync(CreateAccountStore(scope), friends);
+        var key = SqliteFriendStore.CreateItemKey("book", "Copper Skies");
+        var token = CancellationToken.None;
+        var saved = await PublishProgressAsync(scope, friends, bruno, true, ("book", "Copper Skies", "75"));
+        var db = new ServerDatabase(scope.Path);
+        var path = Path.Combine(scope.Path, "friends", "visibility", bruno.AccountId.ToString("N") + ".json");
+
+        // Recreate a settings change written by an older server without rebuilding its projection.
+        await db.WriteJsonAtomicAsync(path, new FriendVisibilityRecord(true, true, [key]),
+            ServerJsonSerializerContext.Default.FriendVisibilityRecord, token);
+        Assert.Empty(await friends.LookupActivityAsync(alice.AccountId, [key], token));
+        await db.WriteJsonAtomicAsync(path, new FriendVisibilityRecord(false, true, []),
+            ServerJsonSerializerContext.Default.FriendVisibilityRecord, token);
+        Assert.Null(Assert.Single(await friends.ListFriendsAsync(alice.AccountId, token)).ProgressUpdatedAt);
+
+        await friends.SetVisibilityAsync(bruno.AccountId, new FriendVisibilityUpdateRequest(true, true, []), token);
+        Assert.Single(await friends.LookupActivityAsync(alice.AccountId, [key], token));
+        await new SqliteUserSyncStore(scope.Path).DeleteAsync(bruno.AccountId, saved.Revision, token);
+        Assert.Empty(await friends.LookupActivityAsync(alice.AccountId, [key], token));
+        Assert.False(db.Exists(SqliteFriendStore.ActivityPath(db, bruno.AccountId)));
     }
 
     [Fact]
@@ -680,9 +703,8 @@ public sealed class FriendStoreTests
             bruno.AccountId,
             new UserSyncUploadRequest(0, CreateSeriesDocument()),
             CancellationToken.None);
-        await friends.SynchronizeAsync(
-            bruno,
-            snapshot,
+        await friends.RefreshActivityAsync(
+            bruno.AccountId,
             CancellationToken.None);
 
         var match = Assert.Single(await friends.LookupActivityAsync(
@@ -884,9 +906,8 @@ public sealed class FriendStoreTests
             account.AccountId,
             new UserSyncUploadRequest(0, CreateDocument(entries)),
             CancellationToken.None);
-        await friends.SynchronizeAsync(
-            account,
-            snapshot,
+        await friends.RefreshActivityAsync(
+            account.AccountId,
             CancellationToken.None);
         return snapshot;
     }

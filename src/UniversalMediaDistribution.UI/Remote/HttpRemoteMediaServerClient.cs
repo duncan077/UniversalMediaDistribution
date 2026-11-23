@@ -34,10 +34,10 @@ internal sealed record RemoteAccountProfileResponse(
     DateTimeOffset SessionExpiresAt);
 
 internal sealed record RemoteSyncSnapshotResponse(
-    long Revision,
+    [property: JsonRequired] long Revision,
     DateTimeOffset UpdatedAt,
-    string UpdatedByDeviceId,
-    UserSyncDocument Document);
+    string? UpdatedByDeviceId,
+    [property: JsonRequired] UserSyncDocument? Document);
 
 internal sealed record RemoteSyncUploadRequest(
     long ExpectedRevision,
@@ -402,6 +402,10 @@ public sealed class HttpRemoteMediaServerClient :
     }
 
     public async ValueTask<RemoteSyncSnapshot?> GetSnapshotAsync(
+        CancellationToken cancellationToken = default) =>
+        (await ReadSnapshotStateAsync(cancellationToken)).Snapshot;
+
+    public async ValueTask<RemoteSnapshotState> ReadSnapshotStateAsync(
         CancellationToken cancellationToken = default)
     {
         var (session, token) = GetRequiredSession();
@@ -419,7 +423,7 @@ public sealed class HttpRemoteMediaServerClient :
         EnsureSecureResponse(response);
         if (response.StatusCode is HttpStatusCode.NotFound)
         {
-            return null;
+            return new RemoteSnapshotState(0, null);
         }
 
         await EnsureSuccessAsync(response, timeout.Token);
@@ -428,12 +432,14 @@ public sealed class HttpRemoteMediaServerClient :
             RemoteMediaJsonContext.Default.RemoteSyncSnapshotResponse,
             timeout.Token,
             _maximumSyncResponseBytes);
+        if (value.Revision < 0) throw new InvalidDataException("Invalid snapshot revision.");
+        if (value.Document is null) return new RemoteSnapshotState(value.Revision, null);
         var document = UserSyncDocumentMerger.Normalize(value.Document);
-        return new RemoteSyncSnapshot(
+        return new RemoteSnapshotState(value.Revision, new RemoteSyncSnapshot(
             value.Revision,
             value.UpdatedAt,
-            value.UpdatedByDeviceId,
-            document);
+            value.UpdatedByDeviceId ?? document.DeviceId,
+            document));
     }
 
     public async ValueTask<RemoteSyncWriteResult> UploadSnapshotAsync(

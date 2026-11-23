@@ -1,0 +1,34 @@
+[workspace]
+members = ["core", "providers", "server", "desktop/src-tauri"]
+default-members = ["core", "providers", "server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+umd-core = { path = "core" }
+
+# Release builds favour one well-optimised binary over compile time. Unwinding
+# stays on: the server turns a panicking request into a 500, and a panicking
+# command must not take the whole app down.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Password hashing dominates the account tests; an unoptimised KDF makes each
+# login take seconds. These few crates are cheap to optimise in dev builds.
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3

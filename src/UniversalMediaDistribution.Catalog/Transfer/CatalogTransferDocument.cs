@@ -218,7 +218,8 @@ public sealed record CatalogTransferMediaSource
 
     public int SortOrder { get; init; }
 
-    public required CatalogTransferTorrent Torrent { get; init; }
+    // HTTP media sources can carry their entire address in FilePath.
+    public CatalogTransferTorrent Torrent { get; set; } = new();
 }
 
 public sealed record CatalogTransferTorrent

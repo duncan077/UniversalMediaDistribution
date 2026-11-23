@@ -264,8 +264,14 @@ public sealed class FramexTvApiContentProvider(HttpClient httpClient) : IApiCata
                 return JsonDocument.Parse(text);
             }
             catch (HttpRequestException exception) when (i + 1 < roots.Length &&
+                exception is not CatalogProviderThrottledException &&
                 (exception.StatusCode is null || (int)exception.StatusCode >= 500))
             { }
+            catch (OperationCanceledException exception) when (i + 1 < roots.Length &&
+                !cancellationToken.IsCancellationRequested && exception.InnerException is TimeoutException)
+            {
+                // An individual host timed out, not the caller's entire operation.
+            }
         }
         throw new InvalidDataException("FramexTV API unavailable.");
     }

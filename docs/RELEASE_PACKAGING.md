@@ -1,9 +1,8 @@
 # Release packaging
 
-Build with the .NET 11 RC1 SDK pinned in `global.json` and restore the matching
+Build with the stable .NET 11 SDK required by `global.json` and restore the matching
 Android workload before publishing. `Publish-Production.ps1` resolves a compatible
-SDK from `-DotnetPath`, `C:\dotnet-11`, or the standard installations; it no longer
-prefers the old Preview 7 installation.
+SDK from `-DotnetPath`, `C:\dotnet-11`, or the standard installations.
 
 For the production build, NativeAOT server deployment, package upload, signed
 manifest publication, and public verification in one command, use

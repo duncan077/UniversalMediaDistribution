@@ -9,6 +9,49 @@ namespace UniversalMediaDistribution.UI.Tests;
 
 public sealed class StreamflixApiContentProviderTests
 {
+    [Theory]
+    [InlineData("12-12-12", "12 12 12")]
+    [InlineData("1899", "1899")]
+    [InlineData("30-monedas", "30 Monedas")]
+    public async Task PelisflixUsesEpisodeCoordinatesInsteadOfDigitsInTheSeriesTitle(string slug, string title)
+    {
+        using var http = new HttpClient(new NumericSeriesHandler(slug, title));
+        IApiCatalogProvider provider = new PelisflixHdApiContentProvider(http);
+        var root = new Uri(provider.Descriptor.DefaultBaseUrl);
+        var item = await provider.LoadCatalogItemAsync(root, new ApiContentSearchItem(
+            $"serie/{slug}", new CatalogTransferItem { Name = title, MediaType = "movie", Subtype = "series" }));
+
+        Assert.Equal(["1", "2", "2.5", "3", "4"], Assert.Single(item.Seasons).Units.Select(unit => unit.DisplayNumber));
+        CatalogTransferValidator.Validate(new() { Items = [item] });
+    }
+
+    private sealed class NumericSeriesHandler(string slug, string title) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var body = request.RequestUri!.AbsolutePath.StartsWith("/serie/", StringComparison.Ordinal)
+                ? $"""
+                    <h1>{title}</h1>
+                    <a href="/temporada/{slug}-1/">Temporada 1</a>
+                    """
+                : $"""
+                    <a href="/episodio/{slug}-1x1/">Episodio 8</a>
+                    <a href="/episodio/{slug}-1x2/">{title}</a>
+                    <a href="/episodio/{slug}-1x2/?duplicate=1">Episodio 2</a>
+                    <a href="/episodio/{slug}-1x2.5/">Episodio especial</a>
+                    <a href="/episodio/{slug}-2x9/">Episodio 9</a>
+                    <a href="/episodio/{slug}-custom/">Episodio 3</a>
+                    <a href="/episodio/4/">Cuarto</a>
+                    """;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(body, Encoding.UTF8, "text/html")
+            });
+        }
+    }
+
     [Fact]
     public async Task PelisflixSearchesLoadsArtworkAndResolvesMovieServer()
     {

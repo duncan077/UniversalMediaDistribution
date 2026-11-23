@@ -1606,7 +1606,7 @@ public partial class MainViewModel(
         if (!_isRebuildingProviderFilters &&
             !_isRebuildingCatalogFilters)
         {
-            ApplyCatalogItems(resetPage: true);
+            ApplySearchCriteriaChange();
         }
     }
 
@@ -1616,7 +1616,7 @@ public partial class MainViewModel(
         NotifyCatalogFilterSelectionChanged();
         if (!_isRebuildingCatalogFilters)
         {
-            ApplyCatalogItems(resetPage: true);
+            ApplySearchCriteriaChange();
         }
     }
 
@@ -1626,7 +1626,7 @@ public partial class MainViewModel(
         NotifyCatalogFilterSelectionChanged();
         if (!_isRebuildingCatalogFilters)
         {
-            ApplyCatalogItems(resetPage: true);
+            ApplySearchCriteriaChange();
         }
     }
 
@@ -1680,10 +1680,8 @@ public partial class MainViewModel(
     }
 
     /// <summary>
-    /// Genre and year are search criteria, so changing one asks the sources
-    /// again instead of narrowing what already came back — which is the only
-    /// way to reach a title no earlier search returned. Once nothing is left
-    /// to search for, the browse grid comes back.
+    /// Changing a public filter asks the sources again, so titles not already
+    /// loaded can be found. Returning to Local/favorites cancels online work.
     /// </summary>
     private void ApplySearchCriteriaChange()
     {
@@ -1701,7 +1699,8 @@ public partial class MainViewModel(
 
         if (IsSearchActive)
         {
-            ClearSearch();
+            LeaveSearchResults();
+            ApplyCatalogItems(resetPage: true);
             return;
         }
 
@@ -1730,7 +1729,12 @@ public partial class MainViewModel(
         // Show what is already here straight away, then fill in the favourites
         // this section never loaded. Waiting for the library before redrawing
         // would make the toggle feel like it had missed the press.
-        ApplyCatalogItems(resetPage: true);
+        if (HasSearchCriteria) ApplySearchCriteriaChange();
+        else
+        {
+            if (IsSearchActive) LeaveSearchResults();
+            ApplyCatalogItems(resetPage: true);
+        }
 
         // Only the whole-library page answers from the whole library, so only
         // it needs the whole library fetched. A media-type page already holds
@@ -2568,6 +2572,7 @@ public partial class MainViewModel(
         // it left a session behind; a profile that never signed in simply
         // stays signed out.
         await InitializeRemoteServerSettingsAsync();
+        await InitializeContentSourceSettingsAsync();
         ClearSearch();
         await LoadHomeAsync();
     }
@@ -3556,16 +3561,6 @@ public partial class MainViewModel(
             SetError(AccountFeedback, null);
             StatusMessage = null;
             var settings = BuildRemoteServerSettings();
-            if (settings.ServiceUrl.Length > 0)
-            {
-                var capabilities =
-                    await remoteMediaServerClient.GetCapabilitiesAsync(
-                        new Uri(settings.ServiceUrl));
-                EnsureRemoteCapabilities(
-                    capabilities,
-                    settings.OnlineCatalogEnabled);
-            }
-
             if (IsRemoteSignedIn &&
                 !string.Equals(
                     remoteMediaServerClient.Session?.ServiceBaseUri
@@ -3580,7 +3575,7 @@ public partial class MainViewModel(
 
             await remoteServerSettingsStore.SaveAsync(settings);
             _remoteServerSettings = settings;
-            await ConfigureRemoteOnlineCatalogAsync(settings);
+            await InitializeContentSourceSettingsAsync();
             StatusMessage = UiTextCatalog.Get(
                 "RemoteServerSettingsSaved");
         }
@@ -3681,7 +3676,7 @@ public partial class MainViewModel(
             IsRemoteSyncBusy = true;
             SetError(AccountFeedback, null);
             StatusMessage = null;
-            var result = await UploadRemoteSnapshotCoreAsync();
+            var result = await UploadRemoteSnapshotCoreAsync(recreateDeletedSnapshot: true);
             StatusMessage = UiTextCatalog.Format(
                 "RemoteSnapshotUploaded",
                 result.Revision);
@@ -5426,16 +5421,20 @@ public partial class MainViewModel(
     }
 
     /// <summary>
-    /// The criteria the pickers currently describe. Genre and year belong here
-    /// because they send a new search; category and provider do not, because
-    /// they only narrow what came back.
+    /// Public metadata filters trigger a search even without text. Favorites
+    /// and the explicit Local choice keep the entire operation local.
     /// </summary>
     private CatalogSearchSelection CurrentSearchSelection => new(
         SearchQuery,
         _selectedMediaType,
         _selectedSubtypeGroup,
         SelectedGenreFilter?.Genre,
-        SelectedYearFilter?.Year);
+        SelectedYearFilter?.Year,
+        SelectedCategoryFilter?.Category,
+        SelectedStatusFilter?.Status,
+        SelectedProviderFilter?.Kind is ContentProviderFilterKind.Named ? SelectedProviderFilter.DisplayName : null,
+        SelectedProviderFilter?.Kind is ContentProviderFilterKind.Online,
+        ShowFavoritesOnly || SelectedProviderFilter?.Kind is ContentProviderFilterKind.Local);
 
     /// <summary>
     /// Whether there is anything to search for. A genre or a year is enough on
@@ -5444,14 +5443,8 @@ public partial class MainViewModel(
     public bool HasSearchCriteria => CurrentSearchSelection.HasCriteria;
 
     /// <summary>
-    /// Whether a picker is narrowing the catalog without being something the
-    /// sources can be asked about.
-    /// <para>
-    /// Provider and category describe what came back rather than what to go and
-    /// fetch — the category list is built from the results themselves, so there
-    /// is no query to send for one. Searching on them alone is therefore a
-    /// narrower view of the catalog, not a request.
-    /// </para>
+    /// Picker selections retained for display, clear, and local-only browsing.
+    /// Public metadata selections also participate in HasSearchCriteria.
     /// </summary>
     public bool HasCatalogFilters =>
         HasSelectedProvider ||
@@ -7611,7 +7604,8 @@ public partial class MainViewModel(
     private async Task ResolveAndOpenApiImagesAsync(
         ApiContentUnitLookupSelection selection,
         string? preferredProviderId,
-        bool automaticallyChooseProvider)
+        bool automaticallyChooseProvider,
+        bool findNextChapter = false)
     {
         var lookupCancellation = BeginApiUnitLookup();
         var cancellationToken = lookupCancellation.Token;
@@ -7627,7 +7621,8 @@ public partial class MainViewModel(
                     .FindApiImageCandidatesForUnitAsync(
                         selection.Details,
                         selection.Unit,
-                        cancellationToken);
+                        cancellationToken,
+                        findNextChapter);
             if (!automaticallyChooseProvider && candidates.Count > 1)
             {
                 ShowApiImageProviderChoices(
@@ -7664,7 +7659,8 @@ public partial class MainViewModel(
                                     selection.Details,
                                     selection.Unit,
                                     candidates[candidateIndex],
-                                    cancellationToken);
+                                    cancellationToken,
+                                    findNextChapter);
                         await ApplyApiImageResolutionAsync(
                             selection,
                             automaticResolution);
@@ -7806,7 +7802,8 @@ public partial class MainViewModel(
             artworkReferrer: resolution.ArtworkReferrer,
             contentSourceProviderId: resolution.ProviderId);
         Reader = await ImageReaderViewModel.CreateAsync(
-            selection.Title,
+            ApiContentUnitRequest.DisplayNumbersMatch(selection.Unit.DisplayNumber, resolution.Unit.DisplayNumber)
+                ? selection.Title : BuildUnitTitle(resolution.Unit),
             resolution.Unit.Identity,
             resolution.Details.Identity,
             resolution.ImageSet,
@@ -8649,11 +8646,6 @@ public partial class MainViewModel(
 
     private async Task InitializeRemoteServerSettingsAsync()
     {
-        if (!SupportsRemoteSync)
-        {
-            return;
-        }
-
         try
         {
             ApplyRemoteServerSettings(
@@ -8666,7 +8658,10 @@ public partial class MainViewModel(
                 exception.Message));
         }
 
-        await RestoreRemoteSessionAsync();
+        if (SupportsRemoteSync)
+        {
+            await RestoreRemoteSessionAsync();
+        }
     }
 
     /// <summary>
@@ -8820,9 +8815,7 @@ public partial class MainViewModel(
             var capabilities =
                 await remoteMediaServerClient.GetCapabilitiesAsync(
                     serviceUri);
-            EnsureRemoteCapabilities(
-                capabilities,
-                settings.OnlineCatalogEnabled);
+            EnsureRemoteCapabilities(capabilities);
             if (register && !capabilities.AccountRegistration)
             {
                 throw new InvalidOperationException(
@@ -8832,7 +8825,7 @@ public partial class MainViewModel(
 
             await remoteServerSettingsStore.SaveAsync(settings);
             _remoteServerSettings = settings;
-            await ConfigureRemoteOnlineCatalogAsync(settings);
+            await InitializeContentSourceSettingsAsync();
             if (remoteMediaServerClient.Session is not null)
             {
                 // Including its watch party, or the incoming account would
@@ -8936,40 +8929,6 @@ public partial class MainViewModel(
         ClearRemoteSession();
     }
 
-    private async Task ConfigureRemoteOnlineCatalogAsync(
-        RemoteServerSettings settings)
-    {
-        var current = await contentSourceCatalogService.LoadSettingsAsync();
-        var catalogBaseUrl = settings.ServiceUrl.Length == 0
-            ? string.Empty
-            : new Uri(
-                new Uri(settings.ServiceUrl),
-                "api/v1/catalog/")
-                .AbsoluteUri;
-        var providers = current.Providers
-            .Select(provider =>
-                string.Equals(
-                    provider.Id,
-                    "umd-json-api",
-                    StringComparison.Ordinal)
-                    ? provider with
-                    {
-                        DisplayName = UiTextCatalog.Get(
-                            "RemoteOnlineCatalogProvider"),
-                        IsEnabled =
-                            settings.OnlineCatalogEnabled,
-                        BaseUrl = catalogBaseUrl
-                    }
-                    : provider)
-            .ToArray();
-        ApplyContentSourceSettings(
-            await contentSourceCatalogService.SaveSettingsAsync(
-                new ContentSourceProviderSettings
-                {
-                    Providers = providers
-                }));
-    }
-
     /// <summary>
     /// Reads what the signed-in server supports, without treating an
     /// unreachable one as a problem: this runs on the startup path, where the
@@ -9008,9 +8967,7 @@ public partial class MainViewModel(
         }
     }
 
-    private void EnsureRemoteCapabilities(
-        RemoteServerCapabilities capabilities,
-        bool requireOnlineCatalog)
+    private void EnsureRemoteCapabilities(RemoteServerCapabilities capabilities)
     {
         ArgumentNullException.ThrowIfNull(capabilities);
 
@@ -9031,9 +8988,7 @@ public partial class MainViewModel(
             !capabilities.Accounts ||
             !capabilities.BackupSync ||
             capabilities.SyncProtocolVersion <
-                UserSyncDocument.CurrentVersion ||
-            requireOnlineCatalog &&
-            !capabilities.OnlineCatalog)
+                UserSyncDocument.CurrentVersion)
         {
             throw new InvalidOperationException(
                 UiTextCatalog.Get("RemoteServerIncompatible"));
@@ -9042,12 +8997,12 @@ public partial class MainViewModel(
 
     private async ValueTask RefreshRemoteSnapshotStateAsync()
     {
-        var snapshot =
-            await remoteMediaServerClient.GetSnapshotAsync();
+        var state = await remoteMediaServerClient.ReadSnapshotStateAsync();
+        var snapshot = state.Snapshot;
         if (snapshot is null)
         {
             ApplyRemoteSnapshotState(
-                revision: 0,
+                revision: state.Revision,
                 updatedAt: null,
                 hasSnapshot: false);
             return;
@@ -9060,7 +9015,7 @@ public partial class MainViewModel(
     }
 
     private async ValueTask<RemoteSyncWriteResult>
-        UploadRemoteSnapshotCoreAsync()
+        UploadRemoteSnapshotCoreAsync(bool recreateDeletedSnapshot = false)
     {
         if (userSyncStore is null)
         {
@@ -9074,7 +9029,7 @@ public partial class MainViewModel(
                 userSyncStore,
                 _remoteServerSettings.DeviceId,
                 RemoteDeviceName,
-                CreateSyncDeltaContext());
+                CreateSyncDeltaContext(), recreateDeletedSnapshot: recreateDeletedSnapshot);
         _syncBaseline = reconciliation.NewBaseline ?? _syncBaseline;
         _syncBaselineRevision = reconciliation.BaselineRevision ?? reconciliation.WriteResult.Revision;
         var result = reconciliation.WriteResult;
@@ -9902,6 +9857,11 @@ public partial class MainViewModel(
             {
                 CategoryFilters.Add(choice);
             }
+            // The local batch may be empty while the online request is still
+            // running. A search criterion must not disappear in that interval.
+            if (selectedCategory is not null && !CategoryFilters.Any(filter =>
+                    string.Equals(filter.Category, selectedCategory, StringComparison.OrdinalIgnoreCase)))
+                CategoryFilters.Add(new CatalogCategoryFilterViewModel(selectedCategory));
 
             SelectedCategoryFilter =
                 CategoryFilters.FirstOrDefault(filter =>
@@ -9911,7 +9871,7 @@ public partial class MainViewModel(
                         StringComparison.OrdinalIgnoreCase)) ??
                 CategoryFilters.FirstOrDefault();
 
-            var selectedStatus = SelectedStatusFilter?.Status;
+            var selectedStatus = resetCatalogFilters ? null : SelectedStatusFilter?.Status;
             StatusFilters.Clear();
             foreach (var choice in CatalogFilterChoices.BuildStatuses())
             {
@@ -11048,6 +11008,16 @@ public partial class MainViewModel(
         IsSteppingReaderChapter = true;
         try
         {
+            if (offset > 0 && navigation.PreferredApiProviderId is not null && unit.Sources.Count == 0)
+            {
+                var current = navigation.Chapters[navigation.CurrentIndex];
+                await ResolveAndOpenApiImagesAsync(
+                    new ApiContentUnitLookupSelection(navigation.Details, current, BuildUnitTitle(current)),
+                    navigation.PreferredApiProviderId,
+                    automaticallyChooseProvider: true,
+                    findNextChapter: true);
+                return;
+            }
             if (unit.Sources.Count > 0)
             {
                 await OpenMediaSourceAsync(new CatalogMediaSourceSelection(

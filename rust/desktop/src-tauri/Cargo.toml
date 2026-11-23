@@ -1,0 +1,74 @@
+[package]
+name = "umd-desktop"
+version = "0.1.12"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "umd_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+cc = "1"
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = "0.8"
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+adblock = { version = "0.13.6", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+chrono.workspace = true
+umd-core.workspace = true
+umd-providers = { path = "../../providers" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-fs = "2"
+dom_query = "0.28"
+regex = "1"
+rars = { version = "0.13", default-features = false }
+quick-xml = {version="0.41",features= ["serialize"] }
+percent-encoding = "2"
+base64 = "0.22"
+librqbit = {version = "9.1", default-features = false, features = ["rust-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tempfile = "3"
+flate2 = "1"
+tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+tauri-plugin-opener = "2"
+
+[target.'cfg(any(windows, target_os = "linux", target_os = "android"))'.dependencies]
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10"
+semver = { version = "1", features = ["serde"] }
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = {version="2",features= ["deep-link"] }
+libloading = "0.7.4"
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows-core = "0.62"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+infer = "0.22"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+javascriptcore-rs = "1.1"
+webkit2gtk = { version = "2.0.2", features = ["v2_40"] }
+adblock = { version = "0.13.6", default-features = false, features = ["content-blocking"] }
+
+

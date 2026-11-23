@@ -154,21 +154,25 @@ link_native_library \
 
 export LIBRARY_PATH="$native_library_directory${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
-dotnet restore \
-    "$server_project" \
-    --runtime "$runtime_identifier" \
-    -p:NuGetAudit=false
-dotnet publish \
-    "$server_project" \
-    --configuration Release \
-    --runtime "$runtime_identifier" \
-    --self-contained true \
-    --no-restore \
-    --output "$release_directory" \
-    -p:Version="$version" \
-    -p:NuGetAudit=false \
-    -p:DebugType=None \
-    -p:DebugSymbols=false
+# The dotnet CLI selects the SDK using global.json from the working directory.
+(
+    cd "$source_directory"
+    dotnet restore \
+        "$server_project" \
+        --runtime "$runtime_identifier" \
+        -p:NuGetAudit=false
+    dotnet publish \
+        "$server_project" \
+        --configuration Release \
+        --runtime "$runtime_identifier" \
+        --self-contained true \
+        --no-restore \
+        --output "$release_directory" \
+        -p:Version="$version" \
+        -p:NuGetAudit=false \
+        -p:DebugType=None \
+        -p:DebugSymbols=false
+)
 
 server_binary="$release_directory/UniversalMediaDistribution.Server"
 [[ -x "$server_binary" ]] ||

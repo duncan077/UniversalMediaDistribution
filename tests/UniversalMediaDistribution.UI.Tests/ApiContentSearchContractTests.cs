@@ -6,6 +6,17 @@ namespace UniversalMediaDistribution.UI.Tests;
 
 public sealed class ApiContentSearchContractTests
 {
+    [Fact]
+    public void MetadataFiltersAreOptInAndCanBrowseWithoutQuery()
+    {
+        var request = new ApiContentSearchRequest(category: "Manhwa", status: PublicationStatus.Completed, providerName: "ManhwaWeb");
+        Assert.True(request.HasCatalogFilters);
+        Assert.False(ApiContentSearchCapabilities.TextOnly.CanSatisfy(request));
+        Assert.False(new ApiContentSearchCapabilities(genre: ApiContentFilterSupport.Native, supportsFilterOnlySearch: true).CanSatisfy(request));
+        Assert.True(new UmdJsonApiContentProvider(new HttpClient()).SearchCapabilities.CanSatisfy(request));
+        Assert.Throws<ArgumentException>(() => new ApiContentSearchRequest(category: new string('a', 201)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ApiContentSearchRequest(status: (PublicationStatus)999));
+    }
     private static readonly Uri BaseUri = new("https://provider.example/");
 
     [Fact]

@@ -1,0 +1,34 @@
+[package]
+name = "umd-server"
+version = "0.1.12"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+umd-core.workspace = true
+umd-providers = { path = "../providers" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
+uuid.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+subtle = "2"
+rusqlite = { version = "0.43", features = ["bundled"] }
+pbkdf2 = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+base64 = "0.22"
+chrono.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "decompression-gzip", "compression-gzip", "fs"] }
+
+futures-util = "0.3"
+tempfile = "3"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+flate2 = "1"

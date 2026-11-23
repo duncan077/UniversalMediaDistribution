@@ -49,9 +49,10 @@
     if (!root) { return false; }
     const style = document.createElement("style");
     style.id = "umd-cosmetic-style";
-    // One rule with a selector list, not one rule per selector: the engine
-    // parses it once and matches it as a set.
-    style.textContent = applied.join(",") + "{display:none!important;}";
+    // A single unsupported selector would invalidate a whole selector list.
+    // Separate rules also work on WebViews with different selector support.
+    style.textContent = applied.filter(s => !/[{}]/.test(s))
+      .map(s => s + "{display:none!important;}").join("\n");
     root.appendChild(style);
     cosmeticStyle = style;
     return true;

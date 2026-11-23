@@ -51,6 +51,8 @@ public sealed record RemoteSyncSnapshot(
     string UpdatedByDeviceId,
     UserSyncDocument Document);
 
+public sealed record RemoteSnapshotState(long Revision, RemoteSyncSnapshot? Snapshot);
+
 public sealed record RemoteSyncWriteResult(
     long Revision,
     DateTimeOffset UpdatedAt,
@@ -308,6 +310,12 @@ public interface IRemoteMediaServerClient
 
     ValueTask<RemoteSyncSnapshot?> GetSnapshotAsync(
         CancellationToken cancellationToken = default);
+
+    async ValueTask<RemoteSnapshotState> ReadSnapshotStateAsync(CancellationToken cancellationToken = default)
+    {
+        var snapshot = await GetSnapshotAsync(cancellationToken);
+        return new RemoteSnapshotState(snapshot?.Revision ?? 0, snapshot);
+    }
 
     /// <summary>
     /// What changed after <paramref name="sinceRevision"/>. Null when the

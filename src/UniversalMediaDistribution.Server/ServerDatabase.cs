@@ -141,6 +141,12 @@ internal sealed class ServerDatabase
                     id TEXT PRIMARY KEY, media_type TEXT NOT NULL, subtype TEXT NOT NULL,
                     name TEXT NOT NULL, search_text TEXT NOT NULL, payload TEXT NOT NULL,
                     content_hash TEXT NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS catalog_arrivals(id TEXT PRIMARY KEY);
+                INSERT INTO catalog_arrivals SELECT id FROM catalog_items
+                    WHERE NOT EXISTS(SELECT 1 FROM catalog_arrivals) ORDER BY rowid;
+                CREATE TRIGGER IF NOT EXISTS catalog_record_arrival AFTER INSERT ON catalog_items BEGIN
+                    INSERT INTO catalog_arrivals VALUES(NEW.id) ON CONFLICT(id) DO NOTHING;
+                END;
                 CREATE INDEX IF NOT EXISTS ix_catalog_media ON catalog_items(media_type, name, id);
                 CREATE TABLE IF NOT EXISTS catalog_names(
                     name_key TEXT NOT NULL, item_id TEXT NOT NULL REFERENCES catalog_items(id) ON DELETE CASCADE,

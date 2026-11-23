@@ -201,11 +201,12 @@ public sealed class VideoChallengeTests : IDisposable
     {
         using var client = new HttpClient(new Handler(request =>
         {
-            Assert.Equal("pelisflixhd1.top", request.RequestUri!.Host);
+            Assert.Equal("pelisflixhd.love", request.RequestUri!.Host);
             return Text("<a href='https://pelisflixhd.blog/pelicula/example/'><img src='https://s.pelisflixhd.blog/poster.jpg' alt='Poster Example'><p>Example</p></a>");
         }));
         var provider = new PelisflixHdApiContentProvider(client);
         Assert.True(provider.Descriptor.IsRetiredBaseUrl("https://pelisflixhd.blog/"));
+        Assert.True(provider.Descriptor.IsRetiredBaseUrl("https://pelisflixhd1.top/"));
         var result = Assert.Single(await provider.LoadDailyUpdatesAsync(new Uri(provider.Descriptor.DefaultBaseUrl)));
         Assert.Equal("pelicula/example/", result.ExternalId);
         Assert.Equal("https://s.pelisflixhd.blog/poster.jpg", result.PreviewItem.ThumbnailRef);

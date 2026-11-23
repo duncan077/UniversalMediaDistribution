@@ -11,6 +11,7 @@ internal sealed record CatalogCrawlerOptions
     public IReadOnlyDictionary<string, TimeSpan> ProviderIntervals { get; init; } = new Dictionary<string, TimeSpan>();
     public TimeSpan MaximumRunTime { get; init; } = TimeSpan.FromMinutes(45);
     public TimeSpan OperationTimeout { get; init; } = TimeSpan.FromMinutes(3);
+    public TimeSpan? DetailTimeout { get; init; }
     public IReadOnlyDictionary<string, Uri> BaseUrls { get; init; } = new Dictionary<string, Uri>();
     public IReadOnlySet<string> DisabledProviders { get; init; } = new HashSet<string>();
     public bool RetryFailures { get; init; }
@@ -30,7 +31,9 @@ internal sealed class CatalogCrawler(
             options.MinimumTitleInterval > TimeSpan.FromMinutes(1) ||
             options.ProviderIntervals.Values.Any(interval => interval < TimeSpan.FromSeconds(1) || interval > TimeSpan.FromMinutes(1)) ||
             options.MaximumRunTime <= TimeSpan.Zero || options.MaximumRunTime > TimeSpan.FromMinutes(50) ||
-            options.OperationTimeout <= TimeSpan.Zero || options.OperationTimeout > TimeSpan.FromMinutes(20))
+            options.OperationTimeout <= TimeSpan.Zero || options.OperationTimeout > TimeSpan.FromMinutes(20) ||
+            options.DetailTimeout is { } detailTimeout &&
+            (detailTimeout <= TimeSpan.Zero || detailTimeout > TimeSpan.FromMinutes(20)))
             throw new ArgumentException("Invalid crawler limits.");
         var store = new CatalogCrawlerStore(database);
         var diagnostics = new ServerDiagnosticsStore(database);
@@ -147,7 +150,8 @@ internal sealed class CatalogCrawler(
                         details++;
                         try
                         {
-                            var item = await Operation(token => provider.LoadCatalogItemAsync(root, title.Item, token).AsTask(), budget.Token);
+                            var item = await Operation(token => provider.LoadCatalogItemAsync(root, title.Item, token).AsTask(),
+                                budget.Token, options.DetailTimeout);
                             var result = catalog.MergeScraped(id, title.ExternalId, item, budget.Token);
                             store.TitleSucceeded(id, title.ExternalId, result.ItemId, DateTimeOffset.UtcNow);
                             if (result.Changed) { Interlocked.Increment(ref changed); providerChanged++; }
@@ -165,6 +169,12 @@ internal sealed class CatalogCrawler(
                             providerFailed = true;
                             store.TitleFailed(id, title, FailureKind(exception), DateTimeOffset.UtcNow);
                             Log("error", "detail", FailureKind(exception), ServerDiagnosticsStore.DescribeFailure(exception, title.Item.PreviewItem.Name), id, exception);
+                            if (exception is HttpRequestException { StatusCode: HttpStatusCode.NotFound or HttpStatusCode.Gone })
+                            {
+                                // A stale or removed title doesn't establish a provider outage.
+                                consecutiveFailures = 0;
+                                continue;
+                            }
                             if (IsProviderFailure(exception) || ++consecutiveFailures >= 3) throw;
                         }
                     }
@@ -232,11 +242,16 @@ internal sealed class CatalogCrawler(
         }
     }
 
-    private async Task<T> Operation<T>(Func<CancellationToken, Task<T>> action, CancellationToken token)
+    private async Task<T> Operation<T>(Func<CancellationToken, Task<T>> action, CancellationToken token, TimeSpan? operationTimeout = null)
     {
+        var limit = operationTimeout ?? options.OperationTimeout;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(options.OperationTimeout);
-        return await action(timeout.Token);
+        timeout.CancelAfter(limit);
+        try { return await action(timeout.Token); }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested && timeout.IsCancellationRequested)
+        {
+            throw new CatalogCrawlerOperationTimeoutException(limit);
+        }
     }
 
     private static bool IsProviderFailure(Exception exception) => exception is CatalogProviderThrottledException ||
@@ -244,11 +259,16 @@ internal sealed class CatalogCrawler(
     private static string FailureKind(Exception exception) => exception switch
     {
         CatalogProviderThrottledException => "throttled",
-        OperationCanceledException => "timeout",
+        OperationCanceledException or TimeoutException => "timeout",
         HttpRequestException { StatusCode: HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized } => "challenge_or_access_denied",
-        HttpRequestException { StatusCode: HttpStatusCode.NotFound } => "not_found",
+        HttpRequestException { StatusCode: HttpStatusCode.NotFound or HttpStatusCode.Gone } => "not_found",
         HttpRequestException => "network",
         NotSupportedException => "unsupported",
         _ => "parse_or_storage_error"
     };
+}
+
+internal sealed class CatalogCrawlerOperationTimeoutException(TimeSpan limit) : TimeoutException
+{
+    internal TimeSpan Limit { get; } = limit;
 }

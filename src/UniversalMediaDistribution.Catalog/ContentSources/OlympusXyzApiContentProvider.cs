@@ -30,6 +30,12 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
 
     private static readonly TimeSpan SeriesListCacheLifetime =
         TimeSpan.FromDays(1);
+    private static readonly TimeSpan SlugRecoveryCacheLifetime =
+        TimeSpan.FromMinutes(1);
+    private static readonly Regex SlugRevisionRegex = new(
+        @"-[0-9]{8}-[0-9]{9}$",
+        RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
     private static readonly Regex SafeSlugRegex = new(
         "^[A-Za-z0-9][A-Za-z0-9_-]{0,239}$",
         RegexOptions.CultureInvariant,
@@ -86,6 +92,8 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
     private readonly TimeProvider _timeProvider;
     private readonly SemaphoreSlim _seriesListCacheGate = new(1, 1);
     private readonly ConcurrentDictionary<string, string> _chapterIds =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _replacementSlugs =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, Uri> _trustedArtworkOrigins =
         new(StringComparer.OrdinalIgnoreCase);
@@ -315,15 +323,24 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
     {
         var root = NormalizeRootUri(baseUri);
         ArgumentNullException.ThrowIfNull(searchItem);
-        var slug = ValidateSlug(searchItem.ExternalId);
+        var originalSlug = ValidateSlug(searchItem.ExternalId);
+        var slug = originalSlug;
+        string detailJson;
+        try
+        {
+            detailJson = await ReadSeriesDetailAsync(root, slug, cancellationToken);
+        }
+        catch (HttpRequestException exception) when (exception.StatusCode is HttpStatusCode.NotFound)
+        {
+            if (await FindReplacementSlugAsync(root, originalSlug, searchItem.PreviewItem.Name,
+                    cancellationToken) is not { } replacement)
+            {
+                throw;
+            }
 
-        var detailJson = await ReadStringAsync(
-            new Uri(
-                root,
-                $"api/series/{Uri.EscapeDataString(slug)}?type=comic"),
-            root,
-            MaximumItemBytes,
-            cancellationToken);
+            slug = replacement;
+            detailJson = await ReadSeriesDetailAsync(root, slug, cancellationToken);
+        }
         using var detailDocument = JsonDocument.Parse(detailJson);
         if (!TryGetProperty(
                 detailDocument.RootElement,
@@ -339,6 +356,15 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
             detail,
             "name",
             out var detailName);
+        if (!string.Equals(slug, originalSlug, StringComparison.OrdinalIgnoreCase) &&
+            (!hasProviderName || !SameSeriesTitle(detailName, searchItem.PreviewItem.Name) ||
+             !TryGetString(detail, "slug", out var returnedSlug) ||
+             !string.Equals(returnedSlug, slug, StringComparison.OrdinalIgnoreCase) ||
+             !TryGetString(detail, "type", out var returnedType) ||
+             !string.Equals(returnedType, "comic", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidDataException("Olympus returned a different series after its identifier changed.");
+        }
         if (searchItem.RequireProviderTitle && !hasProviderName)
         {
             throw new InvalidDataException(
@@ -371,7 +397,8 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
         }
 
         var genres = ReadNamedArray(detail, "genres");
-        var units = TryUseKnownChapterId(
+        var units = string.Equals(slug, originalSlug, StringComparison.OrdinalIgnoreCase) &&
+            TryUseKnownChapterId(
             root,
             slug,
             searchItem.UnitRoutes,
@@ -382,6 +409,15 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
                 slug,
                 targetUnit?.DisplayNumber,
                 cancellationToken);
+        var aliasKey = SeriesAliasKey(root, originalSlug);
+        if (!string.Equals(slug, originalSlug, StringComparison.OrdinalIgnoreCase))
+        {
+            _replacementSlugs[aliasKey] = slug;
+        }
+        else
+        {
+            _replacementSlugs.TryRemove(aliasKey, out _);
+        }
         return new ApiContentItem(new CatalogTransferItem
         {
             MediaType = "book",
@@ -395,6 +431,59 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
             Units = units
         });
     }
+
+    private ValueTask<string> ReadSeriesDetailAsync(Uri root, string slug, CancellationToken cancellationToken) =>
+        ReadStringAsync(new Uri(root, $"api/series/{Uri.EscapeDataString(slug)}?type=comic"),
+            root, MaximumItemBytes, cancellationToken);
+
+    private async ValueTask<string?> FindReplacementSlugAsync(
+        Uri root, string oldSlug, string title, CancellationToken cancellationToken)
+    {
+        var stableSlug = SlugRevisionRegex.Replace(oldSlug, string.Empty);
+        if (string.IsNullOrWhiteSpace(title) || stableSlug.Length == 0)
+        {
+            return null;
+        }
+
+        using var document = JsonDocument.Parse(
+            await GetSeriesListJsonAsync(root, cancellationToken, SlugRecoveryCacheLifetime));
+        if (!TryGetProperty(document.RootElement, "data", JsonValueKind.Array, out var data))
+        {
+            return null;
+        }
+
+        string? candidate = null;
+        foreach (var entry in data.EnumerateArray())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!TryGetString(entry, "slug", out var slug) || !SafeSlugRegex.IsMatch(slug) ||
+                !string.Equals(SlugRevisionRegex.Replace(slug, string.Empty), stableSlug, StringComparison.OrdinalIgnoreCase) ||
+                !TryGetString(entry, "type", out var type) || !string.Equals(type, "comic", StringComparison.OrdinalIgnoreCase) ||
+                !TryGetString(entry, "name", out var name) || !SameSeriesTitle(name, title))
+            {
+                continue;
+            }
+
+            if (string.Equals(oldSlug, slug, StringComparison.OrdinalIgnoreCase) ||
+                candidate is not null && !string.Equals(candidate, slug, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            candidate = slug;
+        }
+
+        return candidate;
+    }
+
+    private static bool SameSeriesTitle(string left, string right) =>
+        CultureInfo.InvariantCulture.CompareInfo.Compare(NormalizeText(left), NormalizeText(right),
+            CompareOptions.IgnoreCase | CompareOptions.IgnoreNonSpace) == 0;
+
+    private static string SeriesAliasKey(Uri root, string slug) => root.AbsoluteUri + slug;
+
+    private string ResolveKnownSlug(Uri root, string slug) =>
+        _replacementSlugs.GetValueOrDefault(SeriesAliasKey(root, slug), slug);
 
     public IReadOnlyList<ApiProviderUnitRoute> GetKnownUnitRoutes(
         Uri baseUri,
@@ -410,7 +499,7 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
         }
 
         var root = NormalizeRootUri(baseUri);
-        var slug = ValidateSlug(searchItem.ExternalId);
+        var slug = ResolveKnownSlug(root, ValidateSlug(searchItem.ExternalId));
         return _chapterIds.TryGetValue(
                    BuildChapterKey(root, slug, unit.DisplayNumber),
                    out var chapterId) &&
@@ -441,7 +530,8 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
             return null;
         }
 
-        var slug = ValidateSlug(searchItem.ExternalId);
+        var originalSlug = ValidateSlug(searchItem.ExternalId);
+        var slug = ResolveKnownSlug(root, originalSlug);
         var key = BuildChapterKey(root, slug, unit.DisplayNumber);
         if (!_chapterIds.TryGetValue(key, out var chapterId))
         {
@@ -450,6 +540,8 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
                 searchItem,
                 unit,
                 cancellationToken);
+            slug = ResolveKnownSlug(root, originalSlug);
+            key = BuildChapterKey(root, slug, unit.DisplayNumber);
             if (!_chapterIds.TryGetValue(key, out chapterId))
             {
                 return null;
@@ -724,11 +816,12 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
 
     private async ValueTask<string> GetSeriesListJsonAsync(
         Uri root,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? cacheLifetime = null)
     {
         var now = _timeProvider.GetUtcNow();
         var cached = Volatile.Read(ref _seriesListCache);
-        if (IsFreshSeriesList(cached, root, now))
+        if (IsFreshSeriesList(cached, root, now, cacheLifetime))
         {
             return cached!.Json;
         }
@@ -738,7 +831,7 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
         {
             now = _timeProvider.GetUtcNow();
             cached = Volatile.Read(ref _seriesListCache);
-            if (IsFreshSeriesList(cached, root, now))
+            if (IsFreshSeriesList(cached, root, now, cacheLifetime))
             {
                 return cached!.Json;
             }
@@ -756,7 +849,8 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
                 return json;
             }
             catch (Exception exception)
-                when (exception is not OperationCanceledException &&
+                when (cacheLifetime is null &&
+                      exception is not OperationCanceledException &&
                       cached is not null &&
                       SameOrigin(cached.Root, root))
             {
@@ -1212,10 +1306,11 @@ public sealed partial class OlympusXyzApiContentProvider : IApiContentProvider
     private static bool IsFreshSeriesList(
         SeriesListCacheEntry? entry,
         Uri root,
-        DateTimeOffset now) =>
+        DateTimeOffset now,
+        TimeSpan? cacheLifetime) =>
         entry is not null &&
         SameOrigin(entry.Root, root) &&
-        now - entry.FetchedAt < SeriesListCacheLifetime;
+        now - entry.FetchedAt < (cacheLifetime ?? SeriesListCacheLifetime);
 
     private static bool TryResolveHttpUri(
         Uri root,

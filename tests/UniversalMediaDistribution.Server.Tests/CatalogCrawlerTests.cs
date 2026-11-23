@@ -41,6 +41,53 @@ public sealed class CatalogCrawlerTests
     }
 
     [Fact]
+    public async Task RemovedTitlesDoNotBlockHealthyTitlesOrPauseTheirProvider()
+    {
+        using var scope = TestDirectory.Create();
+        var database = new ServerDatabase(scope.Path);
+        var store = new CatalogCrawlerStore(database);
+        store.State("fake");
+        var now = DateTimeOffset.UtcNow;
+        store.Enqueue("fake", new[] { "a", "b", "c", "d" }.Select(id => new ApiContentSearchItem(id, Title("Missing"))).ToArray(),
+            now.AddHours(-1), updates: true);
+        var provider = new FakeProvider
+        {
+            DetailError = item => item.ExternalId == "1" ? null :
+                new HttpRequestException("Missing", null, item.ExternalId == "d" ? HttpStatusCode.Gone : HttpStatusCode.NotFound)
+        };
+        var result = await new CatalogCrawler(database, [new(provider)],
+            new() { PagesPerProvider = 1, MinimumTitleInterval = TimeSpan.Zero }).RunAsync(CancellationToken.None);
+
+        Assert.Equal(4, result.Failures);
+        Assert.Equal(1, result.TitlesUpdated);
+        Assert.Null(store.State("fake").RetryAt);
+        var logs = new ServerDiagnosticsStore(database).ReadLogs("fake", "error", null, 20).Items;
+        Assert.Equal(4, logs.Count);
+        Assert.All(logs, entry => Assert.Equal("detail", entry.Stage));
+    }
+
+    [Fact]
+    public async Task DetailTimeoutIsSeparateFromDiscoveryAndLoggedAsSuch()
+    {
+        using var scope = TestDirectory.Create();
+        var database = new ServerDatabase(scope.Path);
+        var provider = new FakeProvider { DetailDelay = TimeSpan.FromSeconds(1) };
+        var result = await new CatalogCrawler(database, [new(provider)], new()
+        {
+            PagesPerProvider = 1,
+            OperationTimeout = TimeSpan.FromSeconds(5),
+            DetailTimeout = TimeSpan.FromMilliseconds(50),
+            MinimumTitleInterval = TimeSpan.Zero
+        }).RunAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.Failures);
+        Assert.Equal(0, result.TitlesUpdated);
+        var entry = Assert.Single(new ServerDiagnosticsStore(database).ReadLogs("fake", "error", null, 20).Items);
+        Assert.Equal("detail", entry.Stage);
+        Assert.Contains("La operación completa superó su límite", entry.Message);
+    }
+
+    [Fact]
     public async Task LeastRecentlyAttemptedProvidersRunFirstAcrossRestarts()
     {
         using var scope = TestDirectory.Create();
@@ -230,6 +277,7 @@ public sealed class CatalogCrawlerTests
         public bool SupportsDailyUpdates => Daily;
         public Exception? DiscoveryError { get; init; }
         public Func<ApiContentSearchItem, Exception?>? DetailError { get; init; }
+        public TimeSpan DetailDelay { get; init; }
         public List<string?> Cursors { get; } = [];
         public List<ApiContentSearchItem> Details { get; } = [];
         public ValueTask<ApiContentSearchPage> ReadCatalogPageAsync(Uri baseUri, string? cursor, CancellationToken cancellationToken = default)
@@ -242,11 +290,12 @@ public sealed class CatalogCrawlerTests
         public ValueTask<IReadOnlyList<ApiContentSearchItem>> LoadDailyUpdatesAsync(Uri baseUri, CancellationToken cancellationToken = default) =>
             ValueTask.FromResult<IReadOnlyList<ApiContentSearchItem>>([new("1", Title("Known title"))]);
         public ValueTask<IReadOnlyList<ApiContentSearchItem>> SearchAsync(Uri baseUri, string query, MediaType? mediaType = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public ValueTask<ApiContentItem> LoadItemAsync(Uri baseUri, ApiContentSearchItem item, CancellationToken cancellationToken = default)
+        public async ValueTask<ApiContentItem> LoadItemAsync(Uri baseUri, ApiContentSearchItem item, CancellationToken cancellationToken = default)
         {
             Details.Add(item);
             if (DetailError?.Invoke(item) is { } error) throw error;
-            return ValueTask.FromResult(new ApiContentItem(Title(item.ExternalId == "1" ? "Known title" : "Alternative")));
+            if (DetailDelay > TimeSpan.Zero) await Task.Delay(DetailDelay, cancellationToken);
+            return new ApiContentItem(Title(item.ExternalId == "1" ? "Known title" : "Alternative"));
         }
     }
 }

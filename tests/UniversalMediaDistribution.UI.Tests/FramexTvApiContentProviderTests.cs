@@ -195,6 +195,25 @@ public sealed class FramexTvApiContentProviderTests
         using var throttled = new HttpClient(handler);
         await Assert.ThrowsAnyAsync<HttpRequestException>(() => new FramexTvApiContentProvider(throttled).SearchAsync(new("https://framextv.xyz/"), "Inception").AsTask());
         Assert.Single(handler.Requests);
+
+        var pacedHandler = new Handler(_ => throw new CatalogProviderThrottledException(TimeSpan.FromHours(1)));
+        using var pacedClient = new HttpClient(pacedHandler);
+        await Assert.ThrowsAsync<CatalogProviderThrottledException>(() =>
+            new FramexTvApiContentProvider(pacedClient).SearchAsync(new("https://framextv.xyz/"), "Inception").AsTask());
+        Assert.Single(pacedHandler.Requests);
+    }
+
+    [Fact]
+    public async Task IndividualBackendTimeoutCanFailOverToTheNextKnownBackend()
+    {
+        var handler = new Handler(request => request.RequestUri!.IdnHost == "api.framextv.tech"
+            ? throw new TaskCanceledException("Request timed out.", new TimeoutException())
+            : Json(Search));
+        using var http = new HttpClient(handler);
+        var provider = new FramexTvApiContentProvider(http);
+
+        Assert.NotEmpty(await provider.SearchAsync(new("https://framextv.xyz/"), "Inception"));
+        Assert.Equal(["api.framextv.tech", "api.framextv.xyz"], handler.Requests.Select(uri => uri.IdnHost));
     }
 
     [Theory]

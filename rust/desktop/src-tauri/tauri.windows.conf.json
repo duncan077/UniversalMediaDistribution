@@ -1,0 +1,10 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File prepare-vlc.ps1"
+  },
+  "bundle": {
+    "resources": {
+      "../../target/vlc-active/": "vlc/"
+    }
+  }
+}

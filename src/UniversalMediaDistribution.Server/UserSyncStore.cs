@@ -78,13 +78,15 @@ internal sealed class SqliteUserSyncStore
     private readonly ServerDatabase _storage;
     private SemaphoreSlim _writeGate => _storage.WriteGate;
 
-    public SqliteUserSyncStore(string dataDirectory)
+    public SqliteUserSyncStore(string dataDirectory) : this(new ServerDatabase(dataDirectory)) { }
+
+    internal SqliteUserSyncStore(ServerDatabase storage)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
-        _storage = new ServerDatabase(dataDirectory);
-        _root = Path.GetFullPath(
-            Path.Combine(dataDirectory, "user-sync"));
+        _storage = storage;
+        _root = Path.Combine(storage.Root, "user-sync");
     }
+
+    internal bool HasSnapshot(Guid accountId) => _storage.Exists(GetPath(accountId));
 
     public async ValueTask<UserSyncSnapshotState?> GetAsync(
         Guid accountId,
@@ -348,6 +350,7 @@ internal sealed class SqliteUserSyncStore
             }
 
             _storage.TryDelete(GetPath(accountId));
+            _storage.TryDelete(SqliteFriendStore.ActivityPath(_storage, accountId));
             write.Commit();
         }
         finally
@@ -433,21 +436,14 @@ internal sealed class SqliteSharedListStore
                 nameof(listId));
         }
 
-        var snapshot = await _syncStore.GetAsync(
-            account.AccountId,
-            cancellationToken) ??
-            throw new InvalidOperationException(
-                "Upload this device's sync snapshot before sharing a list.");
-        var list = snapshot.Document.Lists.SingleOrDefault(
-            candidate => candidate.Id == listId &&
-                         !candidate.IsDeleted) ??
-            throw new KeyNotFoundException(
-                "The selected list is not in the latest sync snapshot.");
-
         await _writeGate.WaitAsync(cancellationToken);
         try
         {
             using var write = _storage.BeginWrite();
+            var snapshot = await _syncStore.GetAsync(account.AccountId, cancellationToken)
+                ?? throw new InvalidOperationException("Upload this device's sync snapshot before sharing a list.");
+            var list = snapshot.Document.Lists.SingleOrDefault(candidate => candidate.Id == listId && !candidate.IsDeleted)
+                ?? throw new KeyNotFoundException("The selected list is not in the latest sync snapshot.");
             var indexPath = GetOwnerIndexPath(account.AccountId, listId);
             var index = await _storage.ReadJsonAsync(
                 indexPath,
@@ -652,20 +648,31 @@ internal sealed class SqliteSharedListStore
         SharedListRecord? existing,
         DateTimeOffset now)
     {
-        var itemKeys = list.Items
-            .Select(UserSyncDocumentValidator.ValidateItemIdentity)
-            .ToHashSet(StringComparer.Ordinal);
-        var catalogItems = catalog.Items
-            .Where(item => itemKeys.Contains(
-                UserSyncDocumentValidator.CreateItemKey(
-                    CatalogSubtypeResolver.ParseMediaType(item.MediaType),
-                    item.Name, item.Subtype)))
-            .ToArray();
-        if (catalogItems.Length != itemKeys.Count)
+        var available = catalog.Items.Where(item => !item.Deleted).ToArray();
+        var byId = available.ToDictionary(item => item.Id ?? CatalogStableId.Create(
+            CatalogSubtypeResolver.ParseMediaType(item.MediaType), item.Name, item.Subtype));
+        var byName = available.ToLookup(item => UserSyncDocumentValidator.CreateItemKey(
+            CatalogSubtypeResolver.ParseMediaType(item.MediaType), item.Name, item.Subtype));
+        var selected = new HashSet<CatalogTransferItem>();
+        foreach (var member in list.Items)
         {
-            throw new InvalidDataException(
-                "The shared list references a catalog item that is unavailable.");
+            CatalogTransferItem? item;
+            if (member.ItemId is { } id)
+            {
+                byId.TryGetValue(id, out item);
+            }
+            else
+            {
+                var matches = byName[UserSyncDocumentValidator.ValidateItemIdentity(member)].Take(2).ToArray();
+                item = matches.Length == 1 ? matches[0] : null;
+            }
+            if (item is null)
+            {
+                throw new InvalidDataException("The shared list contains an unavailable or ambiguous title.");
+            }
+            selected.Add(item);
         }
+        var catalogItems = available.Where(selected.Contains).ToArray();
 
         var record = new SharedListRecord(
             existing?.ShareId ?? CreateShareId(),
@@ -682,7 +689,7 @@ internal sealed class SqliteSharedListStore
                     $"{list.Name} shared by {account.DisplayName}",
                 Items = catalogItems
             });
-        CatalogTransferValidator.Validate(record.Catalog);
+        CatalogTransferValidator.Validate(record.Catalog, allowMissingTorrentIdentity: false, allowDuplicateItemNames: true);
         return record;
     }
 

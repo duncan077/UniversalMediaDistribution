@@ -141,7 +141,8 @@ Cancellation saves the run outcome and releases the lease.
 | `UMD_SERVER_DATA_DIRECTORY` | Must match the HTTP server's durable directory |
 | `UMD_CRAWLER_PAGES_PER_PROVIDER` | `2`; 1–100 |
 | `UMD_CRAWLER_MAX_MINUTES` | `45`; 1–50 |
-| `UMD_CRAWLER_OPERATION_SECONDS` | `180`; 10–1200; individual HTTP requests also have a 90-second limit |
+| `UMD_CRAWLER_OPERATION_SECONDS` | `180`; 10–1200; discovery/update operations |
+| `UMD_CRAWLER_DETAIL_SECONDS` | `600`; 10–1200; budget to fetch a complete title, including paginated chapters or multiple seasons. Defaults to the general limit if that limit was explicitly configured. Individual HTTP requests still have a 90-second limit and the overall crawl budget still applies. |
 | `UMD_CRAWLER_DISABLED_PROVIDERS` | Empty; comma-separated exact IDs from the table |
 | `UMD_CRAWLER_BASE_<ID>` | Optional public base-URL override; uppercase ID with `-` replaced by `_` |
 
@@ -201,6 +202,17 @@ These are installation instructions only: adding the files to the repository
 does not enable a timer, edit a crontab, or start production crawling.
 
 ## Public catalog access
+
+The app enables the catalog by default and uses the current profile's server
+address without a login. Public catalog reads share a limit of 60 requests per
+minute per client IP, configurable with `UMD_SERVER_CATALOG_REQUESTS_PER_MINUTE`
+(1–6000). Excess requests return HTTP 429 with `Retry-After`. Backups, accounts,
+admin routes and the crawler keep their existing access rules and limits.
+
+For CloudPanel/Nginx, keep the backend listener on loopback and forward the
+client address to it (for example, `proxy_set_header X-Forwarded-For $remote_addr;`).
+The server trusts one forwarded hop from loopback only. Without that header,
+all requests coming through the local proxy share its limit.
 
 Existing search and metadata routes remain available. `/api/v1/catalog/current`
 returns the legacy full document while it fits the 30 MiB snapshot bound;

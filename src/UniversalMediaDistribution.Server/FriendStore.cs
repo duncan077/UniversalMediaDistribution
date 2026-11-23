@@ -172,12 +172,14 @@ internal sealed class SqliteFriendStore
 
     private readonly string _root;
     private readonly ServerDatabase _storage;
+    private readonly SqliteUserSyncStore _snapshots;
     private SemaphoreSlim _writeGate => _storage.WriteGate;
 
     public SqliteFriendStore(string dataDirectory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
         _storage = new ServerDatabase(dataDirectory);
+        _snapshots = new SqliteUserSyncStore(_storage);
         _root = Path.GetFullPath(Path.Combine(dataDirectory, "friends"));
     }
 
@@ -324,23 +326,9 @@ internal sealed class SqliteFriendStore
         CancellationToken cancellationToken)
     {
         var edges = new List<FriendSummaryResponse>();
-        foreach (var path in EnumerateJson(GetEdgeDirectory(accountId)))
+        foreach (var edge in await ReadEdgesAsync(accountId, cancellationToken))
         {
-            var edge = await _storage.ReadJsonAsync(
-                path,
-                ServerJsonSerializerContext.Default.FriendEdgeRecord,
-                cancellationToken);
-            if (edge is null)
-            {
-                continue;
-            }
-
-            // How current their half is. Read here so the viewer can tell an
-            // empty answer from a stale one.
-            var activity = await _storage.ReadJsonAsync(
-                GetActivityPath(edge.FriendAccountId),
-                ServerJsonSerializerContext.Default.FriendActivityRecord,
-                cancellationToken);
+            var activity = await ReadVisibleActivityAsync(edge.FriendAccountId, accountId, cancellationToken);
             edges.Add(new FriendSummaryResponse(
                 edge.FriendAccountId,
                 edge.FriendUsername,
@@ -353,6 +341,35 @@ internal sealed class SqliteFriendStore
         return edges
             .OrderBy(static friend => friend.DisplayName, StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private async ValueTask<List<FriendEdgeRecord>> ReadEdgesAsync(Guid accountId, CancellationToken cancellationToken)
+    {
+        var edges = new List<FriendEdgeRecord>();
+        foreach (var path in EnumerateJson(GetEdgeDirectory(accountId)))
+        {
+            var edge = await _storage.ReadJsonAsync(path,
+                ServerJsonSerializerContext.Default.FriendEdgeRecord, cancellationToken);
+            if (edge is not null) edges.Add(edge);
+        }
+        return edges;
+    }
+
+    // Older servers could leave the activity document behind after settings
+    // changed or a backup was deleted. Enforce the current settings on reads.
+    private async ValueTask<FriendActivityRecord?> ReadVisibleActivityAsync(
+        Guid owner, Guid viewer, CancellationToken cancellationToken)
+    {
+        var edge = await _storage.ReadJsonAsync(GetEdgePath(owner, viewer),
+            ServerJsonSerializerContext.Default.FriendEdgeRecord, cancellationToken);
+        if (edge?.ShareProgress is not true || !_snapshots.HasSnapshot(owner)) return null;
+        var visibility = await GetVisibilityAsync(owner, cancellationToken);
+        if (!visibility.ShareProgress) return null;
+        var activity = await _storage.ReadJsonAsync(GetActivityPath(owner),
+            ServerJsonSerializerContext.Default.FriendActivityRecord, cancellationToken);
+        if (activity is null || visibility.HiddenItemKeys.Length == 0) return activity;
+        var hidden = visibility.HiddenItemKeys.ToHashSet(StringComparer.Ordinal);
+        return activity with { Entries = activity.Entries.Where(entry => !hidden.Contains(entry.ItemKey)).ToArray() };
     }
 
     public async ValueTask<IReadOnlyList<FriendRequestResponse>>
@@ -478,6 +495,7 @@ internal sealed class SqliteFriendStore
                 record,
                 ServerJsonSerializerContext.Default.FriendVisibilityRecord,
                 cancellationToken);
+            await RefreshActivityUnderLockAsync(accountId, record, cancellationToken);
             return write.CommitAndReturn(record);
         }
         finally
@@ -489,63 +507,37 @@ internal sealed class SqliteFriendStore
     /// <summary>
     /// Rebuilds the account's shareable activity from its latest sync
     /// snapshot.
-    /// <para>
-    /// Driven from sync rather than a separate upload, the way shared lists
-    /// are: the snapshot is already the authoritative copy of progress, and a
-    /// second path would let the two disagree. Nothing is written while the
-    /// account has sharing switched off, so turning it off and syncing clears
-    /// what friends can see.
-    /// </para>
     /// </summary>
-    public async ValueTask SynchronizeAsync(
-        AccountRecord account,
-        UserSyncSnapshotState snapshot,
-        CancellationToken cancellationToken)
+    public async ValueTask RefreshActivityAsync(Guid accountId, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(account);
-        ArgumentNullException.ThrowIfNull(snapshot);
-        var visibility = await GetVisibilityAsync(
-            account.AccountId,
-            cancellationToken);
-        var activityPath = GetActivityPath(account.AccountId);
-        if (!visibility.ShareProgress)
-        {
-            await _writeGate.WaitAsync(cancellationToken);
-            try
-            {
-                using var write = _storage.BeginWrite();
-                _storage.TryDelete(activityPath);
-                write.Commit();
-            }
-            finally
-            {
-                _writeGate.Release();
-            }
-
-            return;
-        }
-
-        var hidden = visibility.HiddenItemKeys.ToHashSet(StringComparer.Ordinal);
-        var entries = BuildActivityEntries(snapshot.Document, hidden);
-        var record = new FriendActivityRecord(
-            account.AccountId,
-            DateTimeOffset.UtcNow,
-            entries);
         await _writeGate.WaitAsync(cancellationToken);
         try
         {
             using var write = _storage.BeginWrite();
-            await _storage.WriteJsonAtomicAsync(
-                activityPath,
-                record,
-                ServerJsonSerializerContext.Default.FriendActivityRecord,
-                cancellationToken);
+            var visibility = await GetVisibilityAsync(accountId, cancellationToken);
+            await RefreshActivityUnderLockAsync(accountId, visibility, cancellationToken);
             write.Commit();
         }
         finally
         {
             _writeGate.Release();
         }
+    }
+
+    private async ValueTask RefreshActivityUnderLockAsync(
+        Guid accountId, FriendVisibilityRecord visibility, CancellationToken cancellationToken)
+    {
+        var path = GetActivityPath(accountId);
+        var snapshot = visibility.ShareProgress ? await _snapshots.GetAsync(accountId, cancellationToken) : null;
+        if (snapshot is null)
+        {
+            _storage.TryDelete(path);
+            return;
+        }
+        var entries = BuildActivityEntries(snapshot.Document, visibility.HiddenItemKeys.ToHashSet(StringComparer.Ordinal));
+        await _storage.WriteJsonAtomicAsync(path,
+            new FriendActivityRecord(accountId, snapshot.UpdatedAt, entries),
+            ServerJsonSerializerContext.Default.FriendActivityRecord, cancellationToken);
     }
 
     /// <summary>
@@ -571,23 +563,8 @@ internal sealed class SqliteFriendStore
 
         // The friendship, then their decision about this account, in that
         // order — the same two gates an ordinary lookup passes.
-        var ownEdge = await _storage.ReadJsonAsync(
-            GetEdgePath(accountId, friendAccountId),
-            ServerJsonSerializerContext.Default.FriendEdgeRecord,
-            cancellationToken);
-        var theirEdge = await _storage.ReadJsonAsync(
-            GetEdgePath(friendAccountId, accountId),
-            ServerJsonSerializerContext.Default.FriendEdgeRecord,
-            cancellationToken);
-        if (ownEdge is null || theirEdge?.ShareProgress is not true)
-        {
-            return [];
-        }
-
-        var activity = await _storage.ReadJsonAsync(
-            GetActivityPath(friendAccountId),
-            ServerJsonSerializerContext.Default.FriendActivityRecord,
-            cancellationToken);
+        if (!_storage.Exists(GetEdgePath(accountId, friendAccountId))) return [];
+        var activity = await ReadVisibleActivityAsync(friendAccountId, accountId, cancellationToken);
         if (activity is null)
         {
             return [];
@@ -637,26 +614,9 @@ internal sealed class SqliteFriendStore
         }
 
         var matches = new List<FriendActivityMatch>();
-        foreach (var friend in await ListFriendsAsync(
-                     accountId,
-                     cancellationToken))
+        foreach (var friend in await ReadEdgesAsync(accountId, cancellationToken))
         {
-            // Their edge towards this account, not this account's towards them:
-            // whether progress is shared is the owner's decision, and the copy
-            // read here has to be the one they control.
-            var theirEdge = await _storage.ReadJsonAsync(
-                GetEdgePath(friend.AccountId, accountId),
-                ServerJsonSerializerContext.Default.FriendEdgeRecord,
-                cancellationToken);
-            if (theirEdge?.ShareProgress is not true)
-            {
-                continue;
-            }
-
-            var activity = await _storage.ReadJsonAsync(
-                GetActivityPath(friend.AccountId),
-                ServerJsonSerializerContext.Default.FriendActivityRecord,
-                cancellationToken);
+            var activity = await ReadVisibleActivityAsync(friend.FriendAccountId, accountId, cancellationToken);
             if (activity is null)
             {
                 continue;
@@ -665,9 +625,9 @@ internal sealed class SqliteFriendStore
             matches.AddRange(activity.Entries
                 .Where(entry => wanted.Contains(entry.ItemKey))
                 .Select(entry => new FriendActivityMatch(
-                    friend.AccountId,
-                    friend.Username,
-                    friend.DisplayName,
+                    friend.FriendAccountId,
+                    friend.FriendUsername,
+                    friend.FriendDisplayName,
                     entry.ItemKey,
                     entry.UnitKind,
                     entry.DisplayNumber,
@@ -783,23 +743,8 @@ internal sealed class SqliteFriendStore
             return empty;
         }
 
-        var ownEdge = await _storage.ReadJsonAsync(
-            GetEdgePath(accountId, friendAccountId),
-            ServerJsonSerializerContext.Default.FriendEdgeRecord,
-            cancellationToken);
-        var theirEdge = await _storage.ReadJsonAsync(
-            GetEdgePath(friendAccountId, accountId),
-            ServerJsonSerializerContext.Default.FriendEdgeRecord,
-            cancellationToken);
-        if (ownEdge is null || theirEdge?.ShareProgress is not true)
-        {
-            return empty;
-        }
-
-        var activity = await _storage.ReadJsonAsync(
-            GetActivityPath(friendAccountId),
-            ServerJsonSerializerContext.Default.FriendActivityRecord,
-            cancellationToken);
+        if (!_storage.Exists(GetEdgePath(accountId, friendAccountId))) return empty;
+        var activity = await ReadVisibleActivityAsync(friendAccountId, accountId, cancellationToken);
         if (activity is null)
         {
             return empty;
@@ -1116,7 +1061,10 @@ internal sealed class SqliteFriendStore
         GetSafePath("visibility", accountId.ToString("N") + ".json");
 
     private string GetActivityPath(Guid accountId) =>
-        GetSafePath("activity", accountId.ToString("N") + ".json");
+        ActivityPath(_storage, accountId);
+
+    internal static string ActivityPath(ServerDatabase storage, Guid accountId) =>
+        Path.Combine(storage.Root, "friends", "activity", accountId.ToString("N") + ".json");
 
     private string GetSafePath(params string[] segments)
     {

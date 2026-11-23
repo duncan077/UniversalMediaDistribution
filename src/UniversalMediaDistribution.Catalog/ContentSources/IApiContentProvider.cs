@@ -180,9 +180,9 @@ public static class BuiltInApiContentProviderDescriptors
     public static ApiContentProviderDescriptor PelisflixHd { get; } = new(
         "pelisflix-hd",
         "PelisflixHD Movies & Series",
-        "https://pelisflixhd1.top/",
+        "https://pelisflixhd.love/",
         scope: ApiContentProviderScope.LiveAction,
-        retiredHosts: ["pelisflixhd.blog", "www.pelisflixhd.blog"]);
+        retiredHosts: ["pelisflixhd.blog", "www.pelisflixhd.blog", "pelisflixhd1.top", "www.pelisflixhd1.top"]);
 
     public static ApiContentProviderDescriptor PoseidonHd2 { get; } = new(
         "poseidon-hd2",
@@ -266,7 +266,8 @@ public sealed record ApiContentSearchItem(
     string ExternalId,
     CatalogTransferItem PreviewItem,
     IReadOnlyList<ApiProviderUnitRoute>? UnitRoutes = null,
-    bool RequireProviderTitle = false)
+    bool RequireProviderTitle = false,
+    bool IsMetadataSummary = false)
 {
     public string ExternalId { get; } =
         string.IsNullOrWhiteSpace(ExternalId)
@@ -287,6 +288,7 @@ public sealed record ApiContentSearchItem(
     /// <see cref="PreviewItem"/>; otherwise a soft-404 page can look valid.
     /// </summary>
     public bool RequireProviderTitle { get; } = RequireProviderTitle;
+    public bool IsMetadataSummary { get; } = IsMetadataSummary;
 }
 
 /// <summary>
@@ -326,7 +328,8 @@ public sealed record ApiContentSearchCapabilities
     public ApiContentSearchCapabilities(
         ApiContentFilterSupport genre = ApiContentFilterSupport.Unsupported,
         ApiContentFilterSupport releaseYear = ApiContentFilterSupport.Unsupported,
-        bool supportsFilterOnlySearch = false)
+        bool supportsFilterOnlySearch = false,
+        bool supportsCatalogFilters = false)
     {
         if (!Enum.IsDefined(genre))
         {
@@ -340,7 +343,7 @@ public sealed record ApiContentSearchCapabilities
 
         if (supportsFilterOnlySearch &&
             genre is ApiContentFilterSupport.Unsupported &&
-            releaseYear is ApiContentFilterSupport.Unsupported)
+            releaseYear is ApiContentFilterSupport.Unsupported && !supportsCatalogFilters)
         {
             throw new ArgumentException(
                 "A provider cannot support filter-only search without " +
@@ -351,6 +354,7 @@ public sealed record ApiContentSearchCapabilities
         Genre = genre;
         ReleaseYear = releaseYear;
         SupportsFilterOnlySearch = supportsFilterOnlySearch;
+        SupportsCatalogFilters = supportsCatalogFilters;
     }
 
     /// <summary>
@@ -368,6 +372,7 @@ public sealed record ApiContentSearchCapabilities
     /// whose only entry point is a search box cannot.
     /// </summary>
     public bool SupportsFilterOnlySearch { get; }
+    public bool SupportsCatalogFilters { get; }
 
     /// <summary>
     /// Whether every criterion the request sets can be honoured. Callers use
@@ -377,6 +382,7 @@ public sealed record ApiContentSearchCapabilities
     public bool CanSatisfy(ApiContentSearchRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.HasCatalogFilters && !SupportsCatalogFilters) return false;
         if (request.Query is null && !SupportsFilterOnlySearch)
         {
             return false;
@@ -419,16 +425,25 @@ public sealed record ApiContentSearchRequest
         ApiContentGenre? genre = null,
         int? releaseYear = null,
         int pageSize = DefaultPageSize,
-        string? continuationToken = null)
+        string? continuationToken = null,
+        string? category = null,
+        PublicationStatus? status = null,
+        string? providerName = null,
+        bool browse = false,
+        MediaSubtypeGroup? subtypeGroup = null)
     {
         var normalizedQuery = string.IsNullOrWhiteSpace(query)
             ? null
             : query.Trim();
-        if (normalizedQuery is null && genre is null && releaseYear is null)
+        category = CatalogSearchMetadataFilters.NormalizeLabel(category);
+        providerName = CatalogSearchMetadataFilters.NormalizeLabel(providerName);
+        if (status is { } value && !Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(status));
+        if (subtypeGroup is { } group && !Enum.IsDefined(group)) throw new ArgumentOutOfRangeException(nameof(subtypeGroup));
+        if (normalizedQuery is { Length: > ContentSourceSearchCriteria.MaximumQueryLength }) throw new ArgumentException("Search query is too long.");
+        if (normalizedQuery is null && genre is null && releaseYear is null && category is null && status is null && providerName is null && !browse)
         {
             throw new ArgumentException(
-                "A search requires at least one of query text, genre, or " +
-                "release year.");
+                "A search requires text, a public metadata filter, or explicit browsing.");
         }
 
         if (mediaType is not null && !Enum.IsDefined(mediaType.Value))
@@ -470,6 +485,11 @@ public sealed record ApiContentSearchRequest
         ReleaseYear = releaseYear;
         PageSize = pageSize;
         ContinuationToken = normalizedToken;
+        Category = category;
+        Status = status;
+        ProviderName = providerName;
+        Browse = browse;
+        SubtypeGroup = subtypeGroup;
     }
 
     /// <summary>Free text, or null for a filter-only search.</summary>
@@ -493,7 +513,13 @@ public sealed record ApiContentSearchRequest
     /// </summary>
     public string? ContinuationToken { get; }
 
-    public bool HasFilters => Genre is not null || ReleaseYear is not null;
+    public string? Category { get; }
+    public PublicationStatus? Status { get; }
+    public string? ProviderName { get; }
+    public bool Browse { get; }
+    public MediaSubtypeGroup? SubtypeGroup { get; }
+    public bool HasCatalogFilters => Category is not null || Status is not null || ProviderName is not null || Browse;
+    public bool HasFilters => Genre is not null || ReleaseYear is not null || HasCatalogFilters;
 }
 
 /// <summary>
@@ -1346,7 +1372,8 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
     public ApiContentSearchCapabilities SearchCapabilities { get; } = new(
         genre: ApiContentFilterSupport.VerifiedLocal,
         releaseYear: ApiContentFilterSupport.VerifiedLocal,
-        supportsFilterOnlySearch: true);
+        supportsFilterOnlySearch: true,
+        supportsCatalogFilters: true);
 
     public async ValueTask<IReadOnlyList<ApiContentSearchItem>> SearchAsync(
         Uri baseUri,
@@ -1369,8 +1396,9 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
     {
         ArgumentNullException.ThrowIfNull(baseUri);
         ArgumentNullException.ThrowIfNull(request);
-        return new ApiContentSearchPage(
-            await ReadSearchAsync(baseUri, request, cancellationToken));
+        var page = await CatalogDocumentHttpReader.ReadPageAsync(_httpClient, BuildSearchUri(baseUri, request), cancellationToken);
+        return new ApiContentSearchPage(page.Document.Items.Where(item => Matches(item, request))
+            .Select(item => new ApiContentSearchItem(BuildExternalId(item), item, IsMetadataSummary: page.IsSummary)), page.ContinuationToken);
     }
 
     private async ValueTask<IReadOnlyList<ApiContentSearchItem>>
@@ -1380,15 +1408,15 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
             CancellationToken cancellationToken)
     {
         var endpoint = BuildSearchUri(baseUri, request);
-        var document = await CatalogDocumentHttpReader.ReadAsync(
+        var page = await CatalogDocumentHttpReader.ReadPageAsync(
             _httpClient,
             endpoint,
             cancellationToken);
-        return document.Items
+        return page.Document.Items
             .Where(item => Matches(item, request))
-            .Select(static item => new ApiContentSearchItem(
+            .Select(item => new ApiContentSearchItem(
                 BuildExternalId(item),
-                item))
+                item, IsMetadataSummary: page.IsSummary))
             .ToArray();
     }
 
@@ -1396,6 +1424,7 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
         CatalogTransferItem item,
         ApiContentSearchRequest request)
     {
+        if (!CatalogSearchMetadataFilters.Matches(item, request)) return false;
         if (request.MediaType is { } mediaType &&
             CatalogSubtypeResolver.ParseMediaType(item.MediaType) != mediaType)
         {
@@ -1414,7 +1443,7 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
                 year;
     }
 
-    public ValueTask<ApiContentItem> LoadItemAsync(
+    public async ValueTask<ApiContentItem> LoadItemAsync(
         Uri baseUri,
         ApiContentSearchItem searchItem,
         CancellationToken cancellationToken = default)
@@ -1422,7 +1451,13 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
         ArgumentNullException.ThrowIfNull(baseUri);
         ArgumentNullException.ThrowIfNull(searchItem);
         cancellationToken.ThrowIfCancellationRequested();
-        return ValueTask.FromResult(new ApiContentItem(searchItem.PreviewItem));
+        if (!searchItem.IsMetadataSummary) return new ApiContentItem(searchItem.PreviewItem);
+        var id = searchItem.PreviewItem.Id ?? throw new InvalidDataException("The catalog summary has no item ID.");
+        var root = new Uri(baseUri.AbsoluteUri.TrimEnd('/') + '/');
+        var document = await CatalogDocumentHttpReader.ReadAsync(_httpClient, new Uri(root, $"items/{id:N}"), cancellationToken);
+        var item = document.Items.SingleOrDefault(candidate => candidate.Id == id)
+            ?? throw new InvalidDataException("The requested catalog title was not returned.");
+        return new ApiContentItem(item);
     }
 
     private static Uri BuildSearchUri(
@@ -1435,6 +1470,14 @@ public sealed partial class UmdJsonApiContentProvider(HttpClient httpClient) :
             ? baseUri
             : new Uri(baseUri.AbsoluteUri + '/', UriKind.Absolute);
         var parameters = new List<string>(4);
+        parameters.Add("summary=true");
+        parameters.Add($"limit={request.PageSize.ToString(CultureInfo.InvariantCulture)}");
+        if (request.ContinuationToken is { } cursor) parameters.Add($"cursor={Uri.EscapeDataString(cursor)}");
+        if (request.Category is { } category) parameters.Add($"category={Uri.EscapeDataString(category)}");
+        if (request.Status is { } status) parameters.Add($"status={status.ToString().ToLowerInvariant()}");
+        if (request.ProviderName is { } provider) parameters.Add($"provider={Uri.EscapeDataString(provider)}");
+        if (request.Browse) parameters.Add("browse=true");
+        if (request.SubtypeGroup is { } group) parameters.Add($"subtypeGroup={group.ToString().ToLowerInvariant()}");
         if (request.Query is { } query)
         {
             parameters.Add($"q={Uri.EscapeDataString(query)}");
@@ -1474,6 +1517,10 @@ internal static class CatalogDocumentHttpReader
         HttpClient httpClient,
         Uri endpoint,
         CancellationToken cancellationToken)
+        => (await ReadPageAsync(httpClient, endpoint, cancellationToken)).Document;
+
+    public static async ValueTask<(CatalogTransferDocument Document, string? ContinuationToken, bool IsSummary)> ReadPageAsync(
+        HttpClient httpClient, Uri endpoint, CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
         request.Headers.Accept.ParseAdd("application/json");
@@ -1495,6 +1542,9 @@ internal static class CatalogDocumentHttpReader
         var bytes = await CatalogJsonTransferService.ReadDocumentBytesAsync(
             stream,
             cancellationToken);
-        return CatalogJsonTransferService.DeserializeAndValidate(bytes);
+        var cursor = response.Headers.TryGetValues("X-UMD-Next-Cursor", out var values) ? values.SingleOrDefault() : null;
+        if (cursor is { Length: > 512 }) throw new InvalidDataException("Invalid catalog continuation token.");
+        return (CatalogJsonTransferService.DeserializeAndValidate(bytes), cursor,
+            response.Headers.TryGetValues("X-UMD-Summary", out var summary) && summary.SingleOrDefault() == "true");
     }
 }

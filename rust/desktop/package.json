@@ -1,0 +1,26 @@
+{
+  "name": "umd-desktop",
+  "private": true,
+  "version": "0.1.12",
+  "type": "module",
+  "scripts": {
+    "predev": "node prepare-pdf.mjs",
+    "prebuild": "node prepare-pdf.mjs",
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@tauri-apps/api": "^2",
+    "dashjs": "^5.3.0",
+    "hls.js": "^1.7.4",
+    "pdfjs-dist": "^6.5.438"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5",
+    "vite": "^7"
+  }
+}

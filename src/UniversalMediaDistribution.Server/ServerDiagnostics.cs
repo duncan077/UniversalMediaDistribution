@@ -226,6 +226,8 @@ internal sealed class ServerDiagnosticsStore(ServerDatabase database)
             CatalogProviderThrottledException => "El proveedor pidió reducir la frecuencia de las solicitudes.",
             HttpRequestException { StatusCode: { } status } => $"HTTP {(int)status} ({status}).",
             HttpRequestException => "No se pudo conectar con el proveedor.",
+            CatalogCrawlerOperationTimeoutException timeout => $"La operación completa superó su límite de {timeout.Limit.TotalSeconds:0.###} s.",
+            OperationCanceledException { InnerException: TimeoutException } => "La solicitud HTTP individual superó su tiempo de espera.",
             OperationCanceledException => "La solicitud superó el tiempo de espera o fue cancelada.",
             CatalogTransferValidationException validation => $"Datos del catálogo rechazados: {validation.Message}",
             JsonException json => $"JSON inválido; ruta={json.Path ?? "$"}; línea={json.LineNumber}; posición={json.BytePositionInLine}.",

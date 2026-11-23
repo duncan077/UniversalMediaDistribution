@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using UniversalMediaDistribution.UI.Diagnostics;
+using UniversalMediaDistribution.UI.Localization;
 using UniversalMediaDistribution.Catalog.Sync;
 
 namespace UniversalMediaDistribution.UI.Remote;
@@ -32,7 +33,8 @@ internal static class RemoteUserSyncReconciler
             string deviceId,
             string deviceName,
             RemoteSyncDeltaContext? delta = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+        bool recreateDeletedSnapshot = false)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(store);
@@ -54,7 +56,7 @@ internal static class RemoteUserSyncReconciler
                 deviceId,
                 deviceName,
                 delta,
-                cancellationToken),
+                cancellationToken, recreateDeletedSnapshot),
             cancellationToken);
     }
 
@@ -65,7 +67,8 @@ internal static class RemoteUserSyncReconciler
             string deviceId,
             string deviceName,
             RemoteSyncDeltaContext? delta,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool recreateDeletedSnapshot)
     {
         if (delta is { LastSyncedRevision: > 0, Baseline: not null })
         {
@@ -82,19 +85,24 @@ internal static class RemoteUserSyncReconciler
             }
         }
 
-        return await SynchronizeSnapshotsAsync(client, store, deviceId, deviceName, cancellationToken);
+        return await SynchronizeSnapshotsAsync(client, store, deviceId, deviceName, cancellationToken, recreateDeletedSnapshot: recreateDeletedSnapshot);
     }
 
     private static async Task<RemoteUserSyncReconciliationResult> SynchronizeSnapshotsAsync(
         IRemoteMediaServerClient client, IUserSyncStore store, string deviceId, string deviceName,
-        CancellationToken cancellationToken, RemoteSyncSnapshot? prefetchedSnapshot = null)
+        CancellationToken cancellationToken, RemoteSyncSnapshot? prefetchedSnapshot = null, bool recreateDeletedSnapshot = false)
     {
         for (var attempt = 1; attempt <= MaximumAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var snapshot = attempt == 1 && prefetchedSnapshot is not null
-                ? prefetchedSnapshot
-                : await MeasureAsync("download-snapshot", () => client.GetSnapshotAsync(cancellationToken));
+            var state = attempt == 1 && prefetchedSnapshot is not null
+                ? new RemoteSnapshotState(prefetchedSnapshot.Revision, prefetchedSnapshot)
+                : await MeasureAsync("download-snapshot", () => client.ReadSnapshotStateAsync(cancellationToken));
+            var snapshot = state.Snapshot;
+            if (snapshot is null && state.Revision > 0 && (!recreateDeletedSnapshot || attempt > 1))
+            {
+                throw new InvalidOperationException(UiTextCatalog.Get("RemoteSnapshotDeleted"));
+            }
             UserSyncRestoreResult? restore = null;
             if (snapshot is not null)
             {
@@ -111,7 +119,7 @@ internal static class RemoteUserSyncReconciler
             }
             try
             {
-                var write = await MeasureAsync("upload-snapshot", () => client.UploadSnapshotAsync(document, snapshot?.Revision ?? 0, cancellationToken));
+                var write = await MeasureAsync("upload-snapshot", () => client.UploadSnapshotAsync(document, state.Revision, cancellationToken));
                 return new RemoteUserSyncReconciliationResult(
                     write,
                     restore,
@@ -119,7 +127,7 @@ internal static class RemoteUserSyncReconciler
                     document,
                     // A concurrent upload may have been merged by the server.
                     // Do not claim to have downloaded those unseen records.
-                    write.Revision == (snapshot?.Revision ?? 0) + 1
+                    write.Revision == state.Revision + 1
                         ? write.Revision : snapshot?.Revision ?? 0);
             }
             catch (RemoteSyncConflictException)

@@ -251,6 +251,30 @@ public sealed class OnlineServerStorageTests
     }
 
     [Fact]
+    public async Task SharedList_SelectsTheRequestedIdWhenTwoFilmsHaveTheSameName()
+    {
+        using var scope = TestDirectory.Create();
+        var sync = new SqliteUserSyncStore(scope.Path);
+        var shares = new SqliteSharedListStore(scope.Path, sync);
+        var account = new AccountRecord(Guid.NewGuid(), "owner", "Owner", "", "", 100_000, DateTimeOffset.UtcNow);
+        var film = new CatalogTransferItem { Id = Guid.NewGuid(), Name = "Repeat", Subtype = "movie", MediaType = "movie" };
+        var member = new UserSyncCatalogItemIdentity { ItemId = film.Id, Name = film.Name, Subtype = film.Subtype, MediaType = film.MediaType };
+        var list = new UserSyncMediaList
+        {
+            Id = Guid.NewGuid(), Name = "To see", CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow, Items = [member]
+        };
+        var document = new UserSyncDocument
+        {
+            Version = 1, DeviceId = "test", DeviceName = "Desktop", Lists = [list],
+            Catalog = new CatalogTransferDocument { Items = [film with { Id = Guid.NewGuid() }, film] }
+        };
+        await sync.SaveAsync(account.AccountId, new UserSyncUploadRequest(0, document), CancellationToken.None);
+        var published = await shares.PublishAsync(account, list.Id, CancellationToken.None);
+        Assert.Equal(film.Id, Assert.Single(published.Catalog.Items).Id);
+    }
+
+    [Fact]
     public async Task SharedList_FollowsLaterSnapshotsAndDisappearsWithItsList()
     {
         using var scope = TestDirectory.Create();

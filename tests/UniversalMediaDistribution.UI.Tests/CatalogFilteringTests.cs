@@ -12,6 +12,21 @@ namespace UniversalMediaDistribution.UI.Tests;
 public sealed class CatalogSearchSelectionTests
 {
     [Fact]
+    public void PublicMetadataFiltersBecomeSearchCriteriaAndLocalOnlyFlagSurvives()
+    {
+        Assert.True(new CatalogSearchSelection(Category: "Manhwa").HasCriteria);
+        Assert.True(new CatalogSearchSelection(Status: PublicationStatus.Completed).HasCriteria);
+        Assert.True(new CatalogSearchSelection(ProviderName: "ManhwaWeb").HasCriteria);
+        Assert.True(new CatalogSearchSelection(BrowseOnline: true).HasCriteria);
+        Assert.False(new CatalogSearchSelection(LocalOnly: true).HasCriteria);
+        var request = new CatalogSearchSelection(Category: "Manhwa", Status: PublicationStatus.Completed,
+            ProviderName: "ManhwaWeb", LocalOnly: true).ToCriteria();
+        Assert.True(request.LocalOnly);
+        Assert.Equal("Manhwa", request.ToApiRequest().Category);
+        Assert.Equal(PublicationStatus.Completed, request.ToApiRequest().Status);
+        Assert.Equal("ManhwaWeb", request.ToApiRequest().ProviderName);
+    }
+    [Fact]
     public void AnEmptySelectionHasNothingToSearchFor()
     {
         var selection = new CatalogSearchSelection();

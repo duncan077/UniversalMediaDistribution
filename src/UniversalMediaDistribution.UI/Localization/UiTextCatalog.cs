@@ -461,7 +461,7 @@ public static class UiTextCatalog
             ["RemoteDeviceName"] = "This device",
             ["RemoteOnlineCatalog"] = "Use the server's online catalog",
             ["RemoteOnlineCatalogDescription"] =
-                "When enabled, server catalog results appear alongside local and provider results. Your local catalog remains available offline.",
+                "Search the catalog at the server address above without signing in. Your local catalog remains available offline. An account is only needed for private features such as sync.",
             ["RemoteSaveSettings"] = "Save server settings",
             ["RemoteCreateAccount"] = "Create account",
             ["RemoteSignIn"] = "Sign in",
@@ -499,6 +499,8 @@ public static class UiTextCatalog
                 "The online snapshot could not be checked: {0}",
             ["RemoteSnapshotUploaded"] =
                 "Device sync completed at revision {0}.",
+            ["RemoteSnapshotDeleted"] =
+                "The online backup was deleted. Choose Sync now to create a new backup from this device.",
             ["RemoteSnapshotConflict"] =
                 "Other devices kept updating the account through revision {0}; automatic reconciliation could not finish. Try Sync now again.",
             ["RemoteSnapshotUploadFailed"] =
@@ -1562,7 +1564,7 @@ public static class UiTextCatalog
             ["RemoteDeviceName"] = "Este dispositivo",
             ["RemoteOnlineCatalog"] = "Usar el catálogo en línea del servidor",
             ["RemoteOnlineCatalogDescription"] =
-                "Al habilitarlo, los resultados del servidor aparecen junto con los locales y los de proveedores. Tu catálogo local sigue disponible sin conexión.",
+                "Consulta el catálogo del servidor indicado arriba sin iniciar sesión. Tu catálogo local sigue disponible sin conexión. La cuenta solo es necesaria para funciones privadas, como la sincronización.",
             ["RemoteSaveSettings"] = "Guardar servidor",
             ["RemoteCreateAccount"] = "Crear cuenta",
             ["RemoteSignIn"] = "Iniciar sesión",
@@ -1605,6 +1607,8 @@ public static class UiTextCatalog
                 "No se pudo comprobar la copia en línea: {0}",
             ["RemoteSnapshotUploaded"] =
                 "La sincronización terminó en la revisión {0}.",
+            ["RemoteSnapshotDeleted"] =
+                "La copia en línea se eliminó. Elige Sincronizar ahora para crear una copia desde este dispositivo.",
             ["RemoteSnapshotConflict"] =
                 "Otros dispositivos siguieron actualizando la cuenta hasta la revisión {0}; la conciliación automática no pudo terminar. Intenta sincronizar de nuevo.",
             ["RemoteSnapshotUploadFailed"] =

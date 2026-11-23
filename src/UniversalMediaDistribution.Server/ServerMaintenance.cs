@@ -6,6 +6,7 @@ internal static class ServerMaintenance
 {
     internal static async Task<bool> TryRunAsync(string[] args)
     {
+        if (args.FirstOrDefault() == "--provider-worker") { await ProviderWorker.RunAsync(args); return true; }
         if (args.Length == 0 || args[0] is not ("--initialize-database" or "--backup" or "--scrape-once")) return false;
         if (args.Length != (args[0] == "--backup" ? 2 : 1)) throw new ArgumentException("Invalid maintenance arguments.");
         var directory = Environment.GetEnvironmentVariable("UMD_SERVER_DATA_DIRECTORY");

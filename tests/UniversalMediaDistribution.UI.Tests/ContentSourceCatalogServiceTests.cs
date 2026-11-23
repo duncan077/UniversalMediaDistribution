@@ -5,6 +5,7 @@ using UniversalMediaDistribution.Application.Catalog;
 using UniversalMediaDistribution.Application.ContentSources;
 using UniversalMediaDistribution.Catalog;
 using UniversalMediaDistribution.Catalog.ContentSources;
+using UniversalMediaDistribution.Catalog.Sync;
 using UniversalMediaDistribution.Catalog.Transfer;
 using UniversalMediaDistribution.Domain.Catalog;
 
@@ -12,6 +13,339 @@ namespace UniversalMediaDistribution.UI.Tests;
 
 public sealed class ContentSourceCatalogServiceTests
 {
+    [Theory]
+    [InlineData("4.3", "4,4.1,4.2,4.3,5,6", "5")]
+    [InlineData("4.3", "4,4.3,5.1,5.2,6", "5.1")]
+    [InlineData("4.3", "6,5.2,5.1,4.4,4.3", "4.4")]
+    [InlineData("4.3", "5.1,5,4.3", "5")]
+    [InlineData("4", "4.1,4.3,5.1", "5.1")]
+    [InlineData("04.30", "04.3,05.1,6", "05.1")]
+    public async Task NextChapterUsesProviderNumberingAndPersistsTheActualChapter(
+        string currentNumber, string available, string expected)
+    {
+        var provider = new SplitChapterProvider("split-reader", available.Split(','));
+        using var http = new HttpClient(new EmptyHandler());
+        var repository = CreateSplitChapterRepository(currentNumber);
+        var service = CreateService(repository,
+            new InMemoryContentSourceProviderSettingsStore(new ContentSourceProviderSettings
+            {
+                Providers = [CreateApiConfiguration(provider)]
+            }), http, provider);
+        var browse = new CatalogBrowseService(repository);
+        var card = Assert.Single((await browse.GetOverviewAsync(MediaType.Book)).Items);
+        var details = (await browse.GetDetailsAsync(card.Id))!;
+        var current = details.Units.Single(unit => unit.DisplayNumber == currentNumber);
+        var candidate = Assert.Single(await service.FindApiImageCandidatesForUnitAsync(
+            details, current, findNextChapter: true));
+
+        // A next-chapter candidate must never be accepted by an exact lookup.
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            service.ResolveApiImagesForUnitAsync(details, current, candidate).AsTask());
+        var result = await service.ResolveApiImagesForUnitAsync(details, current, candidate, findNextChapter: true);
+        Assert.Equal(expected, result.ImageSet.DisplayNumber);
+        Assert.True(ApiContentUnitRequest.DisplayNumbersMatch(expected, result.Unit.DisplayNumber));
+        Assert.Equal(details.Item.Id, result.Details.Item.Id);
+        Assert.NotEqual(current.Identity.StableKey, result.Unit.Identity.StableKey);
+        Assert.Equal([expected], provider.ImageRequests);
+        Assert.Contains(result.Details.Units, unit => unit.Identity == current.Identity);
+    }
+
+    [Theory]
+    [InlineData("4,4.1,4.3")]
+    [InlineData("4.3,6,6.1")]
+    public async Task NextChapterDoesNotGoBackOrSkipAMissingWholeChapter(string available)
+    {
+        var provider = new SplitChapterProvider("split-reader", available.Split(','));
+        using var http = new HttpClient(new EmptyHandler());
+        var repository = CreateSplitChapterRepository("4.3");
+        var service = CreateService(repository,
+            new InMemoryContentSourceProviderSettingsStore(new ContentSourceProviderSettings
+            {
+                Providers = [CreateApiConfiguration(provider)]
+            }), http, provider);
+        var browse = new CatalogBrowseService(repository);
+        var card = Assert.Single((await browse.GetOverviewAsync(MediaType.Book)).Items);
+        var details = (await browse.GetDetailsAsync(card.Id))!;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.FindApiImageCandidatesForUnitAsync(
+            details, details.Units[0], findNextChapter: true).AsTask());
+        Assert.Empty(provider.ImageRequests);
+    }
+
+    [Fact]
+    public async Task NextChapterCandidatesCanUseDifferentNumbersForDifferentProviders()
+    {
+        var whole = new SplitChapterProvider("whole-reader", ["4", "5", "6"]);
+        var split = new SplitChapterProvider("split-reader", ["4.3", "5.1", "5.2", "6"]);
+        using var http = new HttpClient(new EmptyHandler());
+        var repository = CreateSplitChapterRepository("4.3");
+        var service = CreateService(repository,
+            new InMemoryContentSourceProviderSettingsStore(new ContentSourceProviderSettings
+            {
+                Providers = [CreateApiConfiguration(whole), CreateApiConfiguration(split)]
+            }), http, whole, split);
+        var browse = new CatalogBrowseService(repository);
+        var card = Assert.Single((await browse.GetOverviewAsync(MediaType.Book)).Items);
+        var details = (await browse.GetDetailsAsync(card.Id))!;
+        var current = details.Units[0];
+        var candidates = await service.FindApiImageCandidatesForUnitAsync(details, current, findNextChapter: true);
+        Assert.Equal(2, candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            var result = await service.ResolveApiImagesForUnitAsync(details, current, candidate, findNextChapter: true);
+            Assert.Equal(candidate.ProviderId == "whole-reader" ? "5" : "5.1", result.ImageSet.DisplayNumber);
+        }
+    }
+
+    [Fact]
+    public async Task MissingNextChapterKeepsTheConfirmedProviderTitleBinding()
+    {
+        var provider = new SplitChapterProvider("split-reader", ["4.3"]);
+        using var http = new HttpClient(new EmptyHandler());
+        var repository = CreateSplitChapterRepository("4.3");
+        var bindings = new InMemoryApiTitleBindingStore();
+        var service = CreateService(repository,
+            new InMemoryContentSourceProviderSettingsStore(new ContentSourceProviderSettings
+            {
+                Providers = [CreateApiConfiguration(provider)]
+            }), http, bindings, provider);
+        var browse = new CatalogBrowseService(repository);
+        var card = Assert.Single((await browse.GetOverviewAsync(MediaType.Book)).Items);
+        var details = (await browse.GetDetailsAsync(card.Id))!;
+        var current = details.Units[0];
+        await service.ResolveApiImagesForUnitAsync(details, current);
+        var searches = provider.SearchCount;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.FindApiImageCandidatesForUnitAsync(
+            details, current, findNextChapter: true).AsTask());
+        var searchesAfterMissingChapter = provider.SearchCount;
+        Assert.True(searchesAfterMissingChapter >= searches);
+        await service.FindApiImageCandidatesForUnitAsync(details, current);
+        Assert.Equal(searchesAfterMissingChapter, provider.SearchCount);
+    }
+
+    private static InMemoryCatalogRepository CreateSplitChapterRepository(string current) => new(
+        new CatalogTransferDocument
+        {
+            Items = [CreateManga("Copper Skies", "Saved manga", 0) with
+            {
+                Units = [new CatalogTransferUnit { Kind = "chapter", DisplayNumber = current, SortOrder = 0 },
+                    new CatalogTransferUnit { Kind = "chapter", DisplayNumber = "5", SortOrder = 1 }]
+            }]
+        });
+
+    private sealed class SplitChapterProvider(string id, string[] chapters) : IApiContentProvider
+    {
+        private readonly CatalogTransferItem _item = CreateManga("Copper Skies", "Provider manga", 0) with
+        {
+            Units = chapters.Select((number, index) => new CatalogTransferUnit
+            {
+                Kind = "chapter",
+                DisplayNumber = number,
+                SortOrder = index
+            }).ToArray()
+        };
+        public ApiContentProviderDescriptor Descriptor { get; } = new(id, id);
+        public List<string> ImageRequests { get; } = [];
+        public int SearchCount { get; private set; }
+        public ValueTask<IReadOnlyList<ApiContentSearchItem>> SearchAsync(Uri baseUri, string query,
+            MediaType? mediaType, CancellationToken cancellationToken = default)
+        {
+            SearchCount++;
+            return ValueTask.FromResult<IReadOnlyList<ApiContentSearchItem>>([new("copper", _item)]);
+        }
+        public ValueTask<ApiContentItem> LoadItemAsync(Uri baseUri, ApiContentSearchItem searchItem,
+            CancellationToken cancellationToken = default) => ValueTask.FromResult(new ApiContentItem(_item, []));
+        public ValueTask<ApiContentItem> LoadItemForUnitAsync(Uri baseUri, ApiContentSearchItem searchItem,
+            ApiContentUnitRequest unit, CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(new ApiContentItem(_item with
+            {
+                Units = _item.Units.Where(chapter => ApiContentUnitRequest.DisplayNumbersMatch(
+                    chapter.DisplayNumber, unit.DisplayNumber)).ToArray()
+            }, []));
+        public ValueTask<ApiContentImageSet?> LoadUnitImagesAsync(Uri baseUri, ApiContentSearchItem searchItem,
+            ApiContentUnitRequest unit, CancellationToken cancellationToken = default)
+        {
+            ImageRequests.Add(unit.DisplayNumber);
+            return ValueTask.FromResult<ApiContentImageSet?>(new(ContentUnitKind.Chapter, unit.DisplayNumber, null,
+                [new ApiContentImagePage(0, new Uri("https://images.example/chapter.jpg"))]));
+        }
+    }
+
+    [Fact]
+    public async Task NamedProviderTextSearchStillUsesThatProviderDirectly()
+    {
+        var provider = new TestApiProvider();
+        using var http = new HttpClient(new EmptyHandler());
+        var service = CreateService(new InMemoryCatalogRepository(new CatalogTransferDocument()),
+            new InMemoryContentSourceProviderSettingsStore(new() { Providers = [CreateApiConfiguration(provider)] }), http, provider);
+        var response = await service.SearchAsync(new ContentSourceSearchCriteria("Cloud", providerName: provider.Descriptor.DisplayName));
+        Assert.Single(response.Results);
+        Assert.Equal(1, provider.SearchCount);
+    }
+
+    [Fact]
+    public async Task CatalogSummaryLoadsChaptersOnlyWhenTheTitleIsOpened()
+    {
+        var handler = new SummaryMetadataHandler();
+        using var http = new HttpClient(handler);
+        var provider = new UmdJsonApiContentProvider(http);
+        var page = await provider.SearchAsync(new Uri("https://catalog.example/api/"), new ApiContentSearchRequest(category: "Manga"));
+        var summary = Assert.Single(page.Items);
+        Assert.True(summary.IsMetadataSummary);
+        Assert.Empty(summary.PreviewItem.Units);
+        var full = await provider.LoadItemAsync(new Uri("https://catalog.example/api/"), summary);
+        Assert.Equal(3, full.CatalogItem.Units.Count);
+        Assert.Equal(2, handler.Requests);
+    }
+
+    private sealed class SummaryMetadataHandler : HttpMessageHandler
+    {
+        public int Requests { get; private set; }
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests++;
+            var item = CreateManga("Remote", "Detail", 3) with { Id = Guid.Parse("11111111-1111-1111-1111-111111111111") };
+            var isSearch = request.RequestUri!.AbsolutePath.EndsWith("/search", StringComparison.Ordinal);
+            if (isSearch) item = item with { Units = [] };
+            else Assert.EndsWith("/items/11111111111111111111111111111111", request.RequestUri.AbsolutePath);
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(JsonSerializer.Serialize(new CatalogTransferDocument { Items = [item] }, new JsonSerializerOptions(JsonSerializerDefaults.Web)), Encoding.UTF8, "application/json")
+            };
+            if (isSearch) response.Headers.Add("X-UMD-Summary", "true");
+            return Task.FromResult(response);
+        }
+    }
+
+    [Fact]
+    public async Task MetadataFiltersWithoutTextReachOnlineCatalogAndConsumeAllPages()
+    {
+        var handler = new PagedMetadataHandler();
+        using var http = new HttpClient(handler);
+        var provider = new UmdJsonApiContentProvider(http);
+        var service = CreateService(new InMemoryCatalogRepository(new CatalogTransferDocument()),
+            new InMemoryContentSourceProviderSettingsStore(new() { Providers = [CreateApiConfiguration(provider)] }), http, provider);
+        var response = await service.SearchAsync(new ContentSourceSearchCriteria(category: "Manhwa", status: PublicationStatus.Completed, providerName: "ManhwaWeb"));
+        Assert.Empty(response.Failures);
+        Assert.Equal(2, response.Results.Count);
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.All(handler.Requests, uri =>
+        {
+            Assert.Contains("category=Manhwa", uri.Query);
+            Assert.Contains("provider=ManhwaWeb", uri.Query);
+            Assert.Contains("status=completed", uri.Query);
+            Assert.DoesNotContain("q=", uri.Query);
+        });
+        Assert.Contains("cursor=", handler.Requests[1].Query);
+    }
+
+    [Fact]
+    public async Task OnlineCatalogUsesTheProfileUrlWithoutSignInAndRespectsOptOut()
+    {
+        var handler = new PagedMetadataHandler();
+        using var http = new HttpClient(handler);
+        var remote = new InMemoryRemoteServerSettingsStore();
+        var preferences = await remote.LoadAsync();
+        Assert.True(preferences.OnlineCatalogEnabled);
+        Assert.Empty(preferences.Username);
+        var provider = new UmdJsonApiContentProvider(http);
+        var repository = new InMemoryCatalogRepository();
+        var sources = new InMemoryContentSourceProviderSettingsStore(new()
+        {
+            Providers = [CreateApiConfiguration(provider) with { IsEnabled = false }]
+        });
+        var service = new ContentSourceCatalogService(new CatalogBrowseService(repository),
+            new CatalogJsonTransferService(repository), sources, http, [provider],
+            remoteServerSettingsStore: remote);
+        var criteria = new ContentSourceSearchCriteria(category: "Manhwa");
+
+        Assert.NotEmpty((await service.SearchAsync(criteria)).Results);
+        Assert.All(handler.Requests, uri => Assert.Equal(new Uri(preferences.ServiceUrl).Host, uri.Host));
+
+        handler.Requests.Clear();
+        await remote.SaveAsync(preferences with { ServiceUrl = "https://custom.example/umd/" });
+        Assert.NotEmpty((await service.SearchAsync(criteria)).Results);
+        Assert.All(handler.Requests, uri => Assert.Equal("https://custom.example/umd/api/v1/catalog/search", uri.GetLeftPart(UriPartial.Path)));
+
+        handler.Requests.Clear();
+        await remote.SaveAsync(preferences with { OnlineCatalogEnabled = false });
+        Assert.Empty((await service.SearchAsync(criteria)).Results);
+        await remote.SaveAsync(preferences with { ServiceUrl = "" });
+        Assert.Empty((await service.SearchAsync(criteria)).Results);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task OnlineCatalogKeepsAlreadyReceivedResultsWhenRateLimited()
+    {
+        var handler = new PagedMetadataHandler { RateLimitSecondPage = true };
+        using var http = new HttpClient(handler);
+        var provider = new UmdJsonApiContentProvider(http);
+        var service = CreateService(new InMemoryCatalogRepository(new CatalogTransferDocument()),
+            new InMemoryContentSourceProviderSettingsStore(new() { Providers = [CreateApiConfiguration(provider)] }), http, provider);
+
+        var response = await service.SearchAsync(new ContentSourceSearchCriteria(category: "Manhwa"));
+
+        Assert.Single(response.Results);
+        Assert.Single(response.Failures);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task FavoriteOrLocalOnlySearchNeverRequestsOnlineCatalog()
+    {
+        var handler = new PagedMetadataHandler();
+        using var http = new HttpClient(handler);
+        var provider = new UmdJsonApiContentProvider(http);
+        var local = CreateManga("Local favourite", "Saved", 1) with { Categories = ["Manhwa"] };
+        var service = CreateService(new InMemoryCatalogRepository(new CatalogTransferDocument { Items = [local] }),
+            new InMemoryContentSourceProviderSettingsStore(new() { Providers = [CreateApiConfiguration(provider)] }), http, provider);
+        var response = await service.SearchAsync(new ContentSourceSearchCriteria(category: "Manhwa", localOnly: true));
+        Assert.Single(response.Results);
+        Assert.False(response.Results[0].IsOnline);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task OnlineCatalogRepeatedCursorIsReportedInsteadOfLooping()
+    {
+        var handler = new PagedMetadataHandler { RepeatCursor = true };
+        using var http = new HttpClient(handler);
+        var provider = new UmdJsonApiContentProvider(http);
+        var service = CreateService(new InMemoryCatalogRepository(new CatalogTransferDocument()),
+            new InMemoryContentSourceProviderSettingsStore(new() { Providers = [CreateApiConfiguration(provider)] }), http, provider);
+        var response = await service.SearchAsync(new ContentSourceSearchCriteria(category: "Manhwa"));
+        Assert.Single(response.Failures);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
+    private sealed class PagedMetadataHandler : HttpMessageHandler
+    {
+        public bool RepeatCursor { get; init; }
+        public bool RateLimitSecondPage { get; init; }
+        public List<Uri> Requests { get; } = [];
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Assert.Null(request.Headers.Authorization);
+            Requests.Add(request.RequestUri!);
+            if (RateLimitSecondPage && Requests.Count > 1)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.TooManyRequests) { RequestMessage = request });
+            var item = CreateManga($"Remote title {Requests.Count}", "Metadata", 1) with
+            {
+                Categories = ["Manhwa"],
+                PublicationStatus = "completed",
+                Contributors = [new() { Name = "ManhwaWeb", Kind = "organization", Credits = [new() { Role = "distributor" }] }]
+            };
+            var result = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent(JsonSerializer.Serialize(new CatalogTransferDocument { Items = [item] }, new JsonSerializerOptions(JsonSerializerDefaults.Web)), Encoding.UTF8, "application/json")
+            };
+            if (Requests.Count == 1 || RepeatCursor) result.Headers.Add("X-UMD-Next-Cursor", new string('1', 32));
+            return Task.FromResult(result);
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

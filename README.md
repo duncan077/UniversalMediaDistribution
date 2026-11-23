@@ -2,6 +2,9 @@
 
 Avalonia client for browsing and consuming legally distributable indie, public-domain, Creative Commons, and otherwise authorized media delivered through torrent sources.
 
+The Rust server and Tauri client for desktop, Android and Android TV are under
+[`rust/`](rust/README.md). That guide includes build instructions and the current coverage of the port.
+
 The application targets:
 
 - Native desktop, Android/Android TV, and iOS with MonoTorrent 3.0.2.
@@ -193,10 +196,9 @@ Torrent delivery on the native heads goes through
 
 ## Build and test
 
-Install .NET 11 RC1 SDK `11.0.100-rc.1.26425.128`, as pinned in
-`global.json`. Run the workload restore from the repository root so Android
-uses workloads compatible with that SDK; an older preview workload is not
-sufficient.
+Install the stable .NET 11 SDK (`11.0.100` or a compatible stable .NET 11 SDK).
+Run the workload restore from the repository root to install the Android
+workload for the SDK selected by `global.json`.
 
 ```powershell
 dotnet workload restore src\UniversalMediaDistribution.Android\UniversalMediaDistribution.Android.csproj

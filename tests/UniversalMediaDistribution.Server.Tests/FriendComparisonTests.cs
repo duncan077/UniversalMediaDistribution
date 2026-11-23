@@ -197,7 +197,7 @@ public sealed class FriendComparisonTests : IDisposable
         return (store, mine, theirs);
     }
 
-    private static async Task PublishAsync(
+    private async Task PublishAsync(
         SqliteFriendStore store,
         AccountRecord account,
         string[] favorites,
@@ -205,9 +205,10 @@ public sealed class FriendComparisonTests : IDisposable
         string[]? opened = null)
     {
         var snapshot = CreateSnapshot(favorites, progress, opened);
-        await store.SynchronizeAsync(
-            account,
-            snapshot,
+        await new SqliteUserSyncStore(_directory).SaveAsync(
+            account.AccountId, new UserSyncUploadRequest(0, snapshot.Document), CancellationToken.None);
+        await store.RefreshActivityAsync(
+            account.AccountId,
             CancellationToken.None);
     }
 

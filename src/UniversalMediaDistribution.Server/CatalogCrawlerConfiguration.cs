@@ -20,11 +20,17 @@ internal static class CatalogCrawlerConfiguration
             .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
         if (disabled.Any(id => providers.All(provider => provider.Descriptor.Id != id)))
             throw new ArgumentException("Unknown disabled crawler provider.");
+        const string operationVariable = "UMD_CRAWLER_OPERATION_SECONDS";
+        var operationSeconds = ReadInt(operationVariable, 180, 10, 1200);
+        var defaultDetailSeconds = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(operationVariable))
+            ? 600 : operationSeconds;
         return new CatalogCrawlerOptions
         {
             PagesPerProvider = ReadInt("UMD_CRAWLER_PAGES_PER_PROVIDER", 2, 1, 100),
             MaximumRunTime = TimeSpan.FromMinutes(ReadInt("UMD_CRAWLER_MAX_MINUTES", 45, 1, 50)),
-            OperationTimeout = TimeSpan.FromSeconds(ReadInt("UMD_CRAWLER_OPERATION_SECONDS", 180, 10, 1200)),
+            OperationTimeout = TimeSpan.FromSeconds(operationSeconds),
+            DetailTimeout = TimeSpan.FromSeconds(ReadInt("UMD_CRAWLER_DETAIL_SECONDS",
+                defaultDetailSeconds, 10, 1200)),
             BaseUrls = overrides,
             ProviderIntervals = new CatalogCrawlerSettingsStore(database).ReadIntervals()
                 .Where(pair => providers.Any(provider => provider.Descriptor.Id == pair.Key))

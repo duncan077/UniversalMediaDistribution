@@ -72,11 +72,15 @@ public partial class StreamflixHtmlApiContentProvider : IApiContentProvider
         RegexOptions.CultureInvariant,
         TimeSpan.FromSeconds(1));
     private static readonly Regex SeasonRegex = new(
-        @"(?:temporada[\s/-]*|season[\s/-]*)(?<value>\d+)",
+        @"^(?:temporada|season)[\s/-]+(?<value>[0-9]+)(?=$|\s|:)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
         TimeSpan.FromSeconds(1));
     private static readonly Regex EpisodeRegex = new(
-        @"(?:episodio[\s/-]*|episode[\s/-]*|x)(?<value>\d+(?:[.,]\d+)?)",
+        @"^(?:episodio|episode)[\s/-]+(?<value>[0-9]+(?:[.,][0-9]+)?)(?=$|\s|:)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+    private static readonly Regex EpisodeRouteCoordinateRegex = new(
+        @"(?:^|[-/])(?<season>[0-9]+)x(?<episode>[0-9]+(?:\.[0-9]+)?)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
         TimeSpan.FromSeconds(1));
     private static readonly Regex OriginalTitleTextRegex = new(
@@ -936,6 +940,7 @@ public partial class StreamflixHtmlApiContentProvider : IApiContentProvider
         string html)
     {
         var units = new List<CatalogTransferUnit>();
+        var seenNumbers = new HashSet<decimal>();
         foreach (var link in ParseLinks(root, html)
                      .Where(static link =>
                          link.Route.Contains(
@@ -949,8 +954,8 @@ public partial class StreamflixHtmlApiContentProvider : IApiContentProvider
                          StringComparer.OrdinalIgnoreCase)
                      .Take(MaximumUnits))
         {
-            var number = ReadEpisodeNumber(link.Route, link.Text);
-            if (number is null)
+            var number = ReadEpisodeNumber(link.Route, link.RawText, link.Text, seasonNumber);
+            if (number is null || !seenNumbers.Add(number.Value))
             {
                 continue;
             }
@@ -2050,14 +2055,15 @@ public partial class StreamflixHtmlApiContentProvider : IApiContentProvider
         string route,
         string text)
     {
-        var match = SeasonRegex.Match(route + " " + text);
+        // Like episode slugs, season slugs can start with the show's title.
+        var match = Regex.Match(
+            route,
+            @"[-/](?<value>[0-9]+)/?$",
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromSeconds(1));
         if (!match.Success)
         {
-            match = Regex.Match(
-                route,
-                @"-(?<value>\d+)/?$",
-                RegexOptions.CultureInvariant,
-                TimeSpan.FromSeconds(1));
+            match = SeasonRegex.Match(text);
         }
 
         return match.Success &&
@@ -2072,9 +2078,41 @@ public partial class StreamflixHtmlApiContentProvider : IApiContentProvider
 
     private static decimal? ReadEpisodeNumber(
         string route,
-        string text)
+        string rawText,
+        string text,
+        int seasonNumber)
     {
-        var match = EpisodeRegex.Match(route + " " + text);
+        // The slug can start with a number (e.g. episodio/12-12-12-1x2).
+        // Only the trailing coordinate is authoritative in such links.
+        var coordinate = EpisodeRouteCoordinateRegex.Match(route.TrimEnd('/'));
+        if (coordinate.Success)
+        {
+            return int.TryParse(coordinate.Groups["season"].ValueSpan, NumberStyles.None,
+                       CultureInfo.InvariantCulture, out var routeSeason) &&
+                   routeSeason == seasonNumber &&
+                   decimal.TryParse(coordinate.Groups["episode"].ValueSpan, NumberStyles.AllowDecimalPoint,
+                       CultureInfo.InvariantCulture, out var episode)
+                ? episode
+                : null;
+        }
+
+        var path = route.AsSpan().TrimEnd('/');
+        var previousSlash = path.LastIndexOf('/');
+        var routeEpisode = previousSlash > 0 &&
+            (path[..previousSlash].EndsWith("episodio", StringComparison.OrdinalIgnoreCase) ||
+             path[..previousSlash].EndsWith("episode", StringComparison.OrdinalIgnoreCase)) &&
+            decimal.TryParse(path[(previousSlash + 1)..], NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture, out var explicitNumber)
+            ? explicitNumber
+            : (decimal?)null;
+        return routeEpisode ??
+               ReadExplicitEpisodeNumber(rawText) ??
+               ReadExplicitEpisodeNumber(text);
+    }
+
+    private static decimal? ReadExplicitEpisodeNumber(string value)
+    {
+        var match = EpisodeRegex.Match(value);
         return match.Success &&
                decimal.TryParse(
                    match.Groups["value"].Value.Replace(',', '.'),

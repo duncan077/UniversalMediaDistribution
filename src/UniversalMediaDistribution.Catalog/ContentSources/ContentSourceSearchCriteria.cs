@@ -23,16 +23,23 @@ public sealed record ContentSourceSearchCriteria
         MediaType? mediaType = null,
         MediaSubtypeGroup? subtypeGroup = null,
         ApiContentGenre? genre = null,
-        int? releaseYear = null)
+        int? releaseYear = null,
+        string? category = null,
+        PublicationStatus? status = null,
+        string? providerName = null,
+        bool browseOnline = false,
+        bool localOnly = false)
     {
         var normalizedQuery = string.IsNullOrWhiteSpace(query)
             ? null
             : query.Trim();
-        if (normalizedQuery is null && genre is null && releaseYear is null)
+        category = CatalogSearchMetadataFilters.NormalizeLabel(category);
+        providerName = CatalogSearchMetadataFilters.NormalizeLabel(providerName);
+        if (status is { } value && !Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(status));
+        if (normalizedQuery is null && genre is null && releaseYear is null && category is null && status is null && providerName is null && !browseOnline)
         {
             throw new ArgumentException(
-                "A search requires at least one of query text, genre, or " +
-                "release year.");
+                "A search requires text, a public metadata filter, or explicit online browsing.");
         }
 
         if (normalizedQuery is { Length: > MaximumQueryLength })
@@ -58,6 +65,11 @@ public sealed record ContentSourceSearchCriteria
         SubtypeGroup = subtypeGroup;
         Genre = genre;
         ReleaseYear = releaseYear;
+        Category = category;
+        Status = status;
+        ProviderName = providerName;
+        BrowseOnline = browseOnline;
+        LocalOnly = localOnly;
     }
 
     public string? Query { get; }
@@ -70,7 +82,13 @@ public sealed record ContentSourceSearchCriteria
 
     public int? ReleaseYear { get; }
 
-    public bool HasFilters => Genre is not null || ReleaseYear is not null;
+    public string? Category { get; }
+    public PublicationStatus? Status { get; }
+    public string? ProviderName { get; }
+    public bool BrowseOnline { get; }
+    public bool LocalOnly { get; }
+    public bool HasCatalogFilters => Category is not null || Status is not null || ProviderName is not null || BrowseOnline;
+    public bool HasFilters => Genre is not null || ReleaseYear is not null || HasCatalogFilters;
 
     /// <summary>
     /// True when nothing but filters was given, so the search browses rather
@@ -85,9 +103,13 @@ public sealed record ContentSourceSearchCriteria
     /// it. Media type and subtype group are deliberately not checked here:
     /// callers scope those before a card is ever built.
     /// </summary>
-    public bool Matches(CatalogCard card)
+    public bool Matches(CatalogCard card) => Matches(card, sourceName: null);
+
+    public bool Matches(CatalogCard card, string? sourceName)
     {
         ArgumentNullException.ThrowIfNull(card);
+        if (!CatalogSearchMetadataFilters.Matches(card, Category, Status,
+                string.Equals(sourceName, ProviderName, StringComparison.OrdinalIgnoreCase) ? null : ProviderName)) return false;
         if (ReleaseYear is not null && card.ReleaseYear != ReleaseYear)
         {
             return false;
@@ -120,7 +142,8 @@ public sealed record ContentSourceSearchCriteria
     /// declared capabilities can be tested against the real request.
     /// </summary>
     public ApiContentSearchRequest ToApiRequest() =>
-        new(Query, MediaType, Genre, ReleaseYear);
+        new(Query, MediaType, Genre, ReleaseYear, category: Category, status: Status,
+            providerName: ProviderName, browse: BrowseOnline, subtypeGroup: SubtypeGroup);
 
     private static bool MatchesText(CatalogCard card, string query)
     {

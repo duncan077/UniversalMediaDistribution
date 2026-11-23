@@ -9,6 +9,53 @@ namespace UniversalMediaDistribution.UI.Tests;
 
 public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
 {
+    [Theory]
+    [InlineData("murim-king")]
+    [InlineData("murim-king-20261113-080132108")]
+    public async Task MovedComicLoadsChaptersAndReaderUsingTheVerifiedReplacement(string oldSlug)
+    {
+        var handler = new OlympusHandler(movedComic: true);
+        using var client = new HttpClient(handler);
+        var provider = new OlympusXyzApiContentProvider(client);
+        var root = new Uri(provider.Descriptor.DefaultBaseUrl);
+        var item = new ApiContentSearchItem(oldSlug, new CatalogTransferItem
+        {
+            Name = "The Murim King",
+            MediaType = "book",
+            Subtype = "manga"
+        });
+        var episode = new ApiContentUnitRequest(ContentUnitKind.Chapter, "2.5", null);
+
+        var result = await provider.LoadUnitImagesAsync(root, item, episode);
+
+        Assert.NotNull(result);
+        Assert.Contains(handler.Requests, r => r.Uri.AbsolutePath == $"/api/series/{oldSlug}");
+        Assert.Contains(handler.Requests, r => r.Uri.AbsolutePath == $"/api/capitulo/{OlympusHandler.NewSlug}/2.5");
+        Assert.Single(provider.GetKnownUnitRoutes(root, item, episode));
+    }
+
+    [Theory]
+    [InlineData("another-manga", false)]
+    [InlineData("murim-king", true)]
+    public async Task MovedComicDoesNotFollowANameOnlyOrAmbiguousMatch(string oldSlug, bool ambiguous)
+    {
+        var handler = new OlympusHandler(movedComic: true, ambiguousMove: ambiguous);
+        using var client = new HttpClient(handler);
+        var provider = new OlympusXyzApiContentProvider(client);
+        var item = new ApiContentSearchItem(oldSlug, new CatalogTransferItem
+        {
+            Name = "The Murim King",
+            MediaType = "book",
+            Subtype = "manga"
+        });
+
+        var error = await Assert.ThrowsAsync<HttpRequestException>(() =>
+            provider.LoadItemAsync(new Uri(provider.Descriptor.DefaultBaseUrl), item).AsTask());
+
+        Assert.Equal(HttpStatusCode.NotFound, error.StatusCode);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
     private static readonly Uri BaseUri =
         new("https://olympus.example/");
 
@@ -364,8 +411,12 @@ public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
     private sealed class OlympusHandler(
         string? homepage = null,
         bool useLegacyReader = false,
-        string readerName = "2.5") : HttpMessageHandler
+        string readerName = "2.5",
+        bool movedComic = false,
+        bool ambiguousMove = false) : HttpMessageHandler
     {
+        public const string NewSlug = "murim-king-20261114-080132108";
+
         public int SeriesListRequestCount { get; private set; }
 
         public List<RequestRecord> Requests { get; } = [];
@@ -381,6 +432,7 @@ public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
                 uri,
                 request.Headers.GetValues("Origin").Single()));
 
+            var slug = movedComic ? NewSlug : "murim-king";
             string content;
             if (uri.AbsolutePath == "/")
             {
@@ -411,35 +463,35 @@ public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
             {
                 SeriesListRequestCount++;
                 content =
-                    """
+                    $$"""
                     {
                       "data": [
                         {
                           "id": 7,
                           "name": "The Murim King",
-                          "slug": "murim-king",
+                          "slug": "{{slug}}",
                           "cover": "https://images.olympus.example/covers/king.webp",
                           "type": "comic"
                         },
                         {
                           "id": 8,
-                          "name": "Unrelated",
-                          "slug": "unrelated",
+                          "name": "{{(ambiguousMove ? "The Murim King" : "Unrelated")}}",
+                          "slug": "{{(ambiguousMove ? "murim-king-20261114-080234549" : "unrelated")}}",
                           "type": "comic"
                         }
                       ]
                     }
                     """;
             }
-            else if (uri.AbsolutePath == "/api/series/murim-king")
+            else if (uri.AbsolutePath == $"/api/series/{slug}")
             {
                 content =
-                    """
+                    $$"""
                     {
                       "data": {
                         "id": 7,
                         "name": "The Murim King",
-                        "slug": "murim-king",
+                        "slug": "{{slug}}",
                         "summary": " A martial-arts   story. ",
                         "cover": "https://images.olympus.example/covers/detail.webp",
                         "type": "comic",
@@ -453,7 +505,7 @@ public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
                     """;
             }
             else if (uri.AbsolutePath ==
-                     "/api/series/murim-king/chapters")
+                     $"/api/series/{slug}/chapters")
             {
                 content =
                     """
@@ -478,8 +530,8 @@ public sealed class OlympusXyzApiContentProviderTests(ITestOutputHelper output)
                     """;
             }
             else if (uri.AbsolutePath == (useLegacyReader
-                         ? "/api/capitulo/murim-king/205"
-                         : "/api/capitulo/murim-king/2.5"))
+                         ? $"/api/capitulo/{slug}/205"
+                         : $"/api/capitulo/{slug}/2.5"))
             {
                 content =
                     $$"""

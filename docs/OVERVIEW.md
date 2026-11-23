@@ -131,7 +131,7 @@ No macOS target, and no browser/WebAssembly head.
 
 ## How it is built
 
-- **Avalonia 12** UI shared by every head, on **.NET 11 RC1**.
+- **Avalonia 12** UI shared by every head, on **.NET 11**.
 - A layered split — `Domain`, `Application`, `Catalog`, `UI` — with platform
   heads holding only composition and platform services.
 - **SQLite** for the catalogue and user state, with versioned migrations,
