@@ -6531,7 +6531,7 @@ dependencies = [
 
 [[package]]
 name = "umd-desktop"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "adblock",
  "axum",
@@ -6596,7 +6596,7 @@ dependencies = [
 
 [[package]]
 name = "umd-server"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "axum",
  "base64 0.22.1",
