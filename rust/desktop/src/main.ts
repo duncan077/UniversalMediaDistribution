@@ -73,7 +73,6 @@ let serverAddress = "";
 const serverDialog = element<HTMLDialogElement>("server-dialog");
 let items: CatalogItem[] = [];
 let favorites = new Set<string>();
-let userListsCache: MediaList[] = [];
 let favoritesOnly = false;
 let cursor: string | null = null;
 let generation = 0;
@@ -236,6 +235,8 @@ function showFilters(open: boolean) {
 }
 
 function syncFilterCount() {
+  search.placeholder = ui(favoritesOnly ? "Buscar en favoritos" : "Buscar en tu biblioteca");
+  search.setAttribute("aria-label", ui(favoritesOnly ? "Buscar en favoritos" : "Buscar en el catálogo"));
   const group = element<HTMLSelectElement>("subtype-group").value;
   const beyond = [
     ...Object.entries(filters()).filter(([key]) => key !== "subtypeGroup").map(([, value]) => value),
@@ -313,14 +314,14 @@ async function action(task: () => Promise<void>) {
 
 async function refreshListFilterOptions() {
   try {
-    userListsCache = await invokeProfile<MediaList[]>("personal_lists");
+    const lists = await invokeProfile<MediaList[]>("personal_lists");
     const prev = listFilter.value;
     listFilter.replaceChildren(new Option(ui("Todas las listas"), ""));
-    for (const l of userListsCache) {
+    for (const l of lists) {
       listFilter.add(new Option(`${l.name} (${l.items.length})`, l.id));
     }
-    if (userListsCache.some(l => l.id === prev)) listFilter.value = prev;
-    element("list-filter-wrap").hidden = userListsCache.length === 0;
+    if (lists.some(l => l.id === prev)) listFilter.value = prev;
+    element("list-filter-wrap").hidden = lists.length === 0;
   } catch {
     element("list-filter-wrap").hidden = true;
   }
@@ -340,6 +341,7 @@ async function load(append = false) {
         q: search.value.trim(),
         mediaType: media.value || null,
         favoritesOnly,
+        listId: listFilter.value || null,
         cursor: append ? cursor : null,
         limit: 50,
       },
@@ -501,7 +503,6 @@ function favoriteButton(item: CatalogItem, withText = false) {
           syncFavoriteButton(control, title, item.syncId, control.dataset.withText === "true");
         }
       }
-      window.dispatchEvent(new Event("umd-profile-changed"));
       if (favoritesOnly) await load();
     } catch (error) {
       status(String(error), true);
@@ -661,13 +662,6 @@ async function openOnline(summary: CatalogItem) {
   }
 }
 
-function itemMatchesListFilter(item: CatalogItem): boolean {
-  if (!listFilter.value) return true;
-  const target = userListsCache.find(l => l.id === listFilter.value);
-  if (!target) return true;
-  return target.items.some(entry => entry.itemId === item.syncId);
-}
-
 function renderHomeShelves(visible: CatalogItem[]) {
   const host = element("home-shelves");
   const showShelves = home() && shelfMode && visible.length >= 6;
@@ -774,10 +768,10 @@ function renderHomeShelves(visible: CatalogItem[]) {
 
 function render(from = 0) {
   if (!from) catalog.replaceChildren();
-  const visible = items.filter(item => !hiddenTitle(item) && itemMatchesListFilter(item));
+  const visible = items.filter(item => !hiddenTitle(item));
   const cards = document.createDocumentFragment();
   for (const item of items.slice(from)) {
-    if (hiddenTitle(item) || !itemMatchesListFilter(item)) continue;
+    if (hiddenTitle(item)) continue;
     cards.append(titleCard(item, () => void showDetails(item), true));
   }
   catalog.append(cards);
@@ -792,9 +786,9 @@ function render(from = 0) {
   element("collection-title").textContent = ui(search.value.trim() ? "Resultados" : home() ? "Tu biblioteca" : "Títulos");
   element("empty").hidden = firstRun || visible.length > 0;
   const justFavorites = favoritesOnly && !hasFilters();
-  element("empty-title").textContent = ui(justFavorites ? "Todavía no tenés favoritos" : serverAddress ? "Sin títulos locales para mostrar" : "Sin títulos para mostrar");
-  element("empty-description").textContent = ui(justFavorites ? "Marcá el corazón de un título para encontrarlo acá." : serverAddress ? "Podés guardar un título desde su ficha en el servidor." : "Probá con otro título o cambiá los filtros.");
-  element("empty-reset").textContent = ui(section === "all" && hasFilters() ? "Limpiar filtros" : "Volver a la biblioteca");
+  element("empty-title").textContent = ui(justFavorites ? "Todavía no tenés favoritos" : favoritesOnly ? "No hay favoritos que coincidan" : serverAddress ? "Sin títulos locales para mostrar" : "Sin títulos para mostrar");
+  element("empty-description").textContent = ui(justFavorites ? "Marcá el corazón de un título para encontrarlo acá." : serverAddress && !favoritesOnly ? "Podés guardar un título desde su ficha en el servidor." : "Probá con otro título o cambiá los filtros.");
+  element("empty-reset").textContent = ui((section === "all" || favoritesOnly) && hasFilters() ? "Limpiar filtros" : "Volver a la biblioteca");
   if (!catalog.hidden) element("more").hidden = cursor === null;
 }
 
@@ -1200,7 +1194,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-close]").forEach(button => {
 for (const id of Object.keys(sections) as Section[]) {
   element(id).addEventListener("click", () => selectSection(id));
 }
-element("empty-reset").onclick = () => selectSection("all");
+element("empty-reset").onclick = () => selectSection((section === "all" || favoritesOnly) && hasFilters() ? section : "all");
 element("feature-action").onclick = () => {
   if (featured) void showDetails(featured, featuredUnit);
   else element("connect").click();
@@ -1320,9 +1314,9 @@ setupLanguage(flushProgress);
 void refreshContinue().catch(() => {});
 void refreshListFilterOptions();
 setupAccount(async () => {
+  await refreshListFilterOptions();
   await load();
   void refreshContinue().catch(() => {});
-  void refreshListFilterOptions();
   if (isPageActive("detail") && currentDetail && !currentDetail.onlineServer) {
     const { id, unit } = currentDetail;
     try {
@@ -1371,7 +1365,11 @@ void invoke<string | null>("library_notice").then(message => {
 }).catch(e => status(String(e), true));
 
 window.addEventListener("umd-catalog-changed", () => { void load(); void refreshContinue().catch(() => {}); });
-window.addEventListener("umd-lists-changed", () => { void refreshListFilterOptions(); });
+window.addEventListener("umd-lists-changed", async () => {
+  const filteringByList = !!listFilter.value;
+  await refreshListFilterOptions();
+  if (filteringByList) await load();
+});
 document.addEventListener("close", event => {
   if ((event.target as Element).matches(".player-dialog")) {
     setTimeout(() => void flushProgress().then(refreshContinue).catch(() => {}), 0);

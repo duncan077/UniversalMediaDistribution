@@ -364,6 +364,7 @@ pub struct CatalogQuery {
 #[derive(Clone, Default, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogFilters {
+    pub list_id: Option<Uuid>,
     pub year: Option<i32>,
     pub genre: Option<String>,
     pub category: Option<String>,

@@ -167,6 +167,7 @@ impl Search {
             limit: self.limit,
             favorites_only: false,
             filters: umd_core::CatalogFilters {
+                list_id: None,
                 year: self.year,
                 genre: self.genre,
                 category: self.category,

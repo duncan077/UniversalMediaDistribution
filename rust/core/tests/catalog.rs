@@ -1,5 +1,5 @@
 use serde_json::json;
-use umd_core::{CatalogDocument, CatalogQuery, CatalogStore};
+use umd_core::{CatalogDocument, CatalogQuery, CatalogStore, ListEdit};
 use uuid::Uuid;
 
 #[test]
@@ -102,6 +102,59 @@ fn reimport_and_rename_keep_favorites_and_explicit_identity() {
     assert_eq!(result.total, 1);
     assert_eq!(result.favorite_ids, vec![id]);
     assert_eq!(result.page.document.items[0].name, "Nombre actualizado");
+}
+
+#[test]
+fn favorite_search_intersects_list_members_before_counting_or_paginating() {
+    let store = CatalogStore::in_memory().unwrap();
+    let ids: Vec<_> = (1..=4).map(Uuid::from_u128).collect();
+    let mut items = Vec::new();
+    for (index, &id) in ids.iter().enumerate() {
+        let mut item = document(&format!("Libro {}", index + 1)).items.remove(0);
+        item.sync_id = Some(id);
+        item.metadata.insert(
+            "alternativeNames".into(),
+            json!([{"name":"Océano Azul","language":"es"}]),
+        );
+        items.push(item);
+    }
+    store.import(&CatalogDocument::new(items), false).unwrap();
+    for &id in &ids[..3] {
+        store.set_favorite(id, true).unwrap();
+    }
+    store
+        .edit_list(ListEdit::Create {
+            name: "Para leer".into(),
+        })
+        .unwrap();
+    let lists = store.personal_lists().unwrap();
+    let list_id = Uuid::parse_str(lists[0]["id"].as_str().unwrap()).unwrap();
+    for &item_id in &ids[1..] {
+        store
+            .edit_list(ListEdit::Member {
+                id: list_id,
+                item_id,
+                enabled: true,
+            })
+            .unwrap();
+    }
+
+    let mut query = CatalogQuery {
+        q: "oceano azul".into(),
+        favorites_only: true,
+        limit: Some(1),
+        ..Default::default()
+    };
+    query.filters.list_id = Some(list_id);
+    let first = store.page(&query).unwrap();
+    assert_eq!(first.total, 2);
+    assert_eq!(first.page.document.items[0].sync_id, Some(ids[1]));
+    query.cursor = first.page.continuation_token;
+    assert!(query.cursor.is_some());
+    let second = store.page(&query).unwrap();
+    assert_eq!(second.total, 2);
+    assert_eq!(second.page.document.items[0].sync_id, Some(ids[2]));
+    assert!(second.page.continuation_token.is_none());
 }
 
 #[test]

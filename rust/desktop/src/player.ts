@@ -265,6 +265,8 @@ export function contentControls(
   const toggleAllBtn = node("button", isBook ? ui("Marcar todo leído") : ui("Marcar todo visto"), "quiet-btn");
   toggleAllBtn.type = "button";
   toggleAllBtn.hidden = !hasUnits;
+  toggleAllBtn.disabled = true;
+  let progressLoaded = false;
 
   const pickBtn = node("button", ui("Abrir archivo…"), "quiet-btn");
   pickBtn.type = "button";
@@ -842,6 +844,7 @@ export function contentControls(
       "seen-toggle" + (badge.kind === "seen" ? " active" : ""),
     );
     seenBtn.type = "button";
+    seenBtn.disabled = !progressLoaded;
     seenBtn.setAttribute("aria-pressed", String(badge.kind === "seen"));
     seenBtn.onclick = async () => {
       const nextCompleted = !(progressMap.get(entry.index)?.isCompleted === true);
@@ -986,7 +989,12 @@ export function contentControls(
         const matched = matchProgressRow(entry, rows);
         if (matched) progressMap.set(entry.index, matched);
       }
+      if (!progressLoaded) {
+        progressLoaded = true;
+        toggleAllBtn.disabled = false;
+      }
       renderEntries();
+      updateToggleAllLabel();
       updateContinueCta();
     } catch {
       /* Progress lookup failure does not block viewing entries. */

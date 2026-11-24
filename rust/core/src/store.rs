@@ -336,6 +336,19 @@ impl CatalogStore {
             i64::from(query.favorites_only).into(),
             self.1.to_string().into(),
         ];
+        if let Some(list_id) = query.filters.list_id {
+            args.push(list_id.to_string().into());
+            filter.push_str(
+                " AND c.id IN (
+                    SELECT member.value->>'itemId'
+                    FROM rust_profiles p
+                    CROSS JOIN json_each(p.document,'$.lists') list
+                    CROSS JOIN json_each(list.value,'$.items') member
+                    WHERE p.id=?4 AND list.value->>'id'=?5
+                    AND COALESCE(list.value->>'isDeleted',0)=0
+                )",
+            );
+        }
         crate::filters::apply(&query.filters, &mut filter, &mut args);
         const HIDE_ADULT_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM json_each(s.summary,'$.genres') tag WHERE tag.value IS NOT NULL AND umd_adult_tag(tag.value))
             AND NOT EXISTS (SELECT 1 FROM json_each(s.summary,'$.categories') tag WHERE tag.value IS NOT NULL AND umd_adult_tag(tag.value))

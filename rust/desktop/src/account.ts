@@ -17,23 +17,47 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
   header.append(title, close); dialog.append(header);
   const content = el("div"); const message = el("p"); message.setAttribute("role", "status"); dialog.append(content, message);
   let logged: Login | null = null; let working = false;
-  let syncing = false;
+  let syncing: Promise<void> | undefined;
+  let pendingLocalChanges = false;
+  let syncDebounce: ReturnType<typeof setTimeout> | undefined;
+  function scheduleSync() {
+    if (!logged?.automatic || !pendingLocalChanges || syncDebounce !== undefined) return;
+    syncDebounce = setTimeout(() => {
+      syncDebounce = undefined;
+      void sync(true);
+    }, 2500);
+  }
+
   async function sync(background: boolean) {
     const session = logged;
-    if (!session || syncing || (background && (!session.automatic || document.hidden || dialog.open || working))) return;
-    const username = session.username;
-    syncing = true;
+    if (!session || (background && (!session.automatic || document.hidden || dialog.open || working))) return;
+    if (syncing) {
+      if (background) return;
+      await syncing.catch(() => {});
+      if (logged !== session) return;
+    }
+    const currentSync = reconcile(session, background);
+    syncing = currentSync;
+    try { await currentSync; }
+    finally {
+      if (syncing === currentSync) syncing = undefined;
+      scheduleSync();
+    }
+  }
+
+  async function reconcile(session: Login, background: boolean) {
     try {
       await flushProgress();
+      pendingLocalChanges = false;
       const result = await invokeProfile<{changed: boolean; backup?: BackupInfo}>("account_sync", {background});
-      if (logged?.username !== username) return;
+      if (logged !== session) return;
       if (result.backup) logged.backup = result.backup;
       if (result.changed || !background) await reloaded();
       if (dialog.open) { render(); message.textContent = ui("Perfil sincronizado."); }
     } catch (error) {
       try {
         const current = await invokeProfile<Login | null>("account_current");
-        if (logged?.username === username && current) {
+        if (logged === session && current) {
           logged.automatic = current.automatic;
           logged.backup = current.backup;
           if (dialog.open) render();
@@ -41,16 +65,16 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       } catch { /* Keep the original sync error available. */ }
       if (!background) throw error;
       report(String(error), true);
-    } finally { syncing = false; }
+    }
   }
-  let syncDebounce: ReturnType<typeof setTimeout> | undefined;
   window.setInterval(() => void sync(true), 60_000);
   window.addEventListener("online", () => void sync(true));
   document.addEventListener("visibilitychange", () => { if (!document.hidden) void sync(true); });
+  dialog.addEventListener("close", scheduleSync);
   window.addEventListener("umd-profile-changed", () => {
     if (!logged?.automatic) return;
-    clearTimeout(syncDebounce);
-    syncDebounce = setTimeout(() => void sync(true), 2500);
+    pendingLocalChanges = true;
+    scheduleSync();
   });
   void invokeProfile<Login | null>("account_current").then(session => {
     if (logged) return;
@@ -88,9 +112,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
           button.textContent = logged.displayName;
           window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:true}));
           render();
-          if (!register.checked && logged.backup?.hasBackup) {
-            await sync(false);
-          }
+          await sync(false);
         }
         finally { password.value = ""; }
       }); }); content.append(form);
@@ -145,7 +167,8 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
     try {
       const previousUsername = logged?.username ?? null;
       const current = await invokeProfile<Login | null>("account_current");
-      logged = current;
+      if (logged && current?.username === previousUsername) Object.assign(logged, current);
+      else logged = current;
       button.textContent = current ? current.displayName : ui("Cuenta y respaldo");
       if ((current?.username ?? null) !== previousUsername) {
         window.dispatchEvent(new CustomEvent("umd-account-changed", {detail: !!current}));

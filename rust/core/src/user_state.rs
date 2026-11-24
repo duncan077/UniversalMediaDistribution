@@ -1888,6 +1888,16 @@ mod pending_positions {
         assert!(page.favorite_ids.contains(&manga_id));
         assert!(page.favorite_ids.contains(&novel_canonical));
 
+        let found = store
+            .page(&CatalogQuery {
+                q: "NOVÉLA".into(),
+                favorites_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.total, 1);
+        assert_eq!(found.page.document.items[0].sync_id, Some(novel_canonical));
+
         // Even if rust_favorites is cleared externally, reconciling repairs it.
         store
             .0

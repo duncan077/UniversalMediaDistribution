@@ -223,6 +223,13 @@ mod tests {
             .unwrap();
         assert_eq!(result["backup"]["revision"], 3);
         assert_eq!(result["changed"], true);
+        assert_eq!(session.revision, Some(3));
+        assert_eq!(
+            local
+                .backup_revision(session.base.as_str(), session.account)
+                .unwrap(),
+            Some(3)
+        );
         assert_eq!(local.personal_lists().unwrap().len(), 2);
         super::super::synchronize(&mut session, &local)
             .await

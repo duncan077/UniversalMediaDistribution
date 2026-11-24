@@ -160,7 +160,7 @@ pub async fn account_login(
         token,
         revision,
         pending: None,
-        automatic: false,
+        automatic: true,
         incremental,
         gzip,
         delta_base: None,
@@ -188,7 +188,7 @@ pub async fn account_login(
                 expires: expires.into(),
                 incremental,
                 gzip,
-                automatic: false,
+                automatic: session.automatic,
             },
         )?;
     } else {
@@ -203,9 +203,10 @@ pub async fn account_login(
             .send()
             .await;
     }
+    let automatic = session.automatic;
     state.insert(profile_id, session);
     Ok(
-        json!({"username":result["username"],"displayName":result["displayName"],"backup":backup.ok(),"backupError":backup_error,"automatic":false}),
+        json!({"username":result["username"],"displayName":result["displayName"],"backup":backup.ok(),"backupError":backup_error,"automatic":automatic}),
     )
 }
 async fn fetch(session: &mut Session) -> CommandResult<Value> {
@@ -498,7 +499,7 @@ pub async fn account_sync(
 async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResult<Value> {
     let mut changed = false;
     let mut needs_full_upload = false;
-    for _ in 0..3 {
+    for _ in 0..5 {
         let info = incremental::fetch_latest(session).await?;
         let expected = info["revision"].as_i64().ok_or("Revisión inválida.")?;
         if info["hasBackup"] == false
@@ -537,9 +538,7 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
         let (updated, upload) = merged?;
         changed |= updated;
         let Some(document) = upload else {
-            store
-                .remember_sync_origin(session.base.as_str(), session.account)
-                .map_err(|e| e.to_string())?;
+            acknowledge_sync(session, store, expected)?;
             session.last_sync = Some((expected, marker));
             return Ok(json!({"changed":changed,"backup":info}));
         };
@@ -550,6 +549,7 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
                 .and_then(|base| umd_core::backup_patch(&base["document"], &document))
             {
                 if umd_core::backup_patch_empty(&patch) {
+                    acknowledge_sync(session, store, expected)?;
                     session.last_sync = Some((expected, marker));
                     return Ok(json!({"changed":changed,"backup":info}));
                 }
@@ -579,9 +579,7 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
                                 .map_err(|e| e.to_string())
                         })
                         .await?;
-                        store
-                            .remember_sync_origin(session.base.as_str(), session.account)
-                            .map_err(|e| e.to_string())?;
+                        acknowledge_sync(session, store, revision)?;
                         // This marker predates our write. A concurrent local edit
                         // must still be considered on the next sync.
                         session.last_sync = remaining.is_none().then_some((revision, marker));
@@ -627,13 +625,21 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
         let info = summary(&snapshot);
         session.pending = Some(snapshot);
         session.delta_base = None;
-        store
-            .remember_sync_origin(session.base.as_str(), session.account)
-            .map_err(|e| e.to_string())?;
+        acknowledge_sync(session, store, revision)?;
         session.last_sync = Some((revision, marker));
         return Ok(json!({"changed":changed,"backup":info}));
     }
     Err("Otro dispositivo sigue guardando cambios. Reintentá la sincronización.".into())
+}
+
+fn acknowledge_sync(session: &mut Session, store: &CatalogStore, revision: i64) -> CommandResult<()> {
+    if session.revision != Some(revision) {
+        store
+            .remember_upload(session.base.as_str(), session.account, revision)
+            .map_err(|e| e.to_string())?;
+        session.revision = Some(revision);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -733,6 +739,11 @@ mod tests {
         };
         let result = synchronize(&mut s, &local).await.unwrap();
         assert_eq!(result["backup"]["revision"], 2);
+        assert_eq!(s.revision, Some(2));
+        assert_eq!(
+            local.backup_revision(s.base.as_str(), s.account).unwrap(),
+            Some(2)
+        );
         assert_eq!(local.personal_lists().unwrap().len(), 2);
         assert_eq!(
             snapshot.lock().unwrap()["document"]["lists"]

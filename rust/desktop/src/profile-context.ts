@@ -19,6 +19,9 @@ export interface Profiles {
 // the person who started playback or a backup in that window.
 let context: Promise<Profiles> | undefined;
 let cachedActiveId: string | null = null;
+const personalWrites = new Set([
+  "favorite", "save_progress", "save_progress_batch", "reader_mode", "edit_list", "save_shared_list",
+]);
 
 export function activeProfileId(): string | null {
   return cachedActiveId;
@@ -52,5 +55,9 @@ export async function invokeProfile<T>(command: string, args: Record<string,unkn
         preferredProviders: preferredProvidersForProfile(activeId),
       }
     : {};
-  return invoke<T>(command, {...args, ...view, profileId: activeId});
+  const result = await invoke<T>(command, {...args, ...view, profileId: activeId});
+  if (personalWrites.has(command) && (command !== "reader_mode" || args.mode != null)) {
+    window.dispatchEvent(new Event("umd-profile-changed"));
+  }
+  return result;
 }
