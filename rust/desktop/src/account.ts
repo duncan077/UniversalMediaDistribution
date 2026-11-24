@@ -3,7 +3,7 @@ import {activeProfileId,getProfilePref,invokeProfile} from "./profile-context";
 import {invoke} from "./bridge";
 import {flushProgress} from "./player";
 
-interface BackupInfo { revision: number; updatedAt: string; hasBackup: boolean; itemCount: number | null }
+interface BackupInfo { revision: number; updatedAt: string; hasBackup: boolean; itemCount: number | null; favoriteCount?: number | null; listCount?: number | null }
 interface Login { username: string; displayName: string; backup: BackupInfo | null; backupError?: string; automatic: boolean }
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) { const result = document.createElement(tag); if (text !== undefined) result.textContent = text; return result; }
 
@@ -82,7 +82,16 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       const submit = el("button", ui("Continuar")); submit.type = "submit"; submit.className = "primary"; form.append(submit);
       const hint = el("p", ui("La cuenta se recuerda en este perfil hasta cerrar sesión o hasta que venza el acceso. El respaldo incluye catálogo, favoritos y posiciones guardadas.")); hint.className = "muted"; form.append(hint);
       form.addEventListener("submit", event => { event.preventDefault(); void action(async () => {
-        try { logged = await invokeProfile<Login>("account_login", { baseUrl: url.value, username: user.value, password: password.value, register: register.checked, displayName: display.value.trim() || null, deviceName: device.value.trim() || device.placeholder }); password.value = ""; button.textContent = logged.displayName; window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:true})); render(); }
+        try {
+          logged = await invokeProfile<Login>("account_login", { baseUrl: url.value, username: user.value, password: password.value, register: register.checked, displayName: display.value.trim() || null, deviceName: device.value.trim() || device.placeholder });
+          password.value = "";
+          button.textContent = logged.displayName;
+          window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:true}));
+          render();
+          if (!register.checked && logged.backup?.hasBackup) {
+            await sync(false);
+          }
+        }
         finally { password.value = ""; }
       }); }); content.append(form);
       void invoke<string>("server_url").then(v => { if (!url.value) url.value = v; }).catch(() => {});
@@ -90,7 +99,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
     }
     content.append(el("p", ui("Sesión de {0} (@{1})", logged.displayName, logged.username)));
     const info = logged.backup;
-    if (info) content.append(el("p", info.hasBackup ? ui("Respaldo: {0} títulos · {1} · revisión {2}", info.itemCount ?? 0, new Date(info.updatedAt).toLocaleString(document.documentElement.lang), info.revision) : ui("Esta cuenta todavía no tiene un respaldo.")));
+    if (info) content.append(el("p", info.hasBackup ? ui("Respaldo: {0} títulos · {1} favoritos · {2} · revisión {3}", info.itemCount ?? 0, info.favoriteCount ?? 0, new Date(info.updatedAt).toLocaleString(document.documentElement.lang), info.revision) : ui("Esta cuenta todavía no tiene un respaldo.")));
     else content.append(el("p", logged.backupError || ui("Revisá el respaldo antes de guardar.")));
     const controls = el("div"); controls.className = "button-row";
     const combine = el("button", ui("Sincronizar ahora")); combine.type = "button"; combine.className = "quiet-btn";

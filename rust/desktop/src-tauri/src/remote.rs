@@ -256,7 +256,24 @@ async fn fetch(session: &mut Session) -> CommandResult<Value> {
     Ok(info)
 }
 fn summary(snapshot: &Value) -> Value {
-    json!({"revision":snapshot["revision"],"updatedAt":snapshot["updatedAt"],"itemCount":snapshot["document"]["catalog"]["items"].as_array().map(|v|v.len()),"hasBackup":!snapshot["document"].is_null()})
+    let doc = &snapshot["document"];
+    let item_count = doc["catalog"]["items"]
+        .as_array()
+        .map(|items| items.iter().filter(|item| item["deleted"] != true).count());
+    let favorite_count = doc["favoriteItemStates"]
+        .as_array()
+        .map(|rows| rows.iter().filter(|row| row["isFavorite"] == true).count());
+    let list_count = doc["lists"]
+        .as_array()
+        .map(|rows| rows.iter().filter(|row| row["isDeleted"] != true).count());
+    json!({
+        "revision": snapshot["revision"],
+        "updatedAt": snapshot["updatedAt"],
+        "itemCount": item_count,
+        "favoriteCount": favorite_count,
+        "listCount": list_count,
+        "hasBackup": !doc.is_null()
+    })
 }
 #[tauri::command]
 pub async fn account_backup_info(

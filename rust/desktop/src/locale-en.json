@@ -117,6 +117,7 @@
   "La sesión dura hasta que cierres la app. El respaldo incluye catálogo, favoritos y posiciones guardadas.": "Your session lasts until you close the app. Backups include the catalog, favorites and saved positions.",
   "Sesión de {0} (@{1})": "Signed in as {0} (@{1})",
   "Respaldo: {0} títulos · {1} · revisión {2}": "Backup: {0} titles · {1} · revision {2}",
+  "Respaldo: {0} títulos · {1} favoritos · {2} · revisión {3}": "Backup: {0} titles · {1} favorites · {2} · revision {3}",
   "Esta cuenta todavía no tiene un respaldo.": "This account has no backup yet.",
   "Revisá el respaldo antes de guardar.": "Review the backup before saving.",
   "Sincronizar ahora": "Sync now",

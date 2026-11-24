@@ -516,7 +516,9 @@ impl<'a> Titles<'a> {
             .and_then(|v| Uuid::parse_str(v).ok())
         {
             let target = crate::reconcile_catalog::destination(id, redirects).ok()?;
-            return self.by_id.get(&target).copied();
+            if let Some(found) = self.by_id.get(&target).copied() {
+                return Some(found);
+            }
         }
         resolve(self.catalog, identity)
     }
@@ -661,6 +663,85 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             profile_id TEXT PRIMARY KEY REFERENCES rust_profiles(id) ON DELETE CASCADE,
             device_id TEXT NOT NULL, clock INTEGER NOT NULL, document_bytes INTEGER NOT NULL);",
     )?;
+    repair_profile_favorites(db)?;
+    Ok(())
+}
+
+fn repair_profile_favorites(db: &Connection) -> Result<()> {
+    let profiles: Vec<(String, String)> = {
+        let mut stmt = db.prepare("SELECT id, document FROM rust_profiles WHERE document IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut catalog_cache: Option<CatalogDocument> = None;
+    for (profile_id, raw) in profiles {
+        let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(rows) = doc["favoriteItemStates"].as_array() else {
+            continue;
+        };
+        let active: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r["isFavorite"] == true)
+            .collect();
+        if active.is_empty() {
+            continue;
+        }
+        let existing: HashSet<String> = {
+            let mut stmt = db.prepare_cached("SELECT id FROM rust_favorites WHERE profile_id=?1")?;
+            let ids = stmt
+                .query_map([&profile_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            ids
+        };
+        let redirects = redirect_map(&doc);
+        for row in active {
+            let mut resolved_id: Option<String> = row["item"]["itemId"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .and_then(|id| crate::reconcile_catalog::destination(id, &redirects).ok())
+                .map(|id| id.to_string());
+            if let Some(ref candidate) = resolved_id {
+                if existing.contains(candidate) {
+                    continue;
+                }
+                let in_catalog: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM rust_catalog WHERE id=?1)",
+                    [candidate],
+                    |r| r.get(0),
+                )?;
+                if !in_catalog {
+                    resolved_id = None;
+                }
+            }
+            if resolved_id.is_none() {
+                let catalog = match &catalog_cache {
+                    Some(c) => c,
+                    None => {
+                        catalog_cache = Some(CatalogStore::export_from(db)?);
+                        catalog_cache.as_ref().unwrap()
+                    }
+                };
+                if let Some(item) = resolve(catalog, &row["item"]) {
+                    if let Ok(id) = item.id() {
+                        resolved_id = Some(id.to_string());
+                    }
+                }
+            }
+            if let Some(fav_id) = resolved_id {
+                if !existing.contains(&fav_id) {
+                    db.execute(
+                        "INSERT OR IGNORE INTO rust_favorites(profile_id,id)
+                         SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM rust_catalog WHERE id=?2)",
+                        params![profile_id, fav_id],
+                    )?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1823,5 +1904,19 @@ mod pending_positions {
             })
             .unwrap();
         assert_eq!(after.total, 2);
+
+        // Startup repair also rebuilds rust_favorites from rust_profiles.document.
+        {
+            let db = store.0.lock().unwrap();
+            db.execute("DELETE FROM rust_favorites", []).unwrap();
+            repair_profile_favorites(&db).unwrap();
+        }
+        let repaired_startup = store
+            .page(&CatalogQuery {
+                favorites_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(repaired_startup.total, 2);
     }
 }
