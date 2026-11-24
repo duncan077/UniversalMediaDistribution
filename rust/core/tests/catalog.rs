@@ -268,6 +268,34 @@ fn persists_imports_and_favorites_across_restart() {
 }
 
 #[test]
+fn a_catalog_reader_sees_committed_data_during_a_background_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let library = CatalogStore::open(&path).unwrap();
+    let titles = document("Título visible");
+    let title = titles.items[0].id().unwrap();
+    library.import(&titles, false).unwrap();
+    let profile_id = library.profiles().unwrap().active_id;
+    let reader = CatalogStore::open_read_only(&path)
+        .unwrap()
+        .for_profile(profile_id.parse().unwrap())
+        .unwrap();
+
+    let mut writer = rusqlite::Connection::open(&path).unwrap();
+    let pending = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    pending.execute(
+        "INSERT INTO rust_favorites(profile_id,id) VALUES(?1,?2)",
+        rusqlite::params![profile_id, title.to_string()],
+    ).unwrap();
+    let query = CatalogQuery { favorites_only: true, ..Default::default() };
+    assert_eq!(reader.page(&query).unwrap().total, 0);
+    pending.commit().unwrap();
+    assert_eq!(reader.page(&query).unwrap().favorite_ids, vec![title]);
+}
+
+#[test]
 fn rejects_unsupported_versions_and_invalid_items_before_mutating_storage() {
     let store = CatalogStore::in_memory().unwrap();
     let mut catalog = document("Valid");

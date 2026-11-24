@@ -16,7 +16,7 @@ import {inlineFriendActivity, setupFriends} from "./friends";
 import {setupParty, type ContentUnit} from "./party";
 import {setupProfiles} from "./profiles";
 import {setupUpdates} from "./updates";
-import {goBack, isPageActive, navigateTo, onPageLeave, setCatalogNavId} from "./router";
+import {activePage, goBack, isPageActive, navigateTo, onPageLeave, setCatalogNavId} from "./router";
 
 export interface CatalogItem {
   syncId: string;
@@ -113,6 +113,19 @@ function home() {
   return section === "all" && !hasFilters();
 }
 
+function afterPaint(): Promise<void> {
+  return new Promise(resolve => {
+    const frame = requestAnimationFrame(() => {
+      clearTimeout(fallback);
+      setTimeout(resolve, 0);
+    });
+    const fallback = setTimeout(() => {
+      cancelAnimationFrame(frame);
+      resolve();
+    }, 100);
+  });
+}
+
 function wireShelfNav(host: HTMLElement) {
   const scroller = host.querySelector<HTMLElement>(".shelf-row, .catalog");
   const prev = host.querySelector<HTMLButtonElement>(".shelf-prev");
@@ -126,7 +139,7 @@ function wireShelfNav(host: HTMLElement) {
     prev.hidden = !scrollable || scroller.scrollLeft <= 2;
     next.hidden = !scrollable || scroller.scrollLeft + scroller.clientWidth >= scroller.scrollWidth - 2;
   };
-  scroller.addEventListener("scroll", sync, { passive: true });
+  scroller.onscroll = sync;
   requestAnimationFrame(sync);
 }
 
@@ -212,6 +225,7 @@ function renderFeature() {
 
 function selectSection(id: Section) {
   clearTimeout(timer);
+  detailAbort?.abort();
   search.value = "";
   element("advanced").querySelectorAll<HTMLInputElement | HTMLSelectElement>("input,select").forEach(field => {
     if (field instanceof HTMLInputElement && field.type === "checkbox") field.checked = false;
@@ -222,11 +236,10 @@ function selectSection(id: Section) {
   section = id;
   favoritesOnly = id === "favorites";
   element<HTMLInputElement>("favorites-only").checked = favoritesOnly;
-  setCatalogNavId(id);
-  navigateTo("catalog", { resetStack: true });
   syncSection();
+  navigateTo("catalog", { resetStack: true });
   showFilters(false);
-  void load();
+  void load(false, true);
 }
 
 function showFilters(open: boolean) {
@@ -329,8 +342,43 @@ async function refreshListFilterOptions() {
 
 let recentRows: {added:CatalogItem[];updated:CatalogItem[]} = {added:[],updated:[]};
 let recentRevision = -1;
-async function load(append = false) {
+let catalogWaiting = false;
+let catalogLoad: Promise<void> | undefined;
+
+function showCatalogLoading(loading: boolean) {
+  catalogWaiting = loading;
+  element("catalog-loading").hidden = !loading;
+  catalog.setAttribute("aria-busy", String(loading));
+  if (!loading) return;
+  items = [];
+  cursor = null;
+  catalog.replaceChildren();
+  catalog.hidden = false;
+  for (const id of ["feature", "shortcuts", "home-livetv-card", "home-shelves", "continue-shelf", "online-shelf", "empty", "more", "shelves-toggle"]) {
+    element(id).hidden = true;
+  }
+  ++onlineSequence;
+  onlineKey = "";
+  onlineBusy = false;
+  element("collection-bar").hidden = false;
+  element("collection-title").textContent = ui("Títulos");
+  element("result-count").textContent = "";
+  syncFilterCount();
+}
+
+function load(append = false, transition = false) {
+  const pending = loadPage(append, transition);
+  if (!append) catalogLoad = pending;
+  return pending;
+}
+
+async function loadPage(append: boolean, transition: boolean) {
   const request = ++generation;
+  if (transition) {
+    showCatalogLoading(true);
+    await afterPaint();
+    if (request !== generation) return;
+  }
   if (!append) refreshOnline();
   const more = element<HTMLButtonElement>("more");
   more.disabled = true;
@@ -344,6 +392,7 @@ async function load(append = false) {
         listId: listFilter.value || null,
         cursor: append ? cursor : null,
         limit: 50,
+        summary: true,
       },
     });
     if (request !== generation) return;
@@ -354,15 +403,20 @@ async function load(append = false) {
     cursor = page.continuationToken;
     element("result-count").textContent = `${page.total} ${page.total === 1 ? ui("título") : ui("títulos")}`;
     syncFilterCount();
+    showCatalogLoading(false);
+    render(shown);
+    if (onlineKey && !home() && onlineItems.length) redrawOnline();
     if (home() && recentRevision !== page.revision) {
-      void invoke<typeof recentRows>("home_recent").then(rows => {
+      await invoke<typeof recentRows>("home_recent").then(rows => {
         if (generation !== request) return;
         recentRows = rows; recentRevision = page.revision; renderHomeShelves(items.filter(i => !hiddenTitle(i)));
-      }).catch(e => status(String(e),true));
+      });
     }
-    render(shown);
   } catch (error) {
-    if (request === generation) status(String(error), true);
+    if (request === generation) {
+      showCatalogLoading(false);
+      status(String(error), true);
+    }
   } finally {
     if (request === generation) more.disabled = false;
   }
@@ -610,7 +664,7 @@ function refreshOnline() {
   const anchor = element(home() ? "home-shelves" : "empty");
   anchor.before(shelf);
   element("online-heading").textContent = ui("Catálogo del servidor");
-  void loadOnline();
+  return loadOnline();
 }
 
 function hideAdult() {
@@ -767,6 +821,7 @@ function renderHomeShelves(visible: CatalogItem[]) {
 }
 
 function render(from = 0) {
+  if (catalogWaiting) return;
   if (!from) catalog.replaceChildren();
   const visible = items.filter(item => !hiddenTitle(item));
   const cards = document.createDocumentFragment();
@@ -775,7 +830,6 @@ function render(from = 0) {
     cards.append(titleCard(item, () => void showDetails(item), true));
   }
   catalog.append(cards);
-  if (onlineKey) redrawOnline();
   renderFeature();
   renderContinueShelf();
   renderHomeShelves(visible);
@@ -805,18 +859,19 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   detailAbort = new AbortController();
   const signal = detailAbort.signal;
   const seq = ++detailSequence;
+  const origin = activePage();
 
   // Fetch the full local item (with chapters, seasons, sources, aliases, contributors) if it came from a summary query
   let item = initialItem;
   if (!onlineServer && !Array.isArray(item.units) && !Array.isArray(item.seasons) && !Array.isArray(item.sources)) {
     try {
       const full = await invoke<CatalogItem>("library_item", { id: item.syncId });
-      if (seq !== detailSequence || signal.aborted) return;
       item = full;
     } catch {
       /* Fall back to initialItem if item was just removed */
     }
   }
+  if (seq !== detailSequence || signal.aborted || !isPageActive(origin)) return;
 
   const content = element("detail");
   content.dataset.tone = tone(item);
@@ -1311,9 +1366,7 @@ document.addEventListener("keydown", event => {
 });
 
 setupLanguage(flushProgress);
-void refreshContinue().catch(() => {});
-void refreshListFilterOptions();
-setupAccount(async () => {
+const startAccount = setupAccount(async () => {
   await refreshListFilterOptions();
   await load();
   void refreshContinue().catch(() => {});
@@ -1328,8 +1381,8 @@ setupAccount(async () => {
   }
 }, status);
 setupNavigation();
-setupProfiles();
-setupUpdates();
+const initialProfile = setupProfiles();
+const checkUpdates = setupUpdates();
 const openProviderSearch = setupProvider(async (item, openDetails) => {
   if (openDetails) void showDetails(item);
   await load();
@@ -1343,10 +1396,32 @@ const openListsPage = setupLists(
   titleCard,
   () => load(),
 );
-void load();
-void Promise.all([invoke<string>("server_url"), windowProfile()]).then(([address]) => {
-  if (address && !serverAddress) { serverAddress = address; refreshOnline(); render(); }
-}).catch(() => {});
+void (async () => {
+  await load(false, true);
+  await Promise.allSettled([
+    initialProfile,
+    refreshContinue(),
+    refreshListFilterOptions(),
+    invoke<string>("server_url").then(async address => {
+      if (address && !serverAddress) {
+        serverAddress = address;
+        if (!items.length) render();
+      }
+      await refreshOnline();
+    }),
+    invoke<string | null>("library_notice").then(message => {
+      if (message) status(localizeDiagnostic(message), false, true);
+    }),
+  ]);
+  let pending: Promise<void> | undefined;
+  do {
+    pending = catalogLoad;
+    await pending;
+  } while (pending !== catalogLoad);
+  await afterPaint();
+  void startAccount().catch(e => status(String(e), true));
+  checkUpdates?.(serverAddress);
+})().catch(e => status(String(e), true));
 
 for (const [id, restore] of [["copy-library", false], ["restore-library", true]] as const) {
   element(id).addEventListener("click", async () => {
@@ -1360,9 +1435,6 @@ for (const [id, restore] of [["copy-library", false], ["restore-library", true]]
     } catch (e) { out.textContent = String(e); } finally { buttons.forEach(b => b.disabled = false); }
   });
 }
-void invoke<string | null>("library_notice").then(message => {
-  if (message) status(localizeDiagnostic(message), false, true);
-}).catch(e => status(String(e), true));
 
 window.addEventListener("umd-catalog-changed", () => { void load(); void refreshContinue().catch(() => {}); });
 window.addEventListener("umd-lists-changed", async () => {

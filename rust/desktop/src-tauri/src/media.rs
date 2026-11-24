@@ -554,19 +554,27 @@ pub async fn open_media(
 pub async fn get_progress(
     target: ProgressTarget,
     profile_id: uuid::Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, crate::CatalogReads>,
 ) -> CommandResult<Option<serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    work(move || store.progress(&target).map_err(|e| e.to_string())).await
+    let store = reader.0.clone();
+    work(move || {
+        store.for_profile(profile_id)
+            .and_then(|store| store.progress(&target))
+            .map_err(|e| e.to_string())
+    }).await
 }
 #[tauri::command]
 pub async fn item_progress(
     item_id: uuid::Uuid,
     profile_id: uuid::Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, crate::CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    work(move || store.item_progress(item_id).map_err(|e| e.to_string())).await
+    let store = reader.0.clone();
+    work(move || {
+        store.for_profile(profile_id)
+            .and_then(|store| store.item_progress(item_id))
+            .map_err(|e| e.to_string())
+    }).await
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

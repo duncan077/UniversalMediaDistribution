@@ -3,7 +3,7 @@ use reqwest::{Client, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashSet, time::Duration};
-use tauri::State;
+use tauri::{Manager, State};
 use umd_core::{CatalogItem, CatalogStore};
 use uuid::Uuid;
 
@@ -15,10 +15,29 @@ struct Preferences {
     language: Option<String>,
 }
 #[tauri::command]
-pub fn metadata_preferences(
+pub async fn metadata_preferences(
     profile_id: Uuid,
-    store: State<'_, CatalogStore>,
-    files: State<'_, crate::private_files::PrivateFiles>,
+    app: tauri::AppHandle,
+    tmdb: Option<String>,
+    mal: Option<String>,
+    language: Option<String>,
+) -> CommandResult<Value> {
+    work(move || {
+        metadata_preferences_io(
+            profile_id,
+            &app.state::<crate::CatalogReads>().0,
+            &app.state::<crate::private_files::PrivateFiles>(),
+            tmdb,
+            mal,
+            language,
+        )
+    }).await
+}
+
+fn metadata_preferences_io(
+    profile_id: Uuid,
+    store: &CatalogStore,
+    files: &crate::private_files::PrivateFiles,
     tmdb: Option<String>,
     mal: Option<String>,
     language: Option<String>,

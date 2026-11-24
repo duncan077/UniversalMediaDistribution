@@ -17,6 +17,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
   header.append(title, close); dialog.append(header);
   const content = el("div"); const message = el("p"); message.setAttribute("role", "status"); dialog.append(content, message);
   let logged: Login | null = null; let working = false;
+  let initialLoadFinished = false;
   let syncing: Promise<void> | undefined;
   let pendingLocalChanges = false;
   let syncDebounce: ReturnType<typeof setTimeout> | undefined;
@@ -30,7 +31,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
 
   async function sync(background: boolean) {
     const session = logged;
-    if (!session || (background && (!session.automatic || document.hidden || dialog.open || working))) return;
+    if (!session || (background && (!initialLoadFinished || !session.automatic || document.hidden || dialog.open || working))) return;
     if (syncing) {
       if (background) return;
       await syncing.catch(() => {});
@@ -76,11 +77,6 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
     pendingLocalChanges = true;
     scheduleSync();
   });
-  void invokeProfile<Login | null>("account_current").then(session => {
-    if (logged) return;
-    if (session) { logged = session; button.textContent = session.displayName; void sync(true); }
-    window.dispatchEvent(new CustomEvent("umd-account-changed", {detail: !!session}));
-  }).catch(() => {});
   async function action(task: () => Promise<void>) {
     if (working) return; working = true; message.textContent = ui("Conectando…"); message.className = "";
     content.querySelectorAll<HTMLInputElement | HTMLButtonElement>("button,input").forEach(b => b.disabled = true);
@@ -177,4 +173,15 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       if (!dialog.open) dialog.showModal();
     } catch(e) {report(String(e),true);}
   });
+  return async () => {
+    initialLoadFinished = true;
+    const session = await invokeProfile<Login | null>("account_current");
+    if (logged || working) return;
+    if (session) {
+      logged = session;
+      button.textContent = session.displayName;
+    }
+    window.dispatchEvent(new CustomEvent("umd-account-changed", {detail: !!session}));
+    void sync(true);
+  };
 }

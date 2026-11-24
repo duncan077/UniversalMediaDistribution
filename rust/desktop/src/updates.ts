@@ -96,5 +96,7 @@ export function setupUpdates() {
   };
   install.onclick = () => void apply();
   search.onclick = () => void check();
-  void invoke<string>("server_url").then(address => { if (address && !dialog.open) void check(true); }).catch(() => {});
+  return (address: string) => {
+    if (address && !dialog.open) void check(true);
+  };
 }

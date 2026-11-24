@@ -98,16 +98,19 @@ export function setupProfiles() {
   };
   element("profile-cancel").onclick = element("profile-keep").onclick = () => {reset(); create.focus();};
   element("profile-delete").onclick = () => {if (removing) void change({action:"delete",id:removing});};
-  void windowProfile().then(async state => {
+  return windowProfile().then(async state => {
     showCurrent(state);
     if (state.profiles.length > 1 && !sessionStorage.getItem("umd-profile-choice")) {
       setChooserMode(true);
       reset(); await refresh();
-      if (!dialog.open) dialog.showModal();
-      dialog.addEventListener("close", () => {
-        sessionStorage.setItem("umd-profile-choice", "1");
-        setChooserMode(false);
-      }, {once:true});
+      await new Promise<void>(resolve => {
+        dialog.addEventListener("close", () => {
+          sessionStorage.setItem("umd-profile-choice", "1");
+          setChooserMode(false);
+          resolve();
+        }, {once:true});
+        if (!dialog.open) dialog.showModal();
+      });
     }
   }).catch(e => {status.textContent=String(e);});
 }

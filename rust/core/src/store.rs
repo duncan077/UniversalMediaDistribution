@@ -25,10 +25,34 @@ impl CatalogStore {
         Self::initialize(Connection::open_in_memory()?)
     }
 
-    fn initialize(mut connection: Connection) -> Result<Self> {
-        crate::filters::register(&connection)?;
+    /// A separate reader can use the last committed WAL snapshot while the
+    /// account or an import is updating the library on its write connection.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Self::configure_connection(&connection)?;
+        let profile: String = connection.query_row(
+            "SELECT profile_id FROM rust_profile_selection WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(Self(
+            Arc::new(Mutex::new(connection)),
+            Uuid::parse_str(&profile).map_err(|_| Error::Invalid("Perfil inválido.".into()))?,
+            Arc::new(Mutex::new(None)),
+        ))
+    }
+
+    fn configure_connection(connection: &Connection) -> Result<()> {
+        crate::filters::register(connection)?;
         connection.busy_timeout(Duration::from_secs(10))?;
         connection.set_prepared_statement_cache_capacity(64);
+        connection.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-8000;")?;
+        Ok(())
+    }
+
+    fn initialize(mut connection: Connection) -> Result<Self> {
+        Self::configure_connection(&connection)?;
         // WAL with synchronous=NORMAL stays consistent after a crash or power
         // loss and no longer waits for the disk on every commit, which matters
         // for the position saved every few seconds during playback.
@@ -36,8 +60,6 @@ impl CatalogStore {
             "PRAGMA foreign_keys=ON;
              PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA temp_store=MEMORY;
-             PRAGMA cache_size=-8000;
              CREATE TABLE IF NOT EXISTS rust_catalog(
                 id TEXT PRIMARY KEY, name_key TEXT NOT NULL,
                 media_type TEXT NOT NULL, search_text TEXT NOT NULL, payload TEXT NOT NULL);

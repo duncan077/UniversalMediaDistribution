@@ -378,7 +378,7 @@ async fn refresh(directory: PathBuf, force: bool) -> (usize, usize) {
 
 pub struct Directory(PathBuf);
 pub fn setup(
-    app: &tauri::App,
+    app: &tauri::AppHandle,
     root: &Path,
     store: &CatalogStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -424,13 +424,20 @@ pub async fn filter_status(
 }
 
 #[tauri::command]
-pub fn player_ad_filter(
+pub async fn player_ad_filter(
     mode: Option<Mode>,
     store: State<'_, CatalogStore>,
     directory: State<'_, Directory>,
 ) -> CommandResult<Mode> {
-    let mut current = MODE.lock().unwrap();
+    let store = store.inner().clone();
+    let path = directory.0.clone();
+    crate::work(move || set_player_ad_filter(mode, &store, path)).await
+}
+
+fn set_player_ad_filter(mode: Option<Mode>, store: &CatalogStore, directory: PathBuf) -> CommandResult<Mode> {
     if let Some(mode) = mode {
+        static SAVE_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _save = SAVE_MODE.lock().map_err(|_| "Configuración ocupada.")?;
         let value = match mode {
             Mode::Basic => "basic",
             Mode::Off => "off",
@@ -440,15 +447,15 @@ pub fn player_ad_filter(
         store
             .set_setting("player_ad_filter", value)
             .map_err(|e| e.to_string())?;
-        *current = mode;
+        *MODE.lock().unwrap() = mode;
         if !mode.online() {
             *STANDARD.write().unwrap() = None;
         }
         if mode.online() {
-            tauri::async_runtime::spawn(refresh(directory.0.clone(), false));
+            tauri::async_runtime::spawn(refresh(directory, false));
         }
     }
-    Ok(*current)
+    Ok(*MODE.lock().unwrap())
 }
 
 #[tauri::command]

@@ -63,15 +63,17 @@ pub(crate) async fn json_response(mut response: reqwest::Response) -> CommandRes
         }
         bytes.extend_from_slice(&chunk);
     }
-    if !status.is_success() {
-        let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-        let reason = body["message"]
-            .as_str()
-            .unwrap_or(status.canonical_reason().unwrap_or("Error del servidor"));
-        return Err(format!("HTTP {status}: {reason}"));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| format!("Respuesta inválida del servidor ({status})."))
+    work(move || {
+        if !status.is_success() {
+            let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+            let reason = body["message"]
+                .as_str()
+                .unwrap_or(status.canonical_reason().unwrap_or("Error del servidor"));
+            return Err(format!("HTTP {status}: {reason}"));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| format!("Respuesta inválida del servidor ({status})."))
+    }).await
 }
 pub(crate) fn private_url(value: &str) -> CommandResult<reqwest::Url> {
     let mut base = reqwest::Url::parse(value.trim()).map_err(|e| e.to_string())?;

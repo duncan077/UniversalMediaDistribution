@@ -77,9 +77,51 @@ async fn work<T: Send + 'static>(
         .map_err(|error| error.to_string())?
 }
 
+pub(crate) struct CatalogReads(CatalogStore);
+
+#[derive(Default)]
+struct LibraryStartup(tokio::sync::OnceCell<CommandResult<()>>);
+
 #[tauri::command]
-async fn profiles(store: State<'_, CatalogStore>) -> CommandResult<umd_core::Profiles> {
-    let store = store.inner().clone();
+async fn initialize_library(
+    app: tauri::AppHandle,
+    startup: State<'_, LibraryStartup>,
+) -> CommandResult<()> {
+    startup
+        .0
+        .get_or_init(|| work(move || open_library(&app)))
+        .await
+        .clone()
+}
+
+fn open_library(app: &tauri::AppHandle) -> CommandResult<()> {
+    let directory = match std::env::var_os("UMD_RUST_DESKTOP_DATA_DIRECTORY") {
+        Some(path) => path.into(),
+        None => app.path().app_data_dir().map_err(|e| e.to_string())?,
+    };
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let (store, db) = database::LocalDatabase::open(directory.clone())?;
+    let reader = db.open_reader()?;
+    let capibara = capibara::Capibara::new().map_err(|e| e.to_string())?;
+    providers::setup_sources(&store)?;
+    ad_filter::setup(app, &directory, &store).map_err(|e| e.to_string())?;
+    let downloads = downloads::Downloads::new(directory.join("downloads"));
+    downloads.fast_resume.store(
+        store.setting("torrent-fast-resume").map_err(|e| e.to_string())?.as_deref() != Some("off"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    app.manage(private_files::PrivateFiles(directory.join("private-profiles")));
+    app.manage(downloads);
+    app.manage(capibara);
+    app.manage(CatalogReads(reader));
+    app.manage(store);
+    app.manage(db);
+    Ok(())
+}
+
+#[tauri::command]
+async fn profiles(reader: State<'_, CatalogReads>) -> CommandResult<umd_core::Profiles> {
+    let store = reader.0.clone();
     work(move || store.profiles().map_err(|e| e.to_string())).await
 }
 
@@ -87,11 +129,12 @@ async fn profiles(store: State<'_, CatalogStore>) -> CommandResult<umd_core::Pro
 async fn resume_item(
     profile_id: Uuid,
     hide_adult: bool,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<Option<serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
+    let store = reader.0.clone();
     work(move || {
         store
+            .for_profile(profile_id).map_err(|e| e.to_string())?
             .continue_reading_or_watching(hide_adult)
             .map_err(|e| e.to_string())
     })
@@ -103,12 +146,13 @@ async fn continue_items(
     profile_id: Uuid,
     hide_adult: bool,
     limit: Option<usize>,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
+    let store = reader.0.clone();
     let limit = limit.unwrap_or(12).clamp(1, 40);
     work(move || {
         store
+            .for_profile(profile_id).map_err(|e| e.to_string())?
             .continue_items(hide_adult, limit)
             .map_err(|e| e.to_string())
     })
@@ -119,10 +163,10 @@ async fn continue_items(
 async fn shelf_units(
     ids: Vec<Uuid>,
     profile_id: Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<std::collections::HashMap<String, serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    work(move || store.shelf_units(&ids).map_err(|e| e.to_string())).await
+    let store = reader.0.clone();
+    work(move || store.for_profile(profile_id).and_then(|store| store.shelf_units(&ids)).map_err(|e| e.to_string())).await
 }
 #[tauri::command]
 async fn delete_unit(
@@ -133,13 +177,13 @@ async fn delete_unit(
     work(move || store.delete_unit(&target).map_err(|e| e.to_string())).await
 }
 #[tauri::command]
-async fn filter_choices(store: State<'_, CatalogStore>) -> CommandResult<serde_json::Value> {
-    let store = store.inner().clone();
+async fn filter_choices(reader: State<'_, CatalogReads>) -> CommandResult<serde_json::Value> {
+    let store = reader.0.clone();
     work(move || store.filter_choices().map_err(|e| e.to_string())).await
 }
 #[tauri::command]
-async fn home_recent(store: State<'_, CatalogStore>) -> CommandResult<serde_json::Value> {
-    let store = store.inner().clone();
+async fn home_recent(reader: State<'_, CatalogReads>) -> CommandResult<serde_json::Value> {
+    let store = reader.0.clone();
     work(move || store.home_recent().map_err(|e| e.to_string())).await
 }
 #[tauri::command]
@@ -154,11 +198,12 @@ async fn library(
     hide_adult: Option<bool>,
     preferred_providers: Option<Vec<String>>,
     profile_id: uuid::Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<LibraryPage> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
+    let store = reader.0.clone();
     work(move || {
         store
+            .for_profile(profile_id).map_err(|e| e.to_string())?
             .display_page(
                 &query,
                 hide_adult.unwrap_or(false),
@@ -204,10 +249,14 @@ async fn reader_mode(
 #[tauri::command]
 async fn personal_lists(
     profile_id: uuid::Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    work(move || store.personal_lists().map_err(|e| e.to_string())).await
+    let store = reader.0.clone();
+    work(move || {
+        store.for_profile(profile_id)
+            .and_then(|store| store.personal_lists())
+            .map_err(|e| e.to_string())
+    }).await
 }
 
 #[tauri::command]
@@ -238,9 +287,9 @@ async fn party_titles(
 #[tauri::command]
 async fn library_item(
     id: Uuid,
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
 ) -> CommandResult<umd_core::CatalogItem> {
-    let store = store.inner().clone();
+    let store = reader.0.clone();
     work(move || {
         store
             .item(id)
@@ -335,11 +384,14 @@ async fn export_catalog(
 }
 
 #[tauri::command]
-async fn server_url(store: State<'_, CatalogStore>) -> CommandResult<String> {
-    store
-        .setting("server_url")
-        .map(|value| value.unwrap_or_default())
-        .map_err(|error| error.to_string())
+async fn server_url(reader: State<'_, CatalogReads>) -> CommandResult<String> {
+    let store = reader.0.clone();
+    work(move || {
+        store
+            .setting("server_url")
+            .map(|value| value.unwrap_or_default())
+            .map_err(|error| error.to_string())
+    }).await
 }
 
 fn catalog_base(store: &CatalogStore) -> CommandResult<reqwest::Url> {
@@ -374,10 +426,12 @@ async fn catalog_document(
         .get("x-umd-next-cursor")
         .and_then(|s| s.to_str().ok())
         .map(str::to_owned);
-    let doc: CatalogDocument = serde_json::from_value(remote::json_response(response).await?)
-        .map_err(|e| e.to_string())?;
-    doc.validate().map_err(|e| e.to_string())?;
-    Ok((doc, next))
+    let value = remote::json_response(response).await?;
+    work(move || {
+        let doc: CatalogDocument = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        doc.validate().map_err(|e| e.to_string())?;
+        Ok((doc, next))
+    }).await
 }
 
 #[tauri::command]
@@ -509,7 +563,8 @@ async fn online_page(
     recent: bool,
     hide_adult: bool,
 ) -> CommandResult<OnlinePage> {
-    let base = catalog_base(store)?;
+    let reader = store.clone();
+    let base = work(move || catalog_base(&reader)).await?;
     let result = if recent {
         let response = catalog_response(&base, "api/v1/catalog/recent", &[]).await?;
         if matches!(
@@ -568,12 +623,12 @@ async fn online_page(
 
 #[tauri::command]
 async fn browse_online_catalog(
-    store: State<'_, CatalogStore>,
+    reader: State<'_, CatalogReads>,
     query: CatalogQuery,
     recent: bool,
     hide_adult: bool,
 ) -> CommandResult<OnlinePage> {
-    online_page(&store, query, recent, hide_adult).await
+    online_page(&reader.0, query, recent, hide_adult).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -597,38 +652,17 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(LibraryStartup::default())
         .setup(|app| {
-            let directory = std::env::var_os("UMD_RUST_DESKTOP_DATA_DIRECTORY")
-                .map(std::path::PathBuf::from)
-                .unwrap_or(app.path().app_data_dir()?);
-            std::fs::create_dir_all(&directory)?;
-            let (store, db) =
-                database::LocalDatabase::open(directory.clone()).map_err(std::io::Error::other)?;
             downloads::setup_magnets(app)?;
-            providers::setup_sources(&store).map_err(std::io::Error::other)?;
-            ad_filter::setup(app, &directory, &store)?;
-            app.manage(private_files::PrivateFiles(
-                directory.join("private-profiles"),
-            ));
-            app.manage(store);
-            app.manage(db);
             app.manage(media::MediaState::default());
-            let downloads = downloads::Downloads::new(directory.join("downloads"));
-            downloads.fast_resume.store(
-                app.state::<CatalogStore>()
-                    .setting("torrent-fast-resume")?
-                    .as_deref()
-                    != Some("off"),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            app.manage(downloads);
-            app.manage(capibara::Capibara::new()?);
             app.manage(remote::RemoteState::default());
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             app.manage(updates::Updates::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            initialize_library,
             library,
             profiles,
             remote::edit_profile,

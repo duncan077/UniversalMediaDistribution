@@ -75,8 +75,17 @@ pub fn setup_sources(store: &CatalogStore) -> CommandResult<()> {
     Ok(())
 }
 #[tauri::command]
-pub fn provider_locations(
+pub async fn provider_locations(
     store: State<'_, CatalogStore>,
+    edit: Option<SourceConfig>,
+    remove: Option<String>,
+) -> CommandResult<Vec<SourceConfig>> {
+    let store = store.inner().clone();
+    work(move || update_provider_locations(&store, edit, remove)).await
+}
+
+fn update_provider_locations(
+    store: &CatalogStore,
     edit: Option<SourceConfig>,
     remove: Option<String>,
 ) -> CommandResult<Vec<SourceConfig>> {

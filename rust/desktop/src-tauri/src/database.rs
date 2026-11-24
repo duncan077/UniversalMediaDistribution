@@ -17,6 +17,10 @@ pub struct LocalDatabase {
     filename: String,
 }
 impl LocalDatabase {
+    pub fn open_reader(&self) -> CommandResult<CatalogStore> {
+        CatalogStore::open_read_only(self.directory.join(&self.filename)).map_err(|e| e.to_string())
+    }
+
     pub fn open(directory: PathBuf) -> CommandResult<(CatalogStore, Self)> {
         let marker = directory.join("active-library");
         let mut filename = match fs::read_to_string(&marker) {

@@ -792,17 +792,21 @@ pub fn register_magnets(app: tauri::AppHandle) -> CommandResult<()> {
     Ok(())
 }
 #[tauri::command]
-pub fn torrent_options(
+pub async fn torrent_options(
     fast_resume: Option<bool>,
-    downloads: State<'_, Downloads>,
-    store: State<'_, umd_core::CatalogStore>,
+    app: tauri::AppHandle,
 ) -> CommandResult<bool> {
-    use std::sync::atomic::Ordering;
-    if let Some(on) = fast_resume {
-        store
-            .set_setting("torrent-fast-resume", if on { "on" } else { "off" })
-            .map_err(|e| e.to_string())?;
-        downloads.fast_resume.store(on, Ordering::Relaxed);
-    }
-    Ok(downloads.fast_resume.load(Ordering::Relaxed))
+    work(move || {
+        use std::sync::atomic::Ordering;
+        let downloads = app.state::<Downloads>();
+        if let Some(on) = fast_resume {
+            static SAVE_OPTIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _save = SAVE_OPTIONS.lock().map_err(|_| "Configuración ocupada.")?;
+            app.state::<umd_core::CatalogStore>()
+                .set_setting("torrent-fast-resume", if on { "on" } else { "off" })
+                .map_err(|e| e.to_string())?;
+            downloads.fast_resume.store(on, Ordering::Relaxed);
+        }
+        Ok(downloads.fast_resume.load(Ordering::Relaxed))
+    }).await
 }
