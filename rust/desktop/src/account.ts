@@ -104,7 +104,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       option.append(register, el("span", ui("Crear una cuenta"))); form.append(option);
       register.addEventListener("change", () => {display.parentElement!.hidden = !register.checked; password.autocomplete = register.checked ? "new-password" : "current-password"; password.minLength=register.checked?10:1;});
       const submit = el("button", ui("Continuar")); submit.type = "submit"; submit.className = "primary"; form.append(submit);
-      const hint = el("p", ui("La cuenta se recuerda en este perfil hasta cerrar sesión o hasta que venza el acceso. El respaldo incluye catálogo, favoritos y posiciones guardadas.")); hint.className = "muted"; form.append(hint);
+      const hint = el("p", ui("El respaldo personal guarda tus favoritos, listas, preferencias de lectura y progreso.")); hint.className = "muted"; form.append(hint);
       form.addEventListener("submit", event => { event.preventDefault(); void action(async () => {
         try {
           logged = await invokeProfile<Login>("account_login", { baseUrl: url.value, username: user.value, password: password.value, register: register.checked, displayName: display.value.trim() || null, deviceName: device.value.trim() || device.placeholder });
@@ -137,16 +137,16 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       else message.textContent = ui("Sincronización automática desactivada.");
     });
     automaticLabel.append(automatic, el("span", ui("Sincronizar automáticamente")));
-    const syncHint = el("p", ui("Combina favoritos, listas, preferencias y progreso de esta cuenta. También incorpora los títulos que falten en cada biblioteca."));
+    const syncHint = el("p", ui("Combina favoritos, listas, preferencias y progreso de esta cuenta. Agrega las fichas necesarias para recuperar esos datos."));
     syncHint.className = "muted";
     content.append(automaticLabel, syncHint);
     controls.append(combine);
     const upload = el("button", ui("Guardar respaldo")); upload.type = "button"; upload.className = "primary";
-    upload.addEventListener("click", () => action(async () => { await invokeProfile("account_upload"); logged!.backup = await invokeProfile<BackupInfo>("account_backup_info"); render(); message.textContent = ui("Respaldo guardado en tu cuenta."); }));
+    upload.addEventListener("click", () => action(async () => { await invokeProfile("account_upload"); logged!.backup = await invokeProfile<BackupInfo>("account_backup_info"); await reloaded(); render(); message.textContent = ui("Respaldo guardado en tu cuenta."); }));
     const review = el("button", ui("Revisar respaldo")); review.type = "button"; review.className = "quiet-btn"; review.addEventListener("click", () => action(async () => { logged!.backup = await invokeProfile<BackupInfo>("account_backup_info"); render(); message.textContent = ui("Respaldo actualizado. Podés revisar la fecha y cantidad antes de restaurar."); }));
     if (info) controls.append(upload); controls.append(review); content.append(controls);
     if (info?.hasBackup) {
-      const warning = el("p", ui("Restaurar reemplaza los favoritos, listas y posiciones de este perfil. Con varios perfiles, los títulos del respaldo se agregan o actualizan en la biblioteca compartida. Con un solo perfil, se reemplaza el catálogo.")); warning.className = "muted"; content.append(warning);
+      const warning = el("p", ui("Restaurar reemplaza los favoritos, listas, preferencias de lectura y posiciones de este perfil. Conserva la biblioteca local y agrega las fichas necesarias.")); warning.className = "muted"; content.append(warning);
       const restore = el("button", ui("Restaurar este respaldo")); restore.type = "button"; restore.className = "quiet-btn";
       const confirmation = el("div"); confirmation.className = "notice-danger"; confirmation.hidden = true;
       const confirmRow = el("div"); confirmRow.className = "button-row";
@@ -157,7 +157,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       restore.onclick = () => { restore.hidden = true; confirmation.hidden = false; cancel.focus(); };
       cancel.onclick = () => { confirmation.hidden = true; restore.hidden = false; restore.focus(); };
       accept.addEventListener("click", () => action(async () => {
-        await invokeProfile<number>("account_restore", {reviewedRevision:info.revision}); await reloaded(); dialog.close(); report(ui("Biblioteca restaurada desde tu cuenta."));
+        await invokeProfile<void>("account_restore", {reviewedRevision:info.revision}); await reloaded(); dialog.close(); report(ui("Respaldo personal restaurado."));
       })); content.append(restore, confirmation);
     }
     const logout = el("button", ui("Cerrar sesión")); logout.type = "button"; logout.className = "logout"; logout.addEventListener("click", () => action(async () => { await invokeProfile("account_logout",{purgeDownloads:getProfilePref(activeProfileId(),"torrent-purge")==="on"}); logged = null; window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:false})); button.textContent = ui("Cuenta y respaldo"); render(); })); content.append(logout);

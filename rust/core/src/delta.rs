@@ -183,9 +183,21 @@ impl BackupRevisionIndex {
 
 /// A physical removal or a legacy identity requires a revision-checked full upload.
 pub fn backup_patch(previous: &Value, next: &Value) -> Option<Value> {
+    build_patch(previous, next, false)
+}
+
+/// Personal sync may omit catalog rows from a legacy server snapshot. A
+/// patch can leave those rows on the server without resending them.
+pub fn account_backup_patch(previous: &Value, next: &Value) -> Option<Value> {
+    build_patch(previous, next, true)
+}
+
+fn build_patch(previous: &Value, next: &Value, allow_omitted_titles: bool) -> Option<Value> {
     let old = records(previous)?;
     let current = records(next)?;
-    if old.keys().any(|k| !current.contains_key(k)) {
+    if old.keys().any(|k| {
+        !(allow_omitted_titles && k.starts_with("items:")) && !current.contains_key(k)
+    }) {
         return None;
     }
     extract(next, |k| {

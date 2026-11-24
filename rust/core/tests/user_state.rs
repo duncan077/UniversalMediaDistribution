@@ -106,6 +106,138 @@ fn syncing_two_devices_preserves_independent_edits_and_converges() {
 }
 
 #[test]
+fn an_oversized_local_library_does_not_block_account_favorites_or_progress() {
+    let (remote, target) = store();
+    remote.set_favorite(target.item_id, true).unwrap();
+    let snapshot = remote.backup().unwrap();
+
+    let (local, _) = store();
+    let original = local.export().unwrap().items.remove(0);
+    let unrelated: Vec<_> = (0..12)
+        .map(|n| {
+            let mut item = original.clone();
+            item.sync_id = Some(uuid::Uuid::new_v4());
+            item.name = format!("Título local {n}");
+            item.metadata
+                .insert("description".into(), json!("x".repeat(4096)));
+            item
+        })
+        .collect();
+    local.import(&CatalogDocument::new(unrelated), false).unwrap();
+    local.save_progress(&target, 7.0, "page", true).unwrap();
+
+    let limit = 32 * 1024;
+    assert!(local
+        .reconcile_profile_with_limit(Some(&snapshot), limit)
+        .is_err());
+    assert!(local
+        .page(&umd_core::CatalogQuery::default())
+        .unwrap()
+        .favorite_ids
+        .is_empty());
+
+    let (changed, upload) = local
+        .reconcile_account_profile(Some(&snapshot), limit)
+        .unwrap();
+    assert!(changed);
+    let merged = upload.unwrap();
+    let catalog = validate_backup(&merged).unwrap();
+    assert_eq!(catalog.items.len(), 1);
+    assert_eq!(merged["favoriteItemStates"][0]["isFavorite"], true);
+    assert_eq!(merged["progress"][0]["position"], 7.0);
+    assert_eq!(local.export().unwrap().items.len(), 13);
+    assert_eq!(
+        local.page(&umd_core::CatalogQuery::default()).unwrap().favorite_ids,
+        vec![target.item_id]
+    );
+    assert_eq!(
+        local.reconcile_account_profile(Some(&merged), limit).unwrap(),
+        (false, None)
+    );
+}
+
+#[test]
+fn personal_backups_skip_unrelated_titles_in_both_libraries() {
+    let (remote, target) = store();
+    let mut unrelated = remote.export().unwrap().items.remove(0);
+    unrelated.name = "Catálogo de otro dispositivo".into();
+    unrelated.sync_id = Some(uuid::Uuid::new_v4());
+    remote.import(&CatalogDocument::new(vec![unrelated.clone()]), false).unwrap();
+    remote.set_favorite(target.item_id, true).unwrap();
+    let legacy = remote.backup().unwrap();
+
+    let local = CatalogStore::in_memory().unwrap();
+    unrelated.name = "Catálogo local".into();
+    unrelated.sync_id = Some(uuid::Uuid::new_v4());
+    let local_title = unrelated.sync_id.unwrap();
+    local.import(&CatalogDocument::new(vec![unrelated]), false).unwrap();
+    let limit = umd_core::MAX_DOCUMENT_BYTES;
+    let (_, initial) = local.reconcile_account_profile(None, limit).unwrap();
+    assert_eq!(initial.unwrap()["catalog"]["items"], json!([]));
+
+    let (changed, outgoing) = local.reconcile_account_profile(Some(&legacy), limit).unwrap();
+    assert!(changed && outgoing.is_none());
+    assert_eq!(local.export().unwrap().items.len(), 2);
+    assert!(local.item(local_title).unwrap().is_some());
+    assert_eq!(local.page(&umd_core::CatalogQuery::default()).unwrap().favorite_ids, vec![target.item_id]);
+
+    local.save_progress(&target, 7.0, "page", true).unwrap();
+    let (_, personal) = local.reconcile_account_profile(Some(&legacy), limit).unwrap();
+    let personal = personal.unwrap();
+    assert_eq!(personal["catalog"]["items"].as_array().unwrap().len(), 1);
+    let patch = umd_core::account_backup_patch(&legacy, &personal).unwrap();
+    assert_eq!(patch["catalog"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(patch["progress"][0]["position"], 7.0);
+
+    local.restore_account_backup(&legacy, "https://example.test/", uuid::Uuid::new_v4(), 1).unwrap();
+    assert!(local.progress(&target).unwrap().is_none());
+    assert_eq!(local.export().unwrap().items.len(), 2);
+    assert!(local.item(local_title).unwrap().is_some());
+}
+
+#[test]
+fn account_sync_folds_distinct_dotnet_records_linked_by_a_redirect() {
+    let (remote, target) = store();
+    remote.set_favorite(target.item_id, true).unwrap();
+    let mut snapshot = remote.backup().unwrap();
+    let old_id = uuid::Uuid::new_v4();
+    let mut old_title = snapshot["catalog"]["items"][0].clone();
+    old_title["syncId"] = json!(old_id);
+    snapshot["catalog"]["items"].as_array_mut().unwrap().push(old_title);
+
+    let mut old_state = snapshot["favoriteItemStates"][0].clone();
+    old_state["item"]["itemId"] = json!(old_id);
+    old_state["isFavorite"] = json!(false);
+    let clock = old_state["syncVersion"]["clock"].as_i64().unwrap();
+    snapshot["favoriteItemStates"][0]["syncVersion"]["clock"] = json!(clock + 1);
+    snapshot["catalogRedirects"] = json!([{
+        "fromId": old_id,
+        "toId": target.item_id,
+        "syncVersion": old_state["syncVersion"]
+    }]);
+    snapshot["favoriteItemStates"].as_array_mut().unwrap().push(old_state);
+    assert!(validate_backup(&snapshot).is_err());
+
+    let receiving = CatalogStore::in_memory().unwrap();
+    let limit = umd_core::MAX_DOCUMENT_BYTES;
+    let (changed, upload) = receiving.reconcile_account_profile(Some(&snapshot), limit).unwrap();
+    assert!(changed);
+    assert!(upload.is_none());
+    assert_eq!(receiving.reconcile_account_profile(Some(&snapshot), limit).unwrap(), (false, None));
+    receiving.save_progress(&target, 7.0, "page", true).unwrap();
+    let (_, upload) = receiving.reconcile_account_profile(Some(&snapshot), limit).unwrap();
+    let merged = upload.unwrap();
+    assert!(validate_backup(&merged).is_ok());
+    assert_eq!(merged["favoriteItemStates"].as_array().unwrap().len(), 1);
+    assert_eq!(merged["favoriteItemStates"][0]["isFavorite"], true);
+    assert_eq!(receiving.page(&umd_core::CatalogQuery::default()).unwrap().favorite_ids, vec![target.item_id]);
+
+    let exact_duplicate = snapshot["favoriteItemStates"][0].clone();
+    snapshot["favoriteItemStates"].as_array_mut().unwrap().push(exact_duplicate);
+    assert!(umd_core::validate_account_backup(&snapshot, limit).is_err());
+}
+
+#[test]
 fn dotnet_list_order_and_equivalent_timestamps_do_not_trigger_an_upload() {
     use umd_core::ListEdit;
     let (library, _) = store();
@@ -418,6 +550,7 @@ fn reopening_keeps_confirmed_revision_and_local_edits_scoped_to_this_library() {
     let account = uuid::Uuid::new_v4();
     let other = uuid::Uuid::new_v4();
     let origin = "https://example.test/umd/";
+    source.set_favorite(target.item_id, true).unwrap();
     let doc = source.backup().unwrap();
     {
         let library = CatalogStore::open(&path).unwrap();

@@ -26,7 +26,7 @@ metadatos de cada título se conservan al exportarlos nuevamente.
 La aplicación utiliza una biblioteca SQLite propia en el directorio de datos
 del identificador `org.universalmediadistribution.rust`. El JSON de catálogo
 intercambia los títulos y sus metadatos, sin preferencias personales. Los
-respaldos de cuenta incluyen también favoritos y posiciones.
+respaldos de cuenta llevan el estado personal y las fichas a las que hace referencia.
 
 ### Reproducir y leer
 
@@ -91,28 +91,22 @@ La aplicación recuerda el perfil seleccionado después de cerrarla. Al actualiz
 el perfil **Principal** conserva los datos personales de la biblioteca existente.
 
 **Cuenta y respaldo** permite iniciar sesión, guardar un respaldo y revisar su
-fecha y cantidad de títulos antes de restaurarlo. La sesión se conserva en
-memoria; al reiniciar la app hay que iniciar sesión de nuevo. La contraseña y el
-token no se guardan en la biblioteca ni se devuelven a la interfaz.
-Fuera de localhost, el inicio de sesión requiere HTTPS.
+fecha y cantidad de favoritos antes de restaurarlo. La sesión se recuerda por
+perfil hasta que cierres sesión o venza el acceso. Fuera de localhost, el inicio
+de sesión requiere HTTPS.
 
-Cada perfil recuerda la última revisión guardada o restaurada para cada servidor
-y cuenta. Después de reiniciar, podés volver a iniciar sesión y guardar tus cambios
-si la revisión remota sigue siendo la misma. Una subida con una revisión antigua
-recibe HTTP 409. Una biblioteca sin revisión confirmada necesita restaurar primero
-un respaldo remoto existente. Esto también se aplica al actualizar desde una versión
-que solo guardaba la revisión en memoria.
-**Restaurar** reemplaza el estado personal del perfil en una sola transacción.
-Con un único perfil también reemplaza el catálogo. Si hay varios, incorpora los
-títulos del respaldo al catálogo compartido y conserva los títulos existentes.
+**Guardar respaldo** combina los cambios personales con la revisión de la
+cuenta. **Restaurar** reemplaza el estado personal de ese perfil en una sola
+transacción y agrega a la biblioteca las fichas necesarias para abrir esos
+favoritos, listas y posiciones.
 
 En **Cuenta y respaldo**, **Sincronizar ahora** combina los favoritos, listas,
 miembros de listas, preferencias de lectura y progreso del perfil con los de la
 misma cuenta en otro equipo. Las entradas personales llevan versiones. Si dos
 equipos modifican la misma posición, prevalece la versión más reciente según el
-reloj de sincronización. Cada biblioteca incorpora los títulos que le faltan y
-conserva su ficha de los títulos que ya tiene. Los archivos descargados permanecen
-en el dispositivo.
+reloj de sincronización. Solo incorpora las fichas de los títulos vinculados a
+esos registros personales que falten en la biblioteca. Los archivos descargados
+permanecen en el dispositivo.
 
 **Sincronizar automáticamente durante esta sesión** sincroniza al activar la
 opción, cada minuto mientras la app está visible y al volver a la app o recuperar

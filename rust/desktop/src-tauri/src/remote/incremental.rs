@@ -54,7 +54,8 @@ pub(super) async fn fetch_latest(session: &mut Session) -> CommandResult<Value> 
     }
     let document = match changes["full"].as_bool() {
         Some(true) => {
-            umd_core::validate_backup(delta).map_err(|e| e.to_string())?;
+            umd_core::validate_account_backup(delta, umd_core::MAX_DOCUMENT_BYTES)
+                .map_err(|e| e.to_string())?;
             delta.clone()
         }
         Some(false) if revision == since => {
@@ -142,7 +143,11 @@ mod tests {
     #[tokio::test]
     async fn rereads_a_concurrent_devices_edit_before_acknowledging_a_patch() {
         let local = CatalogStore::in_memory().unwrap();
-        let baseline = local.backup().unwrap();
+        let mut baseline = local.backup().unwrap();
+        let unrelated = uuid::Uuid::new_v4();
+        baseline["catalog"]["items"] = json!([{
+            "syncId": unrelated, "name":"Solo en el catálogo", "mediaType":"book", "subtype":"manga"
+        }]);
         let peer = CatalogStore::in_memory().unwrap();
         peer.restore_backup(&baseline).unwrap();
         peer.edit_list(ListEdit::Create {
@@ -188,6 +193,7 @@ mod tests {
                         let mut remote = s.lock().unwrap();
                         assert_eq!(body["expectedRevision"], 1);
                         assert_eq!(body["patch"]["lists"].as_array().unwrap().len(), 1);
+                        assert_eq!(body["patch"]["catalog"]["items"], json!([]));
                         remote.1 = umd_core::merge_backup_patch(&competing, &body["patch"])
                             .unwrap()
                             .unwrap();
@@ -218,7 +224,7 @@ mod tests {
             etag: None,
             last_sync: None,
         };
-        let result = super::super::synchronize(&mut session, &local)
+        let result = super::super::synchronize(&mut session, &local, false)
             .await
             .unwrap();
         assert_eq!(result["backup"]["revision"], 3);
@@ -231,7 +237,9 @@ mod tests {
             Some(3)
         );
         assert_eq!(local.personal_lists().unwrap().len(), 2);
-        super::super::synchronize(&mut session, &local)
+        assert!(local.item(unrelated).unwrap().is_none());
+        assert_eq!(state.lock().unwrap().1["catalog"]["items"][0]["syncId"], json!(unrelated));
+        super::super::synchronize(&mut session, &local, false)
             .await
             .unwrap();
         assert_eq!(state.lock().unwrap().2, 1);

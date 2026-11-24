@@ -241,7 +241,8 @@ async fn fetch(session: &mut Session) -> CommandResult<Value> {
         .filter(|v| *v >= 0)
         .ok_or("Revisión inválida.")?;
     if !snapshot["document"].is_null() {
-        umd_core::validate_backup(&snapshot["document"]).map_err(|e| e.to_string())?;
+        umd_core::validate_account_backup(&snapshot["document"], MAX_DOCUMENT_BYTES)
+            .map_err(|e| e.to_string())?;
     }
     session.delta_base = (!snapshot["document"].is_null()).then_some(revision);
     session.etag = tag.map(|tag| (revision, tag));
@@ -292,50 +293,8 @@ pub async fn account_upload(
 ) -> CommandResult<()> {
     let mut guard = remote.0.lock().await;
     let session = guard.get_mut(&profile_id).ok_or("Iniciá sesión primero.")?;
-    if session
-        .pending
-        .as_ref()
-        .is_some_and(|v| v["document"].is_object() && v["revision"].as_i64() != session.revision)
-    {
-        return Err(
-            "El respaldo de la cuenta tiene cambios. Elegí Sincronizar ahora para combinarlos o Restaurar para usar el respaldo.".into(),
-        );
-    }
-    let expected = session
-        .revision
-        .ok_or("Revisá el respaldo antes de guardar.")?;
     let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    let library = store.clone();
-    let document = work(move || library.backup().map_err(|e| e.to_string())).await?;
-    let request = session
-        .client
-        .put(session.base.join("api/v1/sync/snapshot").unwrap())
-        .bearer_auth(&session.token);
-    let result = json_response(
-        sync_body(
-            request,
-            session.gzip,
-            json!({"expectedRevision":expected,"document":document}),
-        )
-        .await?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?,
-    )
-    .await?;
-    let confirmed = result["revision"]
-        .as_i64()
-        .filter(|n| *n > expected)
-        .ok_or("Revisión inválida.")?;
-    store
-        .remember_upload(session.base.as_str(), session.account, confirmed)
-        .map_err(|e| {
-            format!(
-                "El servidor guardó el respaldo pero no se pudo registrar la revisión local: {e}"
-            )
-        })?;
-    session.revision = Some(confirmed);
-    session.pending = None;
+    synchronize(session, &store, true).await?;
     Ok(())
 }
 #[tauri::command]
@@ -344,7 +303,7 @@ pub async fn account_restore(
     reviewed_revision: i64,
     store: State<'_, CatalogStore>,
     remote: State<'_, RemoteState>,
-) -> CommandResult<usize> {
+) -> CommandResult<()> {
     let mut guard = remote.0.lock().await;
     let session = guard.get_mut(&profile_id).ok_or("Iniciá sesión primero.")?;
     let snapshot = session
@@ -362,7 +321,7 @@ pub async fn account_restore(
     let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
     let base = session.base.to_string();
     let account = session.account;
-    let count = work(move || {
+    work(move || {
         store
             .restore_account_backup(&document, &base, account, revision)
             .map_err(|e| e.to_string())
@@ -370,7 +329,8 @@ pub async fn account_restore(
     .await?;
     session.revision = Some(revision);
     session.pending = None;
-    Ok(count)
+    session.last_sync = None;
+    Ok(())
 }
 #[tauri::command]
 pub async fn account_logout(
@@ -493,16 +453,21 @@ pub async fn account_sync(
         return Ok(json!({"changed":false}));
     }
     let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    synchronize(session, &store).await
+    synchronize(session, &store, false).await
 }
 
-async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResult<Value> {
+async fn synchronize(
+    session: &mut Session,
+    store: &CatalogStore,
+    recreate_deleted: bool,
+) -> CommandResult<Value> {
     let mut changed = false;
     let mut needs_full_upload = false;
-    for _ in 0..5 {
+    for attempt in 0..5 {
         let info = incremental::fetch_latest(session).await?;
         let expected = info["revision"].as_i64().ok_or("Revisión inválida.")?;
-        if info["hasBackup"] == false
+        if !(recreate_deleted && attempt == 0)
+            && info["hasBackup"] == false
             && (expected > 0
                 || store
                     .has_synced_account(session.base.as_str(), session.account)
@@ -529,7 +494,7 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
                 .and_then(|s| s.get("document"))
                 .filter(|v| !v.is_null());
             let merged = library
-                .reconcile_profile(document)
+                .reconcile_account_profile(document, MAX_DOCUMENT_BYTES)
                 .map_err(|e| e.to_string());
             Ok((snapshot, merged))
         })
@@ -542,12 +507,13 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
             session.last_sync = Some((expected, marker));
             return Ok(json!({"changed":changed,"backup":info}));
         };
-        if !needs_full_upload && session.incremental && session.delta_base == Some(expected) {
-            if let Some(patch) = session
-                .pending
-                .as_ref()
-                .and_then(|base| umd_core::backup_patch(&base["document"], &document))
-            {
+        let base = session.pending.as_ref().map(|v| &v["document"]);
+        let preserve_server_titles = base.is_some_and(|base| omits_server_titles(base, &document));
+        if !needs_full_upload
+            && (preserve_server_titles || (session.incremental && session.delta_base == Some(expected)))
+        {
+            let patch = base.and_then(|base| umd_core::account_backup_patch(base, &document));
+            if let Some(patch) = patch.or_else(|| preserve_server_titles.then(|| document.clone())) {
                 if umd_core::backup_patch_empty(&patch) {
                     acknowledge_sync(session, store, expected)?;
                     session.last_sync = Some((expected, marker));
@@ -575,7 +541,7 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
                         let library = store.clone();
                         let (received, remaining) = work(move || {
                             library
-                                .reconcile_profile(Some(&confirmed))
+                                .reconcile_account_profile(Some(&confirmed), MAX_DOCUMENT_BYTES)
                                 .map_err(|e| e.to_string())
                         })
                         .await?;
@@ -584,6 +550,9 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
                         // must still be considered on the next sync.
                         session.last_sync = remaining.is_none().then_some((revision, marker));
                         return Ok(json!({"changed":changed||received,"backup":info}));
+                    }
+                    incremental::Write::Full if preserve_server_titles => {
+                        return Err("El servidor rechazó la actualización incremental del respaldo personal.".into());
                     }
                     incremental::Write::Full => {
                         needs_full_upload = true;
@@ -630,6 +599,20 @@ async fn synchronize(session: &mut Session, store: &CatalogStore) -> CommandResu
         return Ok(json!({"changed":changed,"backup":info}));
     }
     Err("Otro dispositivo sigue guardando cambios. Reintentá la sincronización.".into())
+}
+
+fn omits_server_titles(base: &Value, personal: &Value) -> bool {
+    let included: std::collections::HashSet<_> = personal["catalog"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["syncId"].as_str())
+        .collect();
+    base["catalog"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| item["syncId"].as_str().is_none_or(|id| !included.contains(id)))
 }
 
 fn acknowledge_sync(session: &mut Session, store: &CatalogStore, revision: i64) -> CommandResult<()> {
@@ -737,7 +720,7 @@ mod tests {
             etag: None,
             last_sync: None,
         };
-        let result = synchronize(&mut s, &local).await.unwrap();
+        let result = synchronize(&mut s, &local, false).await.unwrap();
         assert_eq!(result["backup"]["revision"], 2);
         assert_eq!(s.revision, Some(2));
         assert_eq!(
@@ -752,12 +735,12 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(synchronize(&mut s, &local).await.unwrap()["changed"], false);
+        assert_eq!(synchronize(&mut s, &local, false).await.unwrap()["changed"], false);
         assert_eq!(snapshot.lock().unwrap()["revision"], 2);
         *snapshot.lock().unwrap() = json!({"revision":0,"document":null});
         s.last_sync = None;
         s.pending = None;
-        assert!(synchronize(&mut s, &local)
+        assert!(synchronize(&mut s, &local, false)
             .await
             .unwrap_err()
             .contains("eliminó"));

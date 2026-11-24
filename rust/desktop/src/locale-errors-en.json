@@ -103,6 +103,7 @@
   "El proveedor ya no ofrece la edición guardada.": "The provider no longer offers your saved edition.",
   "El reproductor no respondió.": "The player did not respond.",
   "El respaldo cambió. Revisalo antes de restaurar.": "The backup changed. Review it before restoring.",
+  "El servidor rechazó la actualización incremental del respaldo personal.": "The server rejected the incremental personal backup update.",
   "El respaldo contiene referencias a títulos inexistentes.": "The backup refers to missing titles.",
   "El respaldo contiene una referencia sin identidad.": "A backup reference has no identity.",
   "El respaldo de .NET está dañado o tiene referencias incompletas.": "The .NET backup is damaged or contains incomplete references.",

@@ -6,11 +6,119 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
+fn scoped_catalog(
+    db: &rusqlite::Connection,
+    local: &Value,
+    remote: Option<&CatalogDocument>,
+    remote_state: Option<&Value>,
+) -> Result<CatalogDocument> {
+    let mut ids = HashSet::new();
+    let mut keys = HashSet::new();
+    if let Some(remote) = remote {
+        for title in &remote.items {
+            ids.insert(title.id()?);
+            keys.insert(title.key());
+        }
+    }
+    for reference in personal_references(local) {
+        if let Ok(id) = id(&reference["itemId"]) {
+            ids.insert(id);
+        } else if let (Some(name), Some(media_type), Some(subtype)) = (
+            reference["name"].as_str(),
+            reference["mediaType"].as_str(),
+            reference["subtype"].as_str(),
+        ) {
+            keys.insert(
+                crate::CatalogItem {
+                    sync_id: None,
+                    deleted: false,
+                    name: name.to_owned(),
+                    media_type: media_type.to_owned(),
+                    subtype: subtype.to_owned(),
+                    metadata: BTreeMap::new(),
+                }
+                .key(),
+            );
+        }
+    }
+    for doc in std::iter::once(local).chain(remote_state) {
+        for row in rows(doc, "catalogRedirects") {
+            ids.insert(id(&row["fromId"])?);
+            ids.insert(id(&row["toId"])?);
+        }
+    }
+
+    let mut stmt = db.prepare_cached(
+        "SELECT payload FROM rust_catalog
+         WHERE id IN (SELECT value FROM json_each(?1))
+            OR name_key IN (SELECT value FROM json_each(?2))
+         ORDER BY id",
+    )?;
+    let mut items = Vec::new();
+    for payload in stmt.query_map(
+        params![serde_json::to_string(&ids)?, serde_json::to_string(&keys)?],
+        |r| r.get::<_, String>(0),
+    )? {
+        items.push(serde_json::from_str(&payload?)?);
+    }
+    Ok(CatalogDocument::new(items))
+}
+
 fn invalid(reason: &str) -> Error {
     Error::Invalid(reason.into())
 }
 fn rows<'a>(doc: &'a Value, field: &str) -> impl Iterator<Item = &'a Value> {
     doc[field].as_array().into_iter().flatten()
+}
+fn personal_references(doc: &Value) -> impl Iterator<Item = &Value> {
+    rows(doc, "progress")
+        .map(|row| &row["content"]["item"])
+        .chain(rows(doc, "favoriteItemStates").map(|row| &row["item"]))
+        .chain(rows(doc, "readerPreferences").map(|row| &row["item"]))
+        .chain(rows(doc, "lists").flat_map(|list| {
+            rows(list, "items").chain(rows(list, "itemStates").map(|row| &row["item"]))
+        }))
+}
+
+fn account_snapshot(document: &Value, catalog: &mut CatalogDocument) -> Result<Value> {
+    let redirects = crate::user_state::redirect_map(document);
+    let titles = crate::user_state::Titles::new(catalog);
+    let mut referenced = HashSet::new();
+    for reference in personal_references(document) {
+        if let Ok(key) = id(&reference["itemId"]) {
+            referenced.insert(crate::reconcile_catalog::destination(key, &redirects)?);
+        } else if let Some(item) = titles.resolve(&redirects, reference) {
+            referenced.insert(crate::reconcile_catalog::destination(item.id()?, &redirects)?);
+        }
+    }
+    let mut selected = without_items(document);
+    let mut items = Vec::new();
+    let mut raw_items = Vec::new();
+    for (item, raw) in std::mem::take(&mut catalog.items)
+        .into_iter()
+        .zip(rows(&document["catalog"], "items"))
+    {
+        let key = crate::reconcile_catalog::destination(item.id()?, &redirects)?;
+        if referenced.contains(&key) {
+            items.push(item);
+            raw_items.push(raw.clone());
+        }
+    }
+    catalog.items = items;
+    selected["catalog"]["items"] = Value::Array(raw_items);
+    selected["catalogRedirects"] = Value::Array(
+        rows(document, "catalogRedirects")
+            .filter(|row| redirect_reaches(&row["fromId"], &redirects, &referenced))
+            .cloned()
+            .collect(),
+    );
+    Ok(selected)
+}
+
+fn redirect_reaches(value: &Value, redirects: &HashMap<Uuid, Uuid>, ids: &HashSet<Uuid>) -> bool {
+    id(value)
+        .and_then(|id| crate::reconcile_catalog::destination(id, redirects))
+        .is_ok_and(|key| ids.contains(&key))
 }
 fn id(value: &Value) -> Result<Uuid> {
     value
@@ -494,27 +602,88 @@ impl CatalogStore {
         remote: Option<&Value>,
         max: usize,
     ) -> Result<(bool, Option<Value>)> {
-        let remote_catalog = remote
-            .map(|r| validate_backup_with_limit(r, max))
+        self.reconcile_profile_inner(remote, max, false, None)
+    }
+
+    /// Exchange only personal state and the titles required to identify it.
+    pub fn reconcile_account_profile(
+        &self,
+        remote: Option<&Value>,
+        max: usize,
+    ) -> Result<(bool, Option<Value>)> {
+        self.reconcile_profile_inner(remote, max, true, None)
+    }
+
+    pub fn restore_account_backup(
+        &self,
+        remote: &Value,
+        server: &str,
+        account: Uuid,
+        revision: i64,
+    ) -> Result<()> {
+        self.reconcile_profile_inner(
+            Some(remote),
+            crate::MAX_DOCUMENT_BYTES,
+            true,
+            Some((server, account, revision)),
+        )?;
+        Ok(())
+    }
+
+    fn reconcile_profile_inner(
+        &self,
+        remote: Option<&Value>,
+        max: usize,
+        personal: bool,
+        restore: Option<(&str, Uuid, i64)>,
+    ) -> Result<(bool, Option<Value>)> {
+        let validate = if personal {
+            crate::validate_account_backup
+        } else {
+            validate_backup_with_limit
+        };
+        let mut remote_catalog = remote
+            .map(|r| validate(r, max))
             .transpose()?;
+        let scoped_remote = if personal {
+            remote.zip(remote_catalog.as_mut())
+                .map(|(doc, catalog)| account_snapshot(doc, catalog))
+                .transpose()?
+        } else {
+            None
+        };
+        let remote = scoped_remote.as_ref().or(remote);
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut local_catalog = Self::export_from(&tx)?;
+        let original = read_state(&tx, self.1)?;
+        let mut local_catalog = if personal {
+            scoped_catalog(&tx, &original, remote_catalog.as_ref(), remote)?
+        } else {
+            Self::export_from(&tx)?
+        };
         let live_ids: HashSet<Uuid> = local_catalog
             .items
             .iter()
             .map(crate::CatalogItem::id)
             .collect::<Result<_>>()?;
-        for tombstone in Self::tombstones_from(&tx)? {
-            let key = tombstone.id()?;
-            if !live_ids.contains(&key) {
-                local_catalog.items.push(tombstone);
+        if !personal {
+            for tombstone in Self::tombstones_from(&tx)? {
+                let key = tombstone.id()?;
+                if !live_ids.contains(&key) {
+                    local_catalog.items.push(tombstone);
+                }
             }
         }
         let shared: bool =
             tx.query_row("SELECT count(*)>1 FROM rust_profiles", [], |r| r.get(0))?;
-        let original = read_state(&tx, self.1)?;
         let mut local = original.clone();
+        if restore.is_some() {
+            for field in COLLECTIONS {
+                if field != "catalogRedirects" {
+                    local[field] = json!([]);
+                }
+            }
+        }
         bind_legacy_targets(&mut local, &local_catalog)?;
         let mut right = remote.map_or(Value::Null, without_items);
         if let Some(catalog) = &remote_catalog {
@@ -563,7 +732,7 @@ impl CatalogStore {
                 json!({"fromId":from,"toId":to,"syncVersion":version}),
             );
         }
-        output["catalogRedirects"] = values(redirects);
+        let complete_redirects = values(redirects);
         let local_by_id = local_catalog
             .items
             .iter()
@@ -575,6 +744,20 @@ impl CatalogStore {
             .enumerate()
             .map(|(n, i)| Ok((i.id()?, (n, i))))
             .collect::<Result<HashMap<_, _>>>()?;
+        let mut remote_aliases = HashMap::new();
+        if personal {
+            // Prefer the surviving server row when both sides of a redirect
+            // still exist in the snapshot.
+            for (key, &(n, item)) in &remote_by_id {
+                let canonical = crate::reconcile_catalog::destination(*key, &titles.redirects)?;
+                if canonical != *key && !remote_by_id.contains_key(&canonical) && !item.deleted {
+                    remote_aliases
+                        .entry(canonical)
+                        .and_modify(|record: &mut usize| *record = (*record).min(n))
+                        .or_insert(n);
+                }
+            }
+        }
         let mut additions = Vec::new();
         let mut outgoing = Vec::new();
         for item in &merged.items {
@@ -596,23 +779,72 @@ impl CatalogStore {
                     additions.push(added);
                 }
             }
-            let raw = remote_by_id
+            // Keep the server's metadata for existing titles when the scope
+            // is limited. Large local chapter lists must not inflate the backup.
+            let mut raw = remote_by_id
                 .get(&key)
-                .filter(|(_, r)| *r == item)
+                .filter(|(_, r)| *r == item || (personal && !r.deleted && !item.deleted))
                 .and_then(|(n, _)| Some(remote?["catalog"]["items"][*n].clone()));
-            outgoing.push(raw.unwrap_or(serde_json::to_value(item)?));
+            if raw.is_none() && !item.deleted {
+                if let Some((&n, remote)) = remote_aliases.get(&key).zip(remote) {
+                    let mut aliased = remote["catalog"]["items"][n].clone();
+                    aliased["syncId"] = json!(key);
+                    raw = Some(aliased);
+                }
+            }
+            let document = match raw {
+                Some(value) => value,
+                None => serde_json::to_value(item)?,
+            };
+            outgoing.push((key, document));
         }
-        output["catalog"]["items"] = Value::Array(outgoing);
         merge_personal(&local, &right, &titles, &mut output)?;
-        output["version"] = json!(4);
-        let upload = remote.is_none_or(|remote| {
-            remote["version"] != output["version"]
-                || remote["catalog"] != output["catalog"]
-                || COLLECTIONS.iter().any(|key| {
-                    remote[key] != output[key]
-                        && comparable_rows(remote, key) != comparable_rows(&output, key)
-                })
+        let referenced = personal.then(|| {
+            personal_references(&output)
+                .filter_map(|reference| id(&reference["itemId"]).ok())
+                .collect::<HashSet<_>>()
         });
+        output["catalogRedirects"] = if let Some(ids) = &referenced {
+            Value::Array(
+                complete_redirects.as_array().into_iter().flatten()
+                    .filter(|row| redirect_reaches(&row["fromId"], &titles.redirects, ids))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            complete_redirects.clone()
+        };
+        output["catalog"]["items"] = Value::Array(
+            outgoing
+                .into_iter()
+                .filter(|(key, _)| {
+                    referenced.as_ref().is_none_or(|ids| ids.contains(key))
+                })
+                .map(|(_, item)| item)
+                .collect(),
+        );
+        output["version"] = json!(4);
+        let upload = match (personal, remote) {
+            (_, None) => true,
+            (true, Some(_)) => {
+                // Older servers can retain both sides of a redirect. Compare
+                // the resolved states so they need not be rewritten every sync.
+                let mut server_state = json!({});
+                merge_personal(&Value::Null, &right, &titles, &mut server_state)?;
+                COLLECTIONS
+                    .iter()
+                    .filter(|&&field| field != "catalogRedirects")
+                    .any(|&field| server_state[field] != output[field])
+            }
+            (false, Some(remote)) => {
+                remote["version"] != output["version"]
+                    || remote["catalog"] != output["catalog"]
+                    || COLLECTIONS.iter().any(|key| {
+                        remote[key] != output[key]
+                            && comparable_rows(remote, key) != comparable_rows(&output, key)
+                    })
+            }
+        };
         if upload {
             output["deviceId"] = local["deviceId"].clone();
             output["deviceName"] = local["deviceName"].clone();
@@ -624,14 +856,28 @@ impl CatalogStore {
         for field in COLLECTIONS {
             state[field] = output[field].clone();
         }
+        state["catalogRedirects"] = complete_redirects;
+        if let Some(ids) = &referenced {
+            additions.retain(|item| {
+                !item.deleted
+                    && item.id().is_ok_and(|key| ids.contains(&key) && !live_ids.contains(&key))
+            });
+        }
+        let can_redirect = |id: &&Uuid| {
+            titles.redirects.contains_key(id)
+                && referenced.as_ref().is_none_or(|ids| {
+                    crate::reconcile_catalog::destination(**id, &titles.redirects)
+                        .is_ok_and(|key| ids.contains(&key))
+                })
+        };
         let obsolete = live_ids
             .iter()
-            .filter(|id| titles.redirects.contains_key(id))
+            .filter(can_redirect)
             .copied()
             .collect::<Vec<_>>();
         let obsolete_tombstones = local_by_id
             .keys()
-            .filter(|id| !live_ids.contains(id) && titles.redirects.contains_key(id))
+            .filter(|id| !live_ids.contains(id) && can_redirect(id))
             .copied()
             .collect::<Vec<_>>();
         let changed = state != original
@@ -702,7 +948,10 @@ impl CatalogStore {
                         deleted: HashSet::new(),
                         redirects: titles.redirects.clone(),
                     };
-                    for item in &local_catalog.items {
+                    let other_catalog = personal
+                        .then(|| scoped_catalog(&tx, &doc, None, None))
+                        .transpose()?;
+                    for item in &other_catalog.as_ref().unwrap_or(&local_catalog).items {
                         let key = item.id()?;
                         if !other_titles.names.contains_key(&key) {
                             other_titles.index_item(key, item);
@@ -768,6 +1017,13 @@ impl CatalogStore {
         )?;
         if state != original || needs_identity {
             save_state(&tx, self.1, &state)?;
+        }
+        if let Some((server, account, revision)) = restore {
+            tx.execute(
+                "DELETE FROM rust_backup_revisions WHERE profile_id=?1",
+                [self.1.to_string()],
+            )?;
+            self.write_backup_revision(&tx, server, account, revision)?;
         }
         tx.commit()?;
         Ok((changed, upload.then_some(output)))

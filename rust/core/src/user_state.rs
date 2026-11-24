@@ -102,12 +102,26 @@ pub fn validate_backup(document: &Value) -> Result<CatalogDocument> {
 }
 
 pub fn validate_backup_with_limit(document: &Value, max: usize) -> Result<CatalogDocument> {
+    validate_backup_inner(document, max, false)
+}
+
+/// An existing account can contain distinct records for the old and new IDs
+/// of a title after a catalog redirect. Reconciliation folds those records.
+pub fn validate_account_backup(document: &Value, max: usize) -> Result<CatalogDocument> {
+    validate_backup_inner(document, max, true)
+}
+
+fn validate_backup_inner(
+    document: &Value,
+    max: usize,
+    allow_redirected_records: bool,
+) -> Result<CatalogDocument> {
     validate_envelope(document, max)?;
     // Read the catalog straight from the borrowed value: copying it first
     // doubled the memory held for a document that may be 32 MiB.
     let catalog = CatalogDocument::deserialize(&document["catalog"])?;
     catalog.validate()?;
-    validate_personal(document, &catalog)?;
+    validate_personal_inner(document, &catalog, allow_redirected_records)?;
     Ok(catalog)
 }
 
@@ -182,6 +196,14 @@ fn item_aliases(item: &CatalogItem) -> Vec<String> {
 }
 
 pub(crate) fn validate_personal(document: &Value, catalog: &CatalogDocument) -> Result<()> {
+    validate_personal_inner(document, catalog, false)
+}
+
+fn validate_personal_inner(
+    document: &Value,
+    catalog: &CatalogDocument,
+    allow_redirected_records: bool,
+) -> Result<()> {
     for key in [
         "progress",
         "readerPreferences",
@@ -315,6 +337,18 @@ pub(crate) fn validate_personal(document: &Value, catalog: &CatalogDocument) -> 
                 "El respaldo contiene referencias a títulos inexistentes.",
             ))
         };
+    let record_key = |identity: &Value, allow_missing| -> Result<String> {
+        let (_, canonical) = validate_identity(identity, allow_missing)?;
+        if allow_redirected_records {
+            if let Some(original) = identity["itemId"]
+                .as_str()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+            {
+                return Ok(original.to_string());
+            }
+        }
+        Ok(canonical)
+    };
     let version = document["version"].as_u64().unwrap_or(0);
     for key in ["progress", "favoriteItemStates", "readerPreferences"] {
         let mut seen = HashSet::new();
@@ -329,7 +363,7 @@ pub(crate) fn validate_personal(document: &Value, catalog: &CatalogDocument) -> 
             }
             let allow_missing =
                 key == "favoriteItemStates" && row["isFavorite"].as_bool() == Some(false);
-            let (_, item_key) = validate_identity(identity, allow_missing)?;
+            let item_key = record_key(identity, allow_missing)?;
             if version >= 2 && !valid_version(&row["syncVersion"]) {
                 return Err(invalid("Versión de registro inválida."));
             }
@@ -432,8 +466,7 @@ pub(crate) fn validate_personal(document: &Value, catalog: &CatalogDocument) -> 
                 if !valid_version(&state["syncVersion"]) || !state["isMember"].is_boolean() {
                     return Err(invalid("Estado de lista inválido."));
                 }
-                let (_, item_key) = validate_identity(&state["item"], false)?;
-                if !seen_states.insert(item_key) {
+                if !seen_states.insert(record_key(&state["item"], false)?) {
                     return Err(invalid("Estado de lista inválido."));
                 }
             }
@@ -531,8 +564,10 @@ pub(crate) fn identity(item: &CatalogItem) -> Result<Value> {
 // Older backups identify a title only by name (or by a .NET syncId that differs
 // from the canonical Rust book ID). Resolve those targets against the catalog.
 pub(crate) fn bind_legacy_targets(document: &mut Value, catalog: &CatalogDocument) -> Result<()> {
+    let titles = Titles::new(catalog);
+    let unresolved_redirects = HashMap::new();
     let bind = |target: &mut Value| -> Result<()> {
-        if let Some(item) = resolve(catalog, target) {
+        if let Some(item) = titles.resolve(&unresolved_redirects, target) {
             let canonical = item.id()?;
             if target["itemId"].is_null()
                 || target["itemId"]
@@ -858,7 +893,7 @@ fn max_clock(doc: &Value) -> i64 {
     .max()
     .unwrap_or(0)
 }
-fn redirect_map(doc: &Value) -> HashMap<Uuid, Uuid> {
+pub(crate) fn redirect_map(doc: &Value) -> HashMap<Uuid, Uuid> {
     doc["catalogRedirects"]
         .as_array()
         .into_iter()
@@ -1502,29 +1537,6 @@ impl CatalogStore {
     }
 
     pub fn restore_backup_with_limit(&self, document: &Value, max: usize) -> Result<usize> {
-        self.restore_document(document, None, max)
-    }
-
-    pub fn restore_account_backup(
-        &self,
-        document: &Value,
-        server: &str,
-        account: Uuid,
-        revision: i64,
-    ) -> Result<usize> {
-        self.restore_document(
-            document,
-            Some((server, account, revision)),
-            MAX_DOCUMENT_BYTES,
-        )
-    }
-
-    fn restore_document(
-        &self,
-        document: &Value,
-        origin: Option<(&str, Uuid, i64)>,
-        max: usize,
-    ) -> Result<usize> {
         let catalog = validate_backup_with_limit(document, max)?;
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1586,9 +1598,6 @@ impl CatalogStore {
             "DELETE FROM rust_backup_revisions WHERE profile_id=?1",
             [self.1.to_string()],
         )?;
-        if let Some((server, account, revision)) = origin {
-            self.write_backup_revision(&tx, server, account, revision)?;
-        }
         tx.commit()?;
         Ok(catalog.items.len())
     }

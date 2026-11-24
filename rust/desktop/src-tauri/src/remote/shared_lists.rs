@@ -61,7 +61,7 @@ pub async fn publish_list(
     let session = sessions
         .get_mut(&profile_id)
         .ok_or("Iniciá sesión en Cuenta y respaldo para publicar una lista.")?;
-    synchronize(session, &library).await?;
+    synchronize(session, &library, false).await?;
     let response = session
         .client
         .post(session.base.join("api/v1/shared-lists").unwrap())
