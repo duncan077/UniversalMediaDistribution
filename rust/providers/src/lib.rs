@@ -619,10 +619,38 @@ fn site_player(url: Url) -> Value {
     json!({"url":url.as_str(),"external":true,"label":"Abrir reproductor del sitio"})
 }
 
+/// Some Streamtape player pages end in the uploaded filename, including .mp4.
+pub fn streamtape_player_page(url: &Url) -> bool {
+    url.domain().is_some_and(|domain| {
+        ["streamtape.com", "streamtape.to"].iter().any(|host| {
+            domain == *host
+                || domain
+                    .strip_suffix(host)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    }) && matches!(url.path().split('/').nth(1), Some("e" | "v" | "embed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dom_query::Document;
+
+    #[test]
+    fn jk_keeps_streamtape_embed_filenames_as_player_pages() {
+        let page = Url::parse("https://jkanime.net/example/1/").unwrap();
+        let html = r#"<iframe src="https://streamtape.com/e/abc/episode.mp4"></iframe>
+            <iframe src="https://video.example/episode.mp4"></iframe>"#;
+        let streams = jk::jk_extract_streams(&page, html).unwrap();
+        let source = |host: &str| {
+            streams
+                .iter()
+                .find(|s| s["url"].as_str().is_some_and(|url| url.contains(host)))
+                .unwrap()
+        };
+        assert_eq!(source("streamtape.com")["embed"], true);
+        assert_eq!(source("video.example")["embed"], false);
+    }
 
     #[test]
     fn canonical_number_normalizes_zeros_decimals_and_non_numbers() {

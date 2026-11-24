@@ -469,6 +469,7 @@ pub async fn open_filtered_player(
         .ok()
         .filter(|u| u.scheme() == "https" && umd_core::public_url::web_url(u))
         .ok_or("Ingresá una dirección pública HTTPS.")?;
+    let url = crate::streams::provider_web_address(url);
     if online() {
         let dir = app.state::<Directory>().0.clone();
         prepare(&dir, profile()).await;

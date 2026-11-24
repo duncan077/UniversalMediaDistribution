@@ -111,9 +111,10 @@ pub(crate) fn extract_anime_streams(base: &Url, html: &str) -> Result<Vec<Value>
             if !seen.insert(url.clone()) {
                 continue;
             }
-            let hls = url.path().ends_with(".m3u8");
+            let player_page = super::streamtape_player_page(&url);
+            let hls = !player_page && url.path().ends_with(".m3u8");
             let label = clean(&node.text());
-            let embed = !hls && !url.path().ends_with(".mp4");
+            let embed = player_page || (!hls && !url.path().ends_with(".mp4"));
             options.push(json!({
                 "url": url.to_string(),
                 "hls": hls,

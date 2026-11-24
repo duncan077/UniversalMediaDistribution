@@ -24,6 +24,8 @@ pub struct Sample {
     plays: u32,
     pauses: u32,
     seeks: u32,
+    #[serde(default, rename = "publicSource")]
+    public_source: bool,
 }
 #[derive(Serialize)]
 pub struct Report {
@@ -128,41 +130,39 @@ pub async fn provider_public_stream(
         include_str!("../../player-assets/provider-media.js")
     );
     let raw = super::eval_public(window.app_handle(), session, script).await?;
-    let address: String = serde_json::from_str(&raw).map_err(|_| unavailable)?;
-    let url = reqwest::Url::parse(&address).map_err(|_| unavailable)?;
-    let public = |u: &reqwest::Url| {
-        u.scheme() == "https"
-            && u.query().is_none()
-            && u.fragment().is_none()
-            && umd_core::public_url::web_url(u)
+    if raw.len() > 96 << 10 {
+        return Err(unavailable.into());
+    }
+    #[derive(Deserialize)]
+    struct Observed {
+        page: String,
+        addresses: Vec<String>,
+    }
+    let observed: Observed = serde_json::from_str(&raw).map_err(|_| unavailable)?;
+    let parse = |raw: &str| {
+        (raw.len() <= 16_384).then_some(())?;
+        reqwest::Url::parse(raw)
+            .ok()
+            .filter(|url| url.scheme() == "https" && umd_core::public_url::web_url(url))
     };
-    if !public(&url) {
-        return Err(unavailable.into());
-    }
-    // Only hand off an ordinary public media response that plays independently of
-    // the browser session. Keep authenticated and DRM playback in its original tab.
-    let response = crate::streams::fetch_media(
-        url,
-        std::time::Duration::from_secs(10),
-        None,
-        Some("bytes=0-31"),
-        None,
-    )
-    .await
-    .map_err(|_| unavailable)?;
-    let mime = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    if !public(response.url())
-        || !(mime.starts_with("video/")
-            || mime.starts_with("audio/")
-            || mime.contains("mpegurl")
-            || mime.starts_with("application/dash+xml"))
-    {
-        return Err(unavailable.into());
-    }
-    crate::streams::media(response.url().clone(), &mime).ok_or_else(|| unavailable.into())
+    let mut page = parse(&observed.page).ok_or(unavailable)?;
+    page.set_fragment(None);
+    page.set_query(None);
+    let resolution = async {
+        for address in observed
+            .addresses
+            .iter()
+            .take(4)
+            .filter_map(|raw| parse(raw))
+        {
+            if let Ok(stream) = crate::streams::probe_public_media(address, &page).await {
+                return Ok(stream);
+            }
+        }
+        Err(unavailable.to_owned())
+    };
+    // A separate HTTP client checks the media with no cookies or session headers.
+    tokio::time::timeout(std::time::Duration::from_secs(20), resolution)
+        .await
+        .map_err(|_| unavailable.to_owned())?
 }

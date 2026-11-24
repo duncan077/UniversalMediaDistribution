@@ -1,6 +1,7 @@
 mod declared;
+mod hosters;
+mod pixeldrain;
 use crate::CommandResult;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use dom_query::Document;
 use regex::Regex;
 use reqwest::{header, Client, Url};
@@ -12,6 +13,13 @@ use tokio::{net::lookup_host, sync::Semaphore, time::timeout};
 static REQUESTS: Semaphore = Semaphore::const_new(4);
 
 use umd_core::public_url::{public_ip, web_url};
+
+#[derive(Clone, Copy, PartialEq)]
+enum RequestKind {
+    Get,
+    Relay,
+    LoadX,
+}
 
 pub(crate) async fn get_public(
     url: Url,
@@ -31,23 +39,65 @@ async fn fetch(
         request_timeout,
         player_page,
         first_byte.then_some("bytes=0-0"),
-        None,
+        player_page,
     )
     .await
 }
 pub(crate) async fn fetch_media(
-    mut url: Url,
+    url: Url,
     request_timeout: Duration,
     player_page: Option<&Url>,
     range: Option<&str>,
     referer: Option<&Url>,
 ) -> CommandResult<reqwest::Response> {
+    fetch_response(
+        url,
+        request_timeout,
+        player_page,
+        range,
+        referer,
+        RequestKind::Get,
+    )
+    .await
+}
+
+pub(crate) async fn relay_media(
+    url: Url,
+    player_page: &Url,
+    range: Option<&str>,
+) -> CommandResult<reqwest::Response> {
+    let duration = Duration::from_secs(30);
+    timeout(
+        duration,
+        fetch_response(
+            url,
+            duration,
+            Some(player_page),
+            range,
+            Some(player_page),
+            RequestKind::Relay,
+        ),
+    )
+    .await
+    .map_err(|_| "La fuente tardó demasiado en responder.")?
+}
+
+async fn fetch_response(
+    mut url: Url,
+    request_timeout: Duration,
+    player_page: Option<&Url>,
+    range: Option<&str>,
+    referer: Option<&Url>,
+    kind: RequestKind,
+) -> CommandResult<reqwest::Response> {
+    let streaming = kind == RequestKind::Relay;
     for _ in 0..6 {
         if !web_url(&url) {
             return Err("Ingresá una dirección pública HTTP o HTTPS.".into());
         }
         if player_page.is_some_and(|page| {
-            crate::ad_filter::blocked(url.as_str(), page.as_str(), "document", "GET")
+            let kind = if streaming { "media" } else { "document" };
+            crate::ad_filter::blocked(url.as_str(), page.as_str(), kind, "GET")
         }) {
             return Err("El bloqueador identificó esta dirección como publicidad.".into());
         }
@@ -59,21 +109,37 @@ pub(crate) async fn fetch_media(
         if addresses.is_empty() || addresses.iter().any(|a| !public_ip(a.ip())) {
             return Err("La dirección de la fuente no es pública.".into());
         }
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .no_proxy()
-            .timeout(request_timeout)
+            .connect_timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut request = client.get(url.clone());
+            .resolve_to_addrs(host, &addresses);
+        builder = if streaming {
+            builder.read_timeout(request_timeout)
+        } else {
+            builder.timeout(request_timeout)
+        };
+        let client = builder.build().map_err(|e| e.to_string())?;
+        let mut request = if kind == RequestKind::LoadX {
+            client
+                .post(url.clone())
+                .header(header::ACCEPT, "application/json, */*;q=0.5")
+                .header("X-Requested-With", "XMLHttpRequest")
+        } else {
+            client.get(url.clone())
+        };
+        if player_page.is_some() {
+            request = request.header(header::USER_AGENT, hosters::BROWSER_USER_AGENT);
+        }
         if let Some(range) = range {
             request = request.header(header::RANGE, range);
         }
         if let Some(page) = referer {
             let origin = page.origin().ascii_serialization();
-            let reference = if page.origin() == url.origin() {
-                page.as_str().to_owned()
+            let reference = if player_page.is_some() || page.origin() == url.origin() {
+                let mut page = page.clone();
+                page.set_fragment(None);
+                page.to_string()
             } else {
                 format!("{origin}/")
             };
@@ -82,16 +148,21 @@ pub(crate) async fn fetch_media(
                     .header(header::REFERER, reference)
                     .header(header::ORIGIN, origin);
             }
-            request = request.header(
-                header::USER_AGENT,
-                concat!("UniversalMediaDistribution/", env!("CARGO_PKG_VERSION")),
-            );
+            if player_page.is_none() {
+                request = request.header(
+                    header::USER_AGENT,
+                    concat!("UniversalMediaDistribution/", env!("CARGO_PKG_VERSION")),
+                );
+            }
         }
         let response = request
             .send()
             .await
             .map_err(|_| "No se pudo conectar con la fuente.")?;
         if response.status().is_redirection() {
+            if kind == RequestKind::LoadX {
+                return Err("El servidor de video cambió de dirección.".into());
+            }
             let location = response
                 .headers()
                 .get(header::LOCATION)
@@ -159,14 +230,24 @@ fn direct_media(url: Url, mime: &str) -> Option<Stream> {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    if umd_providers::streamtape_player_page(&url)
+        || matches!(
+            mime.as_str(),
+            "text/html" | "application/xhtml+xml" | "application/json"
+        )
+    {
+        return None;
+    }
     let hls = mime.contains("mpegurl") || path.ends_with(".m3u8");
     let dash = mime == "application/dash+xml" || path.ends_with(".mpd");
     (hls || dash
         || mime.starts_with("video/")
         || mime.starts_with("audio/")
-        || [".mp4", ".webm", ".m4v", ".mp3", ".ogg", ".aac", ".ts"]
-            .iter()
-            .any(|ext| path.ends_with(ext)))
+        || [
+            ".mp4", ".webm", ".m4v", ".mkv", ".mp3", ".ogg", ".aac", ".ts",
+        ]
+        .iter()
+        .any(|ext| path.ends_with(ext)))
     .then(|| Stream {
         referer: None,
         url: url.into(),
@@ -185,7 +266,7 @@ fn matches_host(url: &Url, domains: &[&str]) -> bool {
 }
 
 fn extract(base: &Url, doc: &Document) -> Option<Stream> {
-    if let Some(found) = declared::extract(base, doc) {
+    if let Some(found) = declared::player(base, doc) {
         return Some(found);
     }
     let stream = |value: &str, mime: &str| {
@@ -253,90 +334,36 @@ fn extract(base: &Url, doc: &Document) -> Option<Stream> {
         }
     }
     if matches_host(base, &["mediafire.com"]) {
-        if let Some(link) = doc
-            .select("a#downloadButton")
-            .attr("href")
-            .and_then(|v| stream(&v, ""))
-        {
-            return Some(link);
-        }
-    }
-    static COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)/\*.*?\*/").unwrap());
-    static DPLAYER: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)\bvideo\s*:\s*\{\s*url\s*:\s*(?:(atob)\(\s*)?["']([^'"<>]+)["']"#)
-            .unwrap()
-    });
-    static FILE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\b(?:sources\s*:\s*\[\s*(?:\{\s*(?:src|file)\s*:\s*)?|file\s*:\s*)["']([^'"<>]+)["']"#).unwrap()
-    });
-    // Video.js accepts either a source object or a direct URL. Inspect only
-    // literal arguments to the public player API.
-    static PLAYER_SOURCE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-        r#"(?is)\bplayer\.src\s*\(\s*(?:\{[^{};]{0,384}?\b["']?src["']?\s*:\s*)?["']([^"'<>]+)["']"#
-    ).unwrap()
-    });
-    static VOE_HLS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)\bsources\s*=\s*\{[^{};]{0,384}?["']?hls["']?\s*:\s*["']([^"'<>]+)["']"#)
-            .unwrap()
-    });
-    for el in doc.select("script:not([src])").iter() {
-        let text = el.text();
-        let script = COMMENTS.replace_all(&text, "");
-        if let Some(found) = PLAYER_SOURCE
-            .captures_iter(&script)
-            .find_map(|c| stream(&c[1], ""))
-        {
-            return Some(found);
-        }
-        if matches_host(base, &["voe.sx"]) {
-            if let Some(found) = VOE_HLS
-                .captures_iter(&script)
-                .find_map(|c| stream(&c[1], ""))
+        for link in doc.select("a[href]").iter() {
+            let Some(url) = link
+                .attr("href")
+                .and_then(|v| declared::address(base, &v, "media"))
+            else {
+                continue;
+            };
+            let is_download = url
+                .host_str()
+                .and_then(|h| h.strip_suffix(".mediafire.com"))
+                .and_then(|h| h.strip_prefix("download"))
+                .is_some_and(|tail| tail.bytes().all(|b| b.is_ascii_digit()));
+            if is_download
+                || link
+                    .attr("id")
+                    .is_some_and(|id| id.as_ref() == "downloadButton")
             {
-                return Some(found);
-            }
-        }
-        if script.contains("new DPlayer") {
-            if let Some(c) = DPLAYER.captures(&script).filter(|c| c[2].len() <= 16_384) {
-                let url = if c.get(1).is_some() {
-                    STANDARD
-                        .decode(&c[2])
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok())
-                } else {
-                    Some(c[2].into())
-                };
-                if let Some(found) = url.and_then(|v| stream(&v, "")) {
+                if let Some(found) = media(url, "") {
                     return Some(found);
                 }
             }
         }
-        if matches_host(
-            base,
-            &[
-                "vidmoly.to",
-                "vidmoly.me",
-                "yourupload.com",
-                "yucache.net",
-                "uqload.cx",
-                "uqload.is",
-                "uqload.com",
-                "vidoza.net",
-            ],
-        ) || script.contains("jwplayer(")
-        {
-            if let Some(found) = FILE.captures_iter(&script).find_map(|c| stream(&c[1], "")) {
-                return Some(found);
-            }
-        }
     }
-    None
+    hosters::extract(base, doc).or_else(|| declared::metadata(base, doc))
 }
 
 enum Page {
     Media(Stream),
     Html(Url, String),
+    Redirect(Url, Url),
 }
 
 fn zilla_playlist(page: &Url) -> Option<Url> {
@@ -372,7 +399,29 @@ where
         if !text.trim_start().starts_with("#EXTM3U") {
             break;
         }
+        let protected = text
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                line.strip_prefix("#EXT-X-KEY:")
+                    .or_else(|| line.strip_prefix("#EXT-X-SESSION-KEY:"))
+            })
+            .any(|attrs| {
+                attrs.split(',').any(|attr| {
+                    attr.trim()
+                        .strip_prefix("METHOD=")
+                        .is_some_and(|value| !matches!(value, "NONE" | "AES-128"))
+                        || attr
+                            .trim()
+                            .strip_prefix("KEYFORMAT=")
+                            .is_some_and(|value| value.trim_matches('"') != "identity")
+                })
+            });
+        if protected {
+            return Err("Este video necesita el reproductor del proveedor.".into());
+        }
         let mut child = false;
+        let mut initialization = None;
         let mut entry = None;
         for line in text.lines().map(str::trim) {
             if line.starts_with("#EXT-X-STREAM-INF:") {
@@ -382,8 +431,7 @@ where
                 .strip_prefix("#EXT-X-MAP:")
                 .and_then(|s| s.split_once("URI=\""))
             {
-                entry = uri.split('"').next();
-                break;
+                initialization = uri.split('"').next();
             }
             if !line.is_empty() && !line.starts_with('#') {
                 entry = Some(line);
@@ -397,42 +445,139 @@ where
             next = url;
             continue;
         }
-        let mut segment = get(url, true).await?;
-        let mime = segment
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if mime.contains("text/html") || mime.contains("json") {
-            break;
+        if let Some(initialization) = initialization {
+            let initialization = base
+                .join(initialization)
+                .ok()
+                .filter(web_url)
+                .ok_or("Zilla publicó un enlace de inicialización inválido.")?;
+            check_zilla_bytes(
+                get(initialization, true).await?,
+                "El archivo de inicialización de Zilla no contiene video.",
+            )
+            .await?;
         }
-        if segment
-            .chunk()
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|v| !v.is_empty())
-        {
-            return Ok(Stream {
-                referer: None,
-                url: playlist.into(),
-                hls: true,
-                dash: false,
-                tracks: Vec::new(),
-            });
-        }
-        break;
+        check_zilla_bytes(
+            get(url, true).await?,
+            "El segmento de Zilla no contiene video.",
+        )
+        .await?;
+        return Ok(Stream {
+            referer: None,
+            url: playlist.into(),
+            hls: true,
+            dash: false,
+            tracks: Vec::new(),
+        });
     }
     Err("El servidor de video no publicó segmentos reproducibles.".into())
 }
 
+async fn check_zilla_bytes(mut response: reqwest::Response, error: &str) -> CommandResult<()> {
+    let mime = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if mime.contains("text/html")
+        || mime.contains("json")
+        || response
+            .chunk()
+            .await
+            .map_err(|_| "Zilla interrumpió la descarga.")?
+            .is_none_or(|bytes| bytes.is_empty())
+    {
+        return Err(error.to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) async fn probe_public_media(mut address: Url, page: &Url) -> CommandResult<Stream> {
+    let failure = "Este video necesita el reproductor del proveedor.";
+    address.set_fragment(None);
+    let request = |target, segment: bool| async move {
+        let range = segment.then_some("bytes=0-31");
+        let response = fetch_media(
+            target,
+            Duration::from_secs(8),
+            Some(page),
+            range,
+            Some(page),
+        )
+        .await?;
+        if response.url().scheme() != "https" {
+            return Err(failure.to_owned());
+        }
+        Ok(response)
+    };
+    let mut stream = if address.path().to_ascii_lowercase().ends_with(".m3u8") {
+        zilla_stream(address, request).await?
+    } else {
+        let response = request(address.clone(), true).await?;
+        let mime = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if mime.contains("mpegurl") {
+            zilla_stream(address, request).await?
+        } else if mime.starts_with("application/dash+xml") {
+            let manifest = bounded_text(request(address, false).await?, 2 << 20).await?;
+            if manifest.to_ascii_lowercase().contains("contentprotection") {
+                return Err(failure.into());
+            }
+            media(response.url().clone(), &mime).ok_or(failure)?
+        } else {
+            if !mime.starts_with("video/") && !mime.starts_with("audio/") {
+                return Err(failure.into());
+            }
+            let final_address = response.url().clone();
+            check_zilla_bytes(response, failure).await?;
+            media(final_address, &mime).ok_or(failure)?
+        }
+    };
+    stream.referer = Some(page.to_string());
+    Ok(stream)
+}
+
 async fn load_page(url: Url, parent: Url) -> CommandResult<Page> {
+    if let Some(endpoint) = hosters::upnshare_endpoint(&url) {
+        let response = fetch_media(
+            endpoint,
+            Duration::from_secs(10),
+            Some(&url),
+            None,
+            Some(&url),
+        )
+        .await?;
+        let json: Value = serde_json::from_str(&bounded_text(response, 64 << 10).await?)
+            .map_err(|_| "UPNShare no devolvió una fuente válida.")?;
+        let target = json["url"]
+            .as_str()
+            .and_then(|address| declared::address(&url, address, "subdocument"))
+            .filter(|target| target.scheme() == "https")
+            .ok_or("UPNShare no devolvió una fuente válida.")?;
+        return Ok(Page::Redirect(url, target));
+    }
+    if let Some(address) = pixeldrain::address(&url) {
+        let referer = (parent != url).then_some(&parent);
+        return pixeldrain::resolve(address, referer).await.map(Page::Media);
+    }
+    if let Some(endpoint) = hosters::protocols::loadx_endpoint(&url) {
+        if let Some(mut stream) = loadx(&url, endpoint).await {
+            stream.referer = Some(url.to_string());
+            return Ok(Page::Media(stream));
+        }
+    }
     if let Some(playlist) = zilla_playlist(&url) {
-        return zilla_stream(playlist, |target, probe| {
+        let mut stream = zilla_stream(playlist, |target, probe| {
             fetch(target, Duration::from_secs(10), Some(&url), probe)
         })
-        .await
-        .map(Page::Media);
+        .await?;
+        stream.referer = Some(url.to_string());
+        return Ok(Page::Media(stream));
     }
     let response = fetch(url, Duration::from_secs(20), Some(&parent), false).await?;
     let base = response.url().clone();
@@ -441,33 +586,66 @@ async fn load_page(url: Url, parent: Url) -> CommandResult<Page> {
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(stream) = media(base.clone(), mime) {
+    if let Some(mut stream) = media(base.clone(), mime) {
+        if parent != base {
+            stream.referer = Some(parent.to_string());
+        }
         return Ok(Page::Media(stream));
     }
-    Ok(Page::Html(
-        base,
-        bounded_text(response, 2 * 1024 * 1024).await?,
-    ))
+    let body = bounded_text(response, 2 * 1024 * 1024).await?;
+    if let Some((ticket, token)) = hosters::protocols::dood_request(&base, &body) {
+        let response = fetch(ticket, Duration::from_secs(10), Some(&base), false).await?;
+        let source = bounded_text(response, 4096).await?;
+        if let Some(mut stream) = hosters::protocols::dood_media(&base, &source, &token) {
+            stream.referer = Some(base.to_string());
+            return Ok(Page::Media(stream));
+        }
+    }
+    Ok(Page::Html(base, body))
+}
+
+async fn loadx(page: &Url, endpoint: Url) -> Option<Stream> {
+    let response = fetch_response(
+        endpoint,
+        Duration::from_secs(12),
+        Some(page),
+        None,
+        Some(page),
+        RequestKind::LoadX,
+    )
+    .await
+    .ok()?;
+    let body = bounded_text(response, 1024 * 1024).await.ok()?;
+    let data: Value = serde_json::from_str(&body).ok()?;
+    declared::stream(page, data["videoSource"].as_str()?, "")
 }
 
 async fn resolve_pages(
     mut url: Url,
+    referer: Option<Url>,
+    browser: &mut Option<Url>,
     load: impl AsyncFn(Url, Url) -> CommandResult<Page>,
 ) -> CommandResult<Stream> {
-    let mut parent = url.clone();
+    let mut parent = referer.unwrap_or_else(|| url.clone());
+    parent.set_fragment(None);
     let mut visited = std::collections::HashSet::new();
     for _ in 0..3 {
-        url.set_fragment(None);
+        if hosters::upnshare_endpoint(&url).is_none() {
+            url.set_fragment(None);
+        }
         if !web_url(&url) || !visited.insert(url.clone()) {
             break;
         }
         if crate::ad_filter::blocked(url.as_str(), parent.as_str(), "media", "GET") {
             return Err("El bloqueador identificó esta dirección como publicidad.".into());
         }
-        if let Some(direct) = media(url.clone(), "") {
+        if let Some(mut direct) = media(url.clone(), "") {
+            if url != parent {
+                direct.referer = Some(parent.to_string());
+            }
             return Ok(direct);
         }
-        if matches_host(&url, &["nupload.top", "nupload.me"])
+        if matches_host(&url, hosters::protocols::NUPLOAD)
             && url.path().trim_end_matches('/') == "/iframe"
         {
             if let Some(next) = url
@@ -483,25 +661,55 @@ async fn resolve_pages(
         }
         match load(url, parent).await? {
             Page::Media(stream) => return Ok(stream),
+            Page::Redirect(mut base, next) => {
+                base.set_fragment(None);
+                if browser.is_some() && hosters::alternate_player(&next) {
+                    *browser = Some(next.clone());
+                }
+                url = next;
+                parent = base;
+            }
             Page::Html(mut base, html) => {
                 base.set_fragment(None);
                 visited.insert(base.clone());
+                if let Some(next) = hosters::protocols::frembed(&base, &html) {
+                    parent = base;
+                    url = next;
+                    continue;
+                }
                 let doc = Document::from(html.as_str());
                 if let Some(mut stream) = extract(&base, &doc) {
-                    if stream.hls {
-                        stream.referer = Some(base.to_string());
-                    }
+                    stream.referer = Some(base.to_string());
                     return Ok(stream);
                 }
-                let Some(next) = declared::embed(&base, &doc) else {
+                let Some(next) =
+                    hosters::redirect(&base, &doc).or_else(|| declared::embed(&base, &doc))
+                else {
                     break;
                 };
+                if browser.is_some() && hosters::approved_delegate(&base, &next) {
+                    *browser = Some(next.clone());
+                }
                 parent = base;
                 url = next;
             }
         }
     }
     Err("La página no publica una fuente compatible con el reproductor.".into())
+}
+
+pub(crate) fn provider_web_address(url: Url) -> Url {
+    hosters::mega_embed(&url).unwrap_or(url)
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum VideoResolution {
+    Direct(Stream),
+    Web {
+        #[serde(rename = "providerPlayer")]
+        provider_player: String,
+    },
 }
 
 pub(crate) fn trusted_server(store: &umd_core::CatalogStore, url: &Url) -> CommandResult<bool> {
@@ -520,20 +728,44 @@ pub(crate) fn trusted_server(store: &umd_core::CatalogStore, url: &Url) -> Comma
 #[tauri::command]
 pub async fn resolve_video(
     address: String,
+    provider: Option<String>,
+    web_fallback: Option<bool>,
     store: tauri::State<'_, umd_core::CatalogStore>,
-) -> CommandResult<Stream> {
+) -> CommandResult<VideoResolution> {
     let url = Url::parse(address.trim()).map_err(|_| "Enlace de video inválido.")?;
     if trusted_server(&store, &url)? {
         if let Some(stream) = direct_media(url.clone(), "") {
-            return Ok(stream);
+            return Ok(VideoResolution::Direct(stream));
         }
+    }
+    let mut browser =
+        (web_fallback == Some(true) && hosters::alternate_player(&url)).then(|| url.clone());
+    if let Some(embed) = browser.as_ref().and_then(hosters::mega_embed) {
+        return Ok(VideoResolution::Web {
+            provider_player: embed.into(),
+        });
     }
     let _permit = REQUESTS
         .try_acquire()
         .map_err(|_| "Hay otras fuentes cargando. Volvé a intentar.")?;
-    timeout(Duration::from_secs(35), resolve_pages(url, load_page))
-        .await
-        .map_err(|_| "La fuente tardó demasiado en responder.")?
+    let referer = provider
+        .as_deref()
+        .and_then(crate::providers::provider_referer)
+        .filter(web_url);
+    let resolution = timeout(
+        Duration::from_secs(35),
+        resolve_pages(url, referer, &mut browser, load_page),
+    )
+    .await
+    .map_err(|_| "La fuente tardó demasiado en responder.".to_owned())
+    .and_then(|result| result);
+    match (resolution, browser) {
+        (Ok(stream), _) => Ok(VideoResolution::Direct(stream)),
+        (Err(_), Some(url)) => Ok(VideoResolution::Web {
+            provider_player: url.into(),
+        }),
+        (Err(error), None) => Err(error),
+    }
 }
 
 #[derive(Serialize)]

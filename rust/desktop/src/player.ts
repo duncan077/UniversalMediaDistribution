@@ -183,19 +183,29 @@ function persist(target: Target, position: number, kind: string, completed: bool
   writes = writes.then(() => invokeProfile<void>("save_progress", { target, position, kind, completed })).catch(error);
 }
 
+async function openProviderSession(
+  address: string,
+  entry: { label: string; target: Target },
+  report: (message: string, error?: boolean) => void,
+) {
+  await flushProgress();
+  const saved = await invokeProfile<Progress | null>("get_progress", {target: entry.target});
+  const id = await invoke<string>("open_filtered_player", {address, language: document.documentElement.lang});
+  const resume = saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0;
+  followProvider(id, entry.target, entry.label, resume, (pos, ended) => persist(entry.target, pos, "seconds", ended, e => report(String(e), true)),
+    async stream => {await flushProgress(); await play(entry, "video", [stream.url], report, stream.hls, stream);});
+}
+
+type VideoResolution = Stream | { providerPlayer: string };
+
 function providerPlayerButton(name: string, address: string, external: boolean, entry: Entry, report: (message: string, error?: boolean) => void) {
-  const button = node("button", external ? ui("Abrir ") + name + ui(" en el navegador") : ui("Ver ") + name + ui(" en UMD"));
+  const button = node("button", external ? ui("Abrir ") + name + ui(" en el navegador") : ui("Abrir {0} en el reproductor del proveedor", name));
   button.type = "button";
   button.onclick = async () => {
     button.disabled = true;
     try {
       if (external) { await invoke("open_provider_player", {address}); return; }
-      await flushProgress();
-      const saved = await invokeProfile<Progress | null>("get_progress", {target: entry.target});
-      const id = await invoke<string>("open_filtered_player", {address, language: document.documentElement.lang});
-      const resume = saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0;
-      followProvider(id, entry.target, entry.label, resume, (pos, ended) => persist(entry.target, pos, "seconds", ended, e => report(String(e), true)),
-        async stream => {await flushProgress(); await play(entry, "video", [stream.url], report, stream.hls, stream);});
+      await openProviderSession(address, entry, report);
     } catch (e) {
       report(String(e), true);
     } finally {
@@ -203,6 +213,10 @@ function providerPlayerButton(name: string, address: string, external: boolean, 
     }
   };
   return button;
+}
+
+function isEmbeddedSource(source: Record<string, unknown>): boolean {
+  return typeof source.mimeType === "string" && source.mimeType.split(";", 1)[0].trim().toLowerCase() === "text/html";
 }
 
 export function contentControls(
@@ -454,10 +468,14 @@ export function contentControls(
         const opened = await invoke<OpenedMedia>("open_catalog_book", { address: url, format });
         listStatus.textContent = "";
         if (isAlive()) await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, nav);
-      } else if (kind === "video" && source.mimeType === "text/html") {
+      } else if (kind === "video" && isEmbeddedSource(source)) {
         listStatus.textContent = ui("Buscando video…");
-        const stream = await invoke<Stream>("resolve_video", { address: url });
+        const stream = await invoke<VideoResolution>("resolve_video", { address: url, webFallback: true });
         listStatus.textContent = "";
+        if ("providerPlayer" in stream) {
+          if (isAlive()) await openProviderSession(stream.providerPlayer, entry, report);
+          return;
+        }
         const safeUrl = remoteUrl(stream.url);
         if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
         const tracks = (stream.tracks ?? []).flatMap(track => {
@@ -666,7 +684,8 @@ export function contentControls(
             if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
             if (isAlive()) await play(entry, "images", urls, report, false, undefined, makeChapterNav(entry));
           } else {
-            const choices = await invoke<(Stream & { label: string; embed?: boolean })[]>("provider_unit", args);
+            const sources = await invoke<VideoChoice[]>("provider_unit", args);
+            const choices = sources.map(source => ({...source, provider}));
             if (!isAlive()) return;
             if (!choices.length) {
               report(ui("No se encontraron servidores para este episodio."), true);
@@ -683,12 +702,16 @@ export function contentControls(
             const row = node("div", undefined, "button-row");
             for (const source of choices) {
               const needsExtraction = source.external || source.embed;
-              const choice = node("button", source.external ? ui("Buscar video para reproducir en UMD") : source.label, "primary");
+              const choice = node("button", ui("Ver {0} en UMD", source.label), "primary");
               choice.type = "button";
               choice.onclick = async () => {
                 choice.disabled = true;
                 try {
-                  const media = needsExtraction ? await invoke<Stream>("resolve_video", { address: source.url }) : source;
+                  const media = needsExtraction ? await invoke<VideoResolution>("resolve_video", { address: source.url, provider, webFallback: true }) : source;
+                  if ("providerPlayer" in media) {
+                    if (isAlive()) await openProviderSession(media.providerPlayer, entry, report);
+                    return;
+                  }
                   const safeUrl = remoteUrl(media.url);
                   if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
                   const rawTracks = media.tracks?.length ? media.tracks : source.tracks;
@@ -822,7 +845,7 @@ export function contentControls(
         }
       };
       actions.append(openBtn);
-      if (!isBook && source.mimeType === "text/html" && isHttpsUrl(url)) {
+      if (!isBook && isEmbeddedSource(source) && isHttpsUrl(url)) {
         actions.append(providerPlayerButton(ui("la página del proveedor"), url, false, entry, report));
       }
     }
@@ -1044,8 +1067,8 @@ export function contentControls(
 }
 
 interface Subtitle { url: string; language: string; label: string; default: boolean }
-type VideoChoice = Stream & {label:string;embed?:boolean};
-interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; engine?:string; dialog?:HTMLDialogElement }
+type VideoChoice = Stream & { label: string; embed?: boolean; provider?: string };
+interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; triedEngines?: Set<string>; engine?:string; dialog?:HTMLDialogElement }
 export interface Stream { referer?:string;live?:boolean; url: string; hls: boolean; dash?: boolean; external?: boolean; tracks?: Subtitle[] }
 
 export function playDownload(name: string, media: OpenedMedia, target: Target | null, report: (message: string, error?: boolean) => void) {
@@ -1175,6 +1198,8 @@ async function play(
     engines.value = playback.engine || getProfilePref(profileId, "umd-video-engine") || "web";
     if (!engines.value) engines.value = "web";
     header.insertBefore(engines, fsBtn);
+    const triedEngines = playback.triedEngines ?? new Set<string>();
+    triedEngines.add(engines.value);
 
     let switching = false;
     const switchTo = async (next:Stream,index:number,engine:string) => {
@@ -1182,7 +1207,8 @@ async function play(
       dialog.removeEventListener("close",onClose);
       cleanup(); dialog.replaceChildren();
       try {
-        await play(entry,kind,[next.url],report,next.hls,next,chapterNav,{...playback, dialog, index, engine});
+        await play(entry,kind,[next.url],report,next.hls,next,chapterNav,{...playback, dialog, index, engine,
+          triedEngines: index === playback.index ? triedEngines : undefined});
       } catch(e){ dialog.close();dialog.remove();report(String(e),true); }
     };
     const currentStream=stream ?? {url:primaryUrl,hls:hlsHint};
@@ -1196,7 +1222,16 @@ async function play(
           const choice=playback.sources[i]; if(!choice)continue;
           playback.attempted.add(i);
           try {
-            const next=choice.embed || choice.external ? await invoke<Stream>("resolve_video",{address:choice.url}) : choice;
+            const next = choice.embed || choice.external ? await invoke<VideoResolution>("resolve_video", {
+              address: choice.url, provider: choice.provider, webFallback: !automatic && entry.target !== null,
+            }) : choice;
+            if ("providerPlayer" in next) {
+              if (entry.target && dialog.open) {
+                dialog.close();
+                await openProviderSession(next.providerPlayer, {...entry, target: entry.target}, report);
+              }
+              return;
+            }
             await switchTo({...next, tracks:next.tracks?.length? next.tracks : choice.tracks}, i, engines.value);return;
           } catch(e) { if(!automatic)throw e; }
         }
@@ -1205,7 +1240,12 @@ async function play(
     };
     const failed = (message:string) => {
       if(switching || !dialog.open || !header.isConnected)return;
-      if(engines.value!=="web") {switching=true; void switchTo(currentStream,playback.index,"web");return;}
+      const alternate = engines.value === "web" ? "vlc" : "web";
+      if (!triedEngines.has(alternate)) {
+        switching = true;
+        void switchTo(currentStream, playback.index, alternate);
+        return;
+      }
       const next=playback.sources.findIndex((_,i)=>!playback.attempted.has(i));
       if(next>=0){void changeSource(next,true);return;}
       error(message);
@@ -1230,15 +1270,35 @@ async function play(
       header.insertBefore(wireless, engines);
     }
     if(stream?.live) header.insertBefore(node("span","● LIVE","live-pill"),engines);
+    const isDash = kind === "video" && (stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl));
     if (engines.value !== "web") {
       cleanup = nativePlayer(
         engines.value, primaryUrl, viewport, header, output, entry.label, entry.target, validTracks,
         saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0,
-        (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, stream?.hls ? stream.referer : undefined,
+        (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, isDash ? undefined : stream?.referer, hlsHint,
       );
       return;
     }
 
+    let mediaAddress = primaryUrl;
+    let webTracks = validTracks;
+    let closeRelay = () => {};
+    if (stream?.referer && !isDash) {
+      const id = crypto.randomUUID();
+      try {
+        const relay = await invoke<{url: string; tracks: string[]}>("web_stream_relay", {
+          id, address: primaryUrl, referer: stream.referer, hls: hlsHint, tracks: validTracks.map(track => track.url),
+        });
+        closeRelay = () => { void invoke("close_stream_relay", {id}).catch(() => {}); };
+        if (!dialog.open || !header.isConnected) { closeRelay(); return; }
+        cleanup = closeRelay;
+        mediaAddress = relay.url;
+        webTracks = validTracks.flatMap((track, index) => relay.tracks[index] ? [{...track, url: relay.tracks[index]}] : []);
+      } catch (e) {
+        failed(String(e));
+        return;
+      }
+    }
     const media = node(kind);
     media.controls = true;
     const remote = (media as HTMLVideoElement & {remote?:{prompt:()=>Promise<void>}}).remote;
@@ -1273,10 +1333,10 @@ async function play(
     media.addEventListener("error", () => failed(ui("No se pudo reproducir esta fuente. El formato o códec puede no ser compatible con el reproductor del sistema.")));
 
     let dash: import("dashjs").MediaPlayerClass | undefined;
-    if (validTracks.length) {
+    if (webTracks.length) {
       media.crossOrigin = "anonymous";
       let hasDefault = false;
-      for (const track of validTracks) {
+      for (const track of webTracks) {
         const el = node("track");
         el.kind = "subtitles";
         el.src = track.url;
@@ -1287,18 +1347,18 @@ async function play(
         media.append(el);
       }
     }
-    if ((stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl)) && kind === "video") {
+    if (isDash) {
       const {MediaPlayer} = await import("dashjs");
       if (!dialog.open) return;
       dash = MediaPlayer().create();
       dash.on(MediaPlayer.events.ERROR, () => failed(ui("La transmisión DASH se interrumpió.")));
-      dash.initialize(media as HTMLVideoElement, primaryUrl, false);
+      dash.initialize(media as HTMLVideoElement, mediaAddress, false);
     } else if ((hlsHint || /\.m3u8(?:\?|$)/i.test(primaryUrl)) && !media.canPlayType("application/vnd.apple.mpegurl")) {
       const {default: Hls} = await import("hls.js");
       if (!dialog.open) return;
       if (Hls.isSupported()) {
         hls = new Hls();
-        hls.loadSource(primaryUrl);
+        hls.loadSource(mediaAddress);
         hls.attachMedia(media);
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           if (!hls || !header.isConnected || hls.levels.length < 2) return;
@@ -1309,10 +1369,10 @@ async function play(
         });
         hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) failed(ui("La transmisión HLS se interrumpió. Volvé a abrir la fuente para reintentar.")); });
       } else {
-        media.src = primaryUrl;
+        media.src = mediaAddress;
       }
     } else {
-      media.src = primaryUrl;
+      media.src = mediaAddress;
     }
     viewport.append(media);
     output.textContent = ui("Elegí reproducir para comenzar.");
@@ -1329,6 +1389,7 @@ async function play(
       dash?.reset();
       media.removeAttribute("src");
       media.load();
+      closeRelay();
     };
     return;
   }

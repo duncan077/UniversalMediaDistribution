@@ -20,7 +20,7 @@ function formatMediaTime(seconds: number): string {
 }
 
 export function nativePlayer(engine:string, address:string, view:HTMLElement, header:HTMLElement, out:HTMLElement,
-    label:string,target:Target|null,sidecars:{url:string;language:string;label:string;default:boolean}[],resume:number,save:(position:number,ended:boolean)=>void, onFatal:(message:string)=>void, referer?:string) {
+    label:string,target:Target|null,sidecars:{url:string;language:string;label:string;default:boolean}[],resume:number,save:(position:number,ended:boolean)=>void, onFatal:(message:string)=>void, referer?:string, hls = false) {
   const id=crypto.randomUUID(), embedded=/Android|Windows/i.test(navigator.userAgent);
   const events=new AbortController(), eventOpts={signal:events.signal};
   const controls=document.createElement("div");controls.className="native-hud";view.after(controls);
@@ -201,7 +201,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   seek.onchange=()=>{scrubbing=false;void request("seek",Number(seek.value)).then(()=>{if(!closed){restored=true;lastSave=Date.now();}}).catch(fail);};
   void (async()=>{
     try {
-      const result=await call("start",{engine,source:nativeSourceUrl(address),hls:!!referer,referer,tracks:sidecars,box:box()});started=true;
+      const result=await call("start",{engine,source:nativeSourceUrl(address),hls,referer,tracks:sidecars,box:box()});started=true;
       if(closed){await call("close");return;}
       update(result);await poll();
     }catch(e){if(!closed)onFatal(String(e));}

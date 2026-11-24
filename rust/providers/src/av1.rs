@@ -255,8 +255,10 @@ impl Provider {
                     continue;
                 };
                 if seen.insert((lang, u.clone())) {
-                    let hls = u.path().ends_with(".m3u8");
-                    out.push(json!({"url":u.to_string(),"hls":hls,"embed":!hls&&!u.path().ends_with(".mp4"),"label":format!("{} · {lang}",row.field_text("server")?.unwrap_or_else(||u.host_str().unwrap_or("").into()))}))
+                    let player_page = super::streamtape_player_page(&u);
+                    let hls = !player_page && u.path().ends_with(".m3u8");
+                    let embed = player_page || (!hls && !u.path().ends_with(".mp4"));
+                    out.push(json!({"url":u.to_string(),"hls":hls,"embed":embed,"label":format!("{} · {lang}",row.field_text("server")?.unwrap_or_else(||u.host_str().unwrap_or("").into()))}))
                 }
             }
         }

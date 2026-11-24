@@ -240,8 +240,9 @@ pub(crate) fn jk_extract_streams(episode_url: &Url, html: &str) -> Result<Vec<Va
         if seen.len() >= 100 || !seen.insert(url.clone()) {
             return;
         }
-        let hls = force_hls || url.path().ends_with(".m3u8");
-        let mp4 = url.path().ends_with(".mp4");
+        let player_page = super::streamtape_player_page(&url);
+        let hls = !player_page && (force_hls || url.path().ends_with(".m3u8"));
+        let mp4 = !player_page && url.path().ends_with(".mp4");
         let entry = json!({
             "url": url.to_string(),
             "hls": hls,

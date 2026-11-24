@@ -657,14 +657,15 @@ pub(crate) fn cinema_video_links(
         if out.len() >= 100 || !seen.insert(url.clone()) {
             return;
         }
-        let hls = url.path().ends_with(".m3u8");
+        let player_page = super::streamtape_player_page(&url);
+        let hls = !player_page && url.path().ends_with(".m3u8");
         let label = custom_label
             .filter(|l| !l.is_empty() && l.len() <= 80)
             .unwrap_or_else(|| format!("Servidor {}", out.len() + 1));
         out.push(json!({
             "url": url.to_string(),
             "hls": hls,
-            "embed": embed && !hls && !url.path().ends_with(".mp4"),
+            "embed": player_page || (embed && !hls && !url.path().ends_with(".mp4")),
             "label": label
         }));
     };

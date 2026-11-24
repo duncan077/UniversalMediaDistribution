@@ -610,6 +610,8 @@
   "{0} ediciones": "{0} editions",
   "Índice": "Table of contents",
   "Usar el reproductor de UMD": "Use the UMD player",
+  "Ver {0} en UMD": "Play {0} in UMD",
+  "Abrir {0} en el reproductor del proveedor": "Open {0} in the provider's player",
   "Actualizar": "Refresh",
   "Actualizando ficha…": "Refreshing details…",
   "Ficha actualizada.": "Details updated.",

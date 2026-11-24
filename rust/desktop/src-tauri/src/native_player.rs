@@ -38,7 +38,8 @@ pub async fn native_playback(
     if window.label() != "main" {
         return Err("Acción reservada a la biblioteca.".into());
     }
-    uuid::Uuid::parse_str(args["id"].as_str().unwrap_or("")).map_err(|_| "Sesión inválida.")?;
+    let id =
+        uuid::Uuid::parse_str(args["id"].as_str().unwrap_or("")).map_err(|_| "Sesión inválida.")?;
     #[cfg(windows)]
     if operation == "wireless" {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -74,22 +75,6 @@ pub async fn native_playback(
         crate::hls_proxy::end(args["id"].as_str().unwrap_or(""));
     }
     if operation == "start" {
-        let address = args["source"].as_str().unwrap_or("");
-        let download = reqwest::Url::parse(address)
-            .ok()
-            .filter(|u| u.scheme() == "umdstream" || u.host_str() == Some("umdstream.localhost"));
-        args["source"] = Value::String(if let Some(url) = download {
-            let token = url
-                .path()
-                .trim_start_matches('/')
-                .parse()
-                .map_err(|_| "Descarga inválida.")?;
-            crate::torrent_stream::native_url(window.app_handle(), token).await?
-        } else if args["hls"].as_bool() == Some(true) && args["referer"].is_string() {
-            crate::hls_proxy::start(&args, address).await?
-        } else {
-            source(&window, address)?
-        });
         if let Some(tracks) = args["tracks"].as_array_mut() {
             tracks.truncate(100);
             tracks.retain(|t| {
@@ -99,6 +84,25 @@ pub async fn native_playback(
                 })
             });
         }
+        let address = args["source"].as_str().unwrap_or("");
+        let download = reqwest::Url::parse(address)
+            .ok()
+            .filter(|u| u.scheme() == "umdstream" || u.host_str() == Some("umdstream.localhost"));
+        let playback = if let Some(url) = download {
+            let token = url
+                .path()
+                .trim_start_matches('/')
+                .parse()
+                .map_err(|_| "Descarga inválida.")?;
+            crate::torrent_stream::native_url(window.app_handle(), token).await?
+        } else if let Some(referer) = args["referer"].as_str() {
+            crate::hls_proxy::start(id, address, referer, args["hls"] == true, &[])
+                .await?
+                .url
+        } else {
+            source(&window, address)?
+        };
+        args["source"] = Value::String(playback);
     }
     #[cfg(target_os = "android")]
     {

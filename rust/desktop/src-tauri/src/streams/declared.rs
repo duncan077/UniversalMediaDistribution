@@ -3,7 +3,7 @@ use dom_query::{Document, Selection};
 use reqwest::Url;
 use serde_json::Value;
 
-fn address(base: &Url, raw: &str, kind: &str) -> Option<Url> {
+pub(super) fn address(base: &Url, raw: &str, kind: &str) -> Option<Url> {
     if raw.trim().is_empty() || raw.len() > 16_384 {
         return None;
     }
@@ -12,7 +12,7 @@ fn address(base: &Url, raw: &str, kind: &str) -> Option<Url> {
         .then_some(url)
 }
 
-fn stream(base: &Url, raw: &str, mime: &str) -> Option<Stream> {
+pub(super) fn stream(base: &Url, raw: &str, mime: &str) -> Option<Stream> {
     media(address(base, raw, "media")?, mime)
 }
 
@@ -105,7 +105,7 @@ fn json_ld(doc: &Document) -> impl Iterator<Item = Value> + '_ {
         .into_iter()
 }
 
-pub(super) fn extract(base: &Url, doc: &Document) -> Option<Stream> {
+pub(in crate::streams) fn player(base: &Url, doc: &Document) -> Option<Stream> {
     for player in doc.select("video,audio").iter() {
         let direct = player
             .attr("src")
@@ -124,55 +124,10 @@ pub(super) fn extract(base: &Url, doc: &Document) -> Option<Stream> {
             return Some(found);
         }
     }
-    // Static media bindings published by these players. Never execute host scripts.
-    let host = base.host_str().unwrap_or("");
-    let hosts = [
-        "mixdrop.co",
-        "mixdrop.ag",
-        "mixdrop.to",
-        "mixdrop.is",
-        "streamtape.com",
-        "streamtape.to",
-        "filemoon.sx",
-        "filemoon.to",
-        "streamwish.to",
-        "streamwish.com",
-        "vidhide.com",
-        "vidhideplus.com",
-        "mp4upload.com",
-        "doodstream.com",
-        "dood.watch",
-        "dood.to",
-        "voe.sx",
-    ];
-    if hosts.iter().any(|h| {
-        host == *h
-            || host
-                .strip_suffix(h)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    }) {
-        static SOURCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r#"(?i)(?:\bMDCore\.wurl\s*=|\b(?:sources|playlist)\s*:\s*\[\s*\{\s*["']?(?:file|src)["']?\s*:)\s*["']([^\s"'<>]+)["']"#).unwrap()
-        });
-        for el in doc.select("script:not([src])").iter() {
-            for c in SOURCE.captures_iter(&el.text()) {
-                if let Some(hit) = stream(base, &c[1].replace("\\/", "/"), "") {
-                    return Some(hit);
-                }
-            }
-        }
-        for node in doc
-            .select("a#download-video[href],#robotlink,#ideoooolink")
-            .iter()
-        {
-            let raw = node.attr("href").unwrap_or_else(|| node.text());
-            if raw.trim_start().starts_with("//") || raw.trim_start().starts_with("https://") {
-                if let Some(hit) = stream(base, raw.trim(), "video/mp4") {
-                    return Some(hit);
-                }
-            }
-        }
-    }
+    None
+}
+
+pub(super) fn metadata(base: &Url, doc: &Document) -> Option<Stream> {
     for data in json_ld(doc) {
         if let Some(found) = video_objects(&data).find_map(|v| {
             stream(
@@ -205,25 +160,32 @@ pub(super) fn embed(base: &Url, doc: &Document) -> Option<Url> {
     {
         return Some(url);
     }
-    let selector = if super::matches_host(
-        base,
-        &[
-            "upzone.cc",
-            "upzone.to",
-            "upzone.net",
-            "upzone.link",
-            "nupload.top",
-            "nupload.me",
-        ],
-    ) {
+    let delegates = super::matches_host(base, super::hosters::protocols::NUPLOAD)
+        || super::matches_host(
+            base,
+            &[
+                "upzone.cc",
+                "upzone.to",
+                "upzone.net",
+                "upzone.link",
+                "frembed.pro",
+                "frembed.com",
+            ],
+        );
+    let selector = if delegates {
         "iframe[src]"
     } else {
         "iframe[allowfullscreen][src], iframe#player[src], iframe[allow*=fullscreen][src]"
     };
     let frames = doc.select(selector);
-    let mut urls = frames
+    let mut urls: Vec<_> = frames
         .iter()
-        .filter_map(|el| address(base, &el.attr("src")?, "subdocument"));
+        .filter_map(|el| address(base, &el.attr("src")?, "subdocument"))
+        .collect();
+    if delegates && urls.iter().any(super::hosters::known) {
+        urls.retain(super::hosters::known);
+    }
+    let mut urls = urls.into_iter();
     let first = urls.next()?;
     urls.all(|u| u == first).then_some(first)
 }

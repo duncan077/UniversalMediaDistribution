@@ -6,6 +6,30 @@ Checked 2026-09-09. This is a bounded sample, not a promise that every title or 
 
 All eight video providers receive the same `VideoHosterResolver` from `ApplicationComposition`. A supported host works across providers; there is no per-provider extractor allowlist. Matching uses URLs or player markup, not the displayed server name.
 
+## Rust retest on 2026-11-24
+
+The Tauri client inventoried the sources for one title in each of ten video providers. It used search when the recent list was empty. This check records which servers each provider returned and exercises selected sources through the Windows client.
+
+| Host or provider | Finding |
+| --- | --- |
+| Streamtape | JKAnime returned a player page whose path ends in the uploaded `.mp4` filename. Rust now sends these pages to the extractor and rejects HTML responses as direct video. The JKAnime retest returned video bytes with HTTP 206. |
+| Nupload | PelisPlus, PelisflixHD, and SeriesFlix returned `nupload.my`. The existing decoder and iframe routing now recognize this mirror. SeriesFlix returned a valid HLS playlist. The sampled PelisPlus and PelisflixHD links returned HTTP 404. |
+| Mixdrop | The JKAnime source on `mixdrop.top` redirected to `mxdrop.click` and served Mixdrop player markup. Rust recognizes both in wrapper selection. The retest returned video bytes with HTTP 206. |
+| Zilla | The sampled AnimeAV1 source exposed an HLS playlist, then returned HTTP 403 for the media segment. Rust now checks the initialization file and a media segment and surfaces the upstream error. |
+| Pixeldrain | The AnimeTMO sample was HTTP 404. The new resolver uses public file metadata and a byte-range request. It accepts a playable video when the service allows the file to be read from the playback context. [Pixeldrain API documentation](https://pixeldrain.com/api) |
+| Byse / Filemoon | The sampled Byse mirror did not yield a direct URL. The legacy player parser still handles static Filemoon pages. Byse offers an account API with API keys, and UMD retains the provider-player option for the sampled embed. [Byse](https://byse.sx/) |
+| HGCloud, UPNShare, and MEGA | The sampled pages did not expose a direct source to the Rust resolver. JKAnime labeled `hgcloud.to` as Streamwish, and the HGCloud response only displayed a loading page. UMD retains the provider-player option for these sources. |
+| PoseidonHD2 | The sampled wrapper published a VOE embed. VOE redirected to a mirror with the same video ID, but the final page did not yield a direct stream. |
+| Doramasflix and PelisPlus.to | Doramasflix search returned a title with only a provider-player option. The PelisPlus.to request failed before server discovery. |
+
+### Integrated playback for the remaining hosts
+
+- **UPNShare** uses the public resolver published by the AnimeAV1 player. The client keeps the file identifier from the fragment and follows a public HTTPS destination. The sampled identifier returned HTTP 404.
+- **MEGA** opens the official embed for a public file and keeps the share key in the fragment so the provider can decrypt the content in its own player. [MEGA public links](https://github.com/meganz/MEGAcmd/blob/master/UserGuide.md)
+- **Byse and HGCloud** open inside the filtered UMD player when extraction does not yield media. The Windows retest verified the route to the player for both providers. The HGCloud sample served a JavaScript loader.
+- **PoseidonHD2** follows the wrapper to the recognized VOE player. In the Windows retest the destination was `caseyseemavoid.com`, whose page asked the viewer to confirm they are human.
+- **Transfer to the native player** can use the video element's HTTPS address or HLS manifests observed after its media starts loading. An independent probe checks the media without browser cookies before transfer. A public MP4 from the filtered player passed this check in Windows. The remaining hosted samples were checked for routing only.
+
 ## Registered extractors
 
 ### FramexTV addition — 2026-10-19

@@ -724,6 +724,8 @@ pub fn run() {
             browse_online_catalog,
             native_player::native_playback,
             streams::resolve_video,
+            hls_proxy::web_stream_relay,
+            hls_proxy::close_stream_relay,
             streams::live_channels,
             providers::provider_locations,
             providers::json_provider_search,

@@ -1,13 +1,15 @@
 use crate::CommandResult;
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 use regex::Regex;
 use reqwest::Url;
+use serde::Serialize;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
@@ -24,27 +26,57 @@ struct Relay {
     page: Url,
     token: Uuid,
     origin: String,
-    resources: Arc<Mutex<HashMap<Uuid, Url>>>,
+    resources: Arc<Mutex<HashMap<Uuid, Resource>>>,
     permits: Arc<Semaphore>,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Auto,
+    Hls,
+    Subtitle,
+}
+
+#[derive(Clone)]
+struct Resource {
+    url: Url,
+    kind: Kind,
+}
+
+#[derive(Serialize)]
+pub struct Source {
+    pub url: String,
+    pub tracks: Vec<String>,
+}
+
 impl Relay {
-    fn link(&self, url: Url) -> CommandResult<String> {
+    fn link(&self, url: Url, kind: Kind) -> CommandResult<String> {
         if !umd_core::public_url::web_url(&url) {
             return Err("Dirección HLS inválida.".into());
         }
-        let id = Uuid::new_v5(&self.token, url.as_str().as_bytes());
+        let id = Uuid::new_v5(
+            &self.token,
+            &[&[kind as u8], url.as_str().as_bytes()].concat(),
+        );
         let mut map = self.resources.lock().map_err(|_| "Reproductor ocupado.")?;
         if map.len() >= 32768 && !map.contains_key(&id) {
             return Err("La transmisión publicó demasiados recursos.".into());
         }
-        map.insert(id, url);
-        Ok(format!("{}/{}/{id}", self.origin, self.token))
+        let name = match kind {
+            Kind::Hls => "stream.m3u8",
+            Kind::Subtitle => "track.vtt",
+            Kind::Auto if url.path().to_ascii_lowercase().ends_with(".mp4") => "video.mp4",
+            Kind::Auto => "media",
+        };
+        map.insert(id, Resource { url, kind });
+        Ok(format!("{}/{}/{id}/{name}", self.origin, self.token))
     }
     fn manifest(&self, base: &Url, body: &str) -> CommandResult<String> {
         if !body.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
             return Err("Lista HLS inválida.".into());
         }
         let mut out = String::new();
+        let mut variant = false;
         for line in body.trim_start_matches('\u{feff}').lines().map(str::trim) {
             if line.starts_with("#EXT-X-DEFINE") || line.contains("{$") {
                 return Err("La lista HLS usa variables externas.".into());
@@ -65,6 +97,14 @@ impl Relay {
                             &self.link(
                                 base.join(span.as_str())
                                     .map_err(|_| "Dirección HLS inválida.")?,
+                                if line.starts_with("#EXT-X-MEDIA:")
+                                    || line.starts_with("#EXT-X-I-FRAME-STREAM-INF:")
+                                    || line.starts_with("#EXT-X-RENDITION-REPORT:")
+                                {
+                                    Kind::Hls
+                                } else {
+                                    Kind::Auto
+                                },
                             )?,
                         );
                         at = span.end();
@@ -76,8 +116,17 @@ impl Relay {
                 } else {
                     out.push_str(line);
                 }
+                variant |= line.starts_with("#EXT-X-STREAM-INF:");
             } else if !line.is_empty() {
-                out.push_str(&self.link(base.join(line).map_err(|_| "Dirección HLS inválida.")?)?);
+                let kind = if std::mem::take(&mut variant) {
+                    Kind::Hls
+                } else {
+                    Kind::Auto
+                };
+                out.push_str(&self.link(
+                    base.join(line).map_err(|_| "Dirección HLS inválida.")?,
+                    kind,
+                )?);
             }
             out.push('\n');
         }
@@ -96,14 +145,20 @@ fn end_token(id: &str, token: Uuid) {
         }
     }
 }
-pub async fn start(args: &serde_json::Value, address: &str) -> CommandResult<String> {
+pub async fn start(
+    id: Uuid,
+    address: &str,
+    referer: &str,
+    hls: bool,
+    tracks: &[String],
+) -> CommandResult<Source> {
     let parse = |s: &str| {
         Url::parse(s)
             .ok()
             .filter(umd_core::public_url::web_url)
             .ok_or("Fuente HLS pública inválida.")
     };
-    let page = parse(args["referer"].as_str().unwrap_or(""))?;
+    let page = parse(referer)?;
     let url = parse(address)?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -119,8 +174,18 @@ pub async fn start(args: &serde_json::Value, address: &str) -> CommandResult<Str
         permits: Arc::new(Semaphore::new(6)),
     };
     let token = relay.token;
-    let root = relay.link(url)?;
-    let id = args["id"].as_str().ok_or("Sesión inválida.")?.to_owned();
+    let root = relay.link(url, if hls { Kind::Hls } else { Kind::Auto })?;
+    let tracks = tracks
+        .iter()
+        .take(100)
+        .map(|s| {
+            parse(s)
+                .ok()
+                .and_then(|url| relay.link(url, Kind::Subtitle).ok())
+                .unwrap_or_default()
+        })
+        .collect();
+    let id = id.to_string();
     let (tx, rx) = oneshot::channel();
     {
         let mut active = ACTIVE.lock().map_err(|_| "Reproductor ocupado.")?;
@@ -131,7 +196,10 @@ pub async fn start(args: &serde_json::Value, address: &str) -> CommandResult<Str
     }
     tauri::async_runtime::spawn(async move {
         let app = Router::new()
-            .route("/{token}/{resource}", get(resource))
+            .route(
+                "/{token}/{resource}/{name}",
+                get(resource).options(preflight),
+            )
             .with_state(relay);
         let _ = axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -140,17 +208,72 @@ pub async fn start(args: &serde_json::Value, address: &str) -> CommandResult<Str
             .await;
         end_token(&id, token);
     });
-    Ok(root)
+    Ok(Source { url: root, tracks })
+}
+
+#[tauri::command]
+pub async fn web_stream_relay(
+    window: tauri::WebviewWindow,
+    id: Uuid,
+    address: String,
+    referer: String,
+    hls: bool,
+    tracks: Vec<String>,
+) -> CommandResult<Source> {
+    if window.label() != "main" {
+        return Err("Acción reservada a la biblioteca.".into());
+    }
+    start(id, &address, &referer, hls, &tracks).await
+}
+
+#[tauri::command]
+pub fn close_stream_relay(window: tauri::WebviewWindow, id: Uuid) {
+    if window.label() == "main" {
+        end(&id.to_string());
+    }
+}
+
+fn origin(headers: &HeaderMap) -> Option<Option<HeaderValue>> {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return Some(None);
+    };
+    matches!(
+        origin.to_str().ok()?,
+        "http://tauri.localhost"
+            | "https://tauri.localhost"
+            | "tauri://localhost"
+            | "http://127.0.0.1:1420"
+            | "null"
+    )
+    .then(|| Some(origin.clone()))
+}
+
+async fn preflight(
+    State(relay): State<Relay>,
+    Path((token, _, _)): Path<(Uuid, Uuid, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Some(origin)) = origin(&headers).filter(|_| token == relay.token) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin)
+        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "range")
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD")
+        .header(header::VARY, "Origin")
+        .body(Body::empty())
+        .unwrap()
 }
 async fn resource(
     State(relay): State<Relay>,
-    Path((token, id)): Path<(Uuid, Uuid)>,
+    Path((token, id, _)): Path<(Uuid, Uuid, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if token != relay.token {
+    let Some(origin) = origin(&headers).filter(|_| token == relay.token) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    let Some(url) = relay
+    };
+    let Some(resource) = relay
         .resources
         .lock()
         .ok()
@@ -158,7 +281,7 @@ async fn resource(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(_permit) = relay.permits.try_acquire() else {
+    let Ok(permit) = relay.permits.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let range = headers
@@ -169,15 +292,7 @@ async fn resource(
                 && s.strip_prefix("bytes=")
                     .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
         });
-    let Ok(mut res) = crate::streams::fetch_media(
-        url,
-        Duration::from_secs(30),
-        Some(&relay.page),
-        range,
-        Some(&relay.page),
-    )
-    .await
-    else {
+    let Ok(res) = crate::streams::relay_media(resource.url, &relay.page, range).await else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let mime = res
@@ -187,38 +302,31 @@ async fn resource(
         .unwrap_or("application/octet-stream")
         .to_owned();
     let final_url = res.url().clone();
-    let mut is_list = mime.to_lowercase().contains("mpegurl")
+    let mime = mime.to_ascii_lowercase();
+    let is_list = resource.kind == Kind::Hls
+        || mime.contains("mpegurl")
         || final_url.path().to_ascii_lowercase().ends_with(".m3u8");
+    if mime.starts_with("text/html") || mime.contains("json") || mime.contains("javascript") {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     let mut builder = Response::builder()
         .status(res.status())
-        .header(header::CACHE_CONTROL, "no-store");
-    for key in [header::CONTENT_RANGE, header::ACCEPT_RANGES] {
-        if let Some(v) = res.headers().get(&key) {
-            builder = builder.header(key, v);
-        }
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::VARY, "Origin");
+    if let Some(origin) = origin {
+        builder = builder
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin)
+            .header(
+                header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                "Content-Range, Accept-Ranges, Content-Length",
+            );
     }
-    let mut bytes = Vec::new();
-    loop {
-        match res.chunk().await {
-            Ok(Some(chunk)) => {
-                if chunk.len() > (if is_list { 2 << 20 } else { 32 << 20 }) - bytes.len() {
-                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-        }
-    }
-    is_list |= bytes.starts_with(b"#EXTM3U");
     if is_list {
-        if bytes.len() > 2 << 20 {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let Ok(text) = crate::streams::bounded_text(res, 2 << 20).await else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
-        let Ok(text) = relay.manifest(&final_url, text) else {
+        let Ok(text) = relay.manifest(&final_url, &text) else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
         return builder
@@ -226,9 +334,34 @@ async fn resource(
             .body(text.into())
             .unwrap();
     }
+    for key in [
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::CONTENT_LENGTH,
+    ] {
+        if let Some(v) = res.headers().get(&key) {
+            builder = builder.header(key, v);
+        }
+    }
+    let mime = if resource.kind == Kind::Subtitle {
+        "text/vtt"
+    } else if mime.starts_with("video/") || mime.starts_with("audio/") {
+        &mime
+    } else {
+        "application/octet-stream"
+    };
+    let body =
+        futures_util::stream::try_unfold((res, permit), |(mut upstream, permit)| async move {
+            Ok::<_, reqwest::Error>(
+                upstream
+                    .chunk()
+                    .await?
+                    .map(|bytes| (bytes, (upstream, permit))),
+            )
+        });
     builder
         .header(header::CONTENT_TYPE, mime)
-        .body(bytes.into())
+        .body(Body::from_stream(body))
         .unwrap()
 }
 
@@ -253,7 +386,7 @@ mod tests {
             .lock()
             .unwrap()
             .values()
-            .any(|url| url.path() == "/a/low/index.m3u8"));
+            .any(|resource| resource.url.path() == "/a/low/index.m3u8"));
         assert!(relay
             .manifest(&base, "#EXTM3U\nfile:///tmp/file.ts")
             .is_err());

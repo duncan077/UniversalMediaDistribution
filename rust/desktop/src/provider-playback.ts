@@ -3,7 +3,7 @@ import {invoke} from "./bridge";
 import {attachPartyPlayer} from "./party";
 import type {Stream, Target} from "./player";
 
-interface Sample {position:number; duration:number|null; paused:boolean; ended:boolean; ready:number; seeking:boolean; seekable:boolean; plays:number; pauses:number; seeks:number}
+interface Sample {position:number; duration:number|null; paused:boolean; ended:boolean; ready:number; seeking:boolean; seekable:boolean; publicSource?:boolean; plays:number; pauses:number; seeks:number}
 interface Report {closed:boolean; media:Sample|null}
 type Action = "read" | "seek" | "pause" | "play" | "close";
 
@@ -92,7 +92,7 @@ export function followProvider(session:string,target:Target,label:string,resume:
       if (closed) return;
       if (result.closed) {panel.close();return;}
       const sample=result.media;
-      handoff.hidden = !sample;
+      handoff.hidden = !sample?.publicSource;
       if(!sample){
         if (media.sample) {persist(true);detach?.();detach=undefined;}
         media.update(null);
