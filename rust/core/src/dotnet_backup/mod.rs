@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, path::Path};
 use uuid::Uuid;
 
+mod settings;
+pub use settings::{legacy_private_settings, LegacyPrivateSettings};
+
 const DEFAULT_PROFILE: &str = "00000000-0000-0000-0000-000000000001";
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.into())
@@ -201,6 +204,27 @@ fn catalog(db: &Connection, version: i32) -> Result<CatalogDocument> {
         ])?;
         items.push(item);
     }
+    if db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type='table' AND name='catalog_tombstones')",
+        [], |r| r.get::<_, bool>(0),
+    )? {
+        let live_ids = items.iter().filter_map(|item| item.sync_id).collect::<std::collections::HashSet<_>>();
+        let mut statement = db.prepare("SELECT sync_id,media_type,subtype_code,name,clock,device_id,operation_id,modified_at FROM main.catalog_tombstones")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let id = Uuid::parse_str(&row.get::<_, String>(0)?)
+                .map_err(|_| invalid("Identidad de título eliminado inválida."))?;
+            let item: CatalogItem = serde_json::from_value(json!({
+                "syncId":id, "mediaType":row.get::<_, String>(1)?, "subtype":row.get::<_, String>(2)?,
+                "name":row.get::<_, String>(3)?, "deleted":true,
+                "syncVersion":{"clock":row.get::<_, i64>(4)?, "deviceId":row.get::<_, String>(5)?,
+                    "operationId":row.get::<_, String>(6)?, "modifiedAt":normalize_timestamp(&row.get::<_, String>(7)?)}
+            }))?;
+            if !live_ids.contains(&item.id()?) {
+                items.push(item);
+            }
+        }
+    }
     let catalog = CatalogDocument::new(items);
     catalog.validate()?;
     Ok(catalog)
@@ -246,12 +270,12 @@ fn profiles(source: &Connection, target: &Connection, catalog: &CatalogDocument)
         }
         user_state::save_state(target, id, &doc)?;
     }
+    let active = active.ok_or_else(|| invalid("El respaldo no tiene perfiles."))?;
     target.execute(
         "INSERT INTO rust_profile_selection VALUES(1,?1)",
-        [active
-            .ok_or_else(|| invalid("El respaldo no tiene perfiles."))?
-            .to_string()],
+        [active.to_string()],
     )?;
+    settings::import(source, target, active)?;
     Ok(())
 }
 

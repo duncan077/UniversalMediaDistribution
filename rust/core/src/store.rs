@@ -3,7 +3,10 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -12,8 +15,31 @@ use uuid::Uuid;
 pub struct CatalogStore(
     pub(crate) Arc<Mutex<Connection>>,
     pub(crate) Uuid,
-    pub(crate) Arc<Mutex<Option<(i64, CatalogMetadata)>>>,
+    pub(crate) Arc<Mutex<CatalogCaches>>,
 );
+
+#[derive(Default)]
+pub(crate) struct CatalogCaches {
+    metadata: Option<(i64, CatalogMetadata)>,
+    filters: Option<(i64, String, serde_json::Value)>,
+}
+
+pub struct CatalogReaders {
+    readers: Vec<CatalogStore>,
+    next: AtomicUsize,
+}
+
+pub struct EncodedCatalogPage {
+    pub continuation_token: Option<String>,
+    pub body: Vec<u8>,
+}
+
+impl CatalogReaders {
+    pub fn get(&self) -> CatalogStore {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[index].clone()
+    }
+}
 
 impl CatalogStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -39,15 +65,46 @@ impl CatalogStore {
         Ok(Self(
             Arc::new(Mutex::new(connection)),
             Uuid::parse_str(&profile).map_err(|_| Error::Invalid("Perfil inválido.".into()))?,
-            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(CatalogCaches::default())),
         ))
+    }
+
+    pub fn readers(&self, count: usize) -> Result<CatalogReaders> {
+        let path = self
+            .0
+            .lock()
+            .map_err(|_| Error::Lock)?
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
+        let mut readers = Vec::new();
+        if let Some(path) = path {
+            for _ in 0..count.max(1) {
+                let mut reader = Self::open_read_only(&path)?;
+                reader.2 = self.2.clone();
+                readers.push(reader);
+            }
+        } else {
+            readers.push(self.clone());
+        }
+        Ok(CatalogReaders {
+            readers,
+            next: AtomicUsize::new(0),
+        })
     }
 
     fn configure_connection(connection: &Connection) -> Result<()> {
         crate::filters::register(connection)?;
         connection.busy_timeout(Duration::from_secs(10))?;
         connection.set_prepared_statement_cache_capacity(64);
-        connection.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-8000;")?;
+        let cache_kib = if cfg!(target_os = "android") {
+            2000
+        } else {
+            8000
+        };
+        connection.execute_batch(&format!(
+            "PRAGMA temp_store=MEMORY; PRAGMA cache_size=-{cache_kib};"
+        ))?;
         Ok(())
     }
 
@@ -115,12 +172,25 @@ impl CatalogStore {
                 WHERE id NOT IN (SELECT id FROM rust_catalog_arrivals) ORDER BY rowid;
              CREATE TABLE IF NOT EXISTS rust_catalog_summary(
                 id TEXT PRIMARY KEY REFERENCES rust_catalog(id) ON DELETE CASCADE,
-                summary TEXT NOT NULL);
+                summary TEXT NOT NULL, is_adult INTEGER);
              DELETE FROM rust_catalog_summary WHERE id NOT IN (SELECT id FROM rust_catalog);
              INSERT INTO rust_catalog_summary(id,summary)
                 SELECT id,{SUMMARY_SQL} FROM rust_catalog
                 WHERE id NOT IN (SELECT id FROM rust_catalog_summary);"
         ))?;
+        let adult_column = tx
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('rust_catalog_summary') WHERE name='is_adult'",
+            )?
+            .exists([])?;
+        if !adult_column {
+            tx.execute_batch("ALTER TABLE rust_catalog_summary ADD COLUMN is_adult INTEGER")?;
+        }
+        tx.execute_batch("UPDATE rust_catalog_summary AS s SET is_adult=(
+           EXISTS(SELECT 1 FROM json_each(s.summary,'$.genres') tag WHERE tag.type='text' AND umd_adult_tag(tag.value))
+           OR EXISTS(SELECT 1 FROM json_each(s.summary,'$.categories') tag WHERE tag.type='text' AND umd_adult_tag(tag.value))
+           OR umd_adult_rating(CASE WHEN json_type(s.summary,'$.contentRating')='text' THEN s.summary->>'contentRating' END))
+           WHERE is_adult IS NULL")?;
         let profile = crate::profiles::initialize(&tx)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS rust_sync_origins(
@@ -133,16 +203,22 @@ impl CatalogStore {
         Ok(Self(
             Arc::new(Mutex::new(connection)),
             profile,
-            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(CatalogCaches::default())),
         ))
     }
 
     pub fn import(&self, document: &CatalogDocument, replace: bool) -> Result<usize> {
         document.validate()?;
+        let prepared = prepare_import(document)?;
         let mut connection = self.0.lock().map_err(|_| Error::Lock)?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        Self::import_into(&transaction, document, replace)?;
+        Self::write_import(
+            &transaction,
+            document,
+            replace,
+            prepared.into_iter().map(Ok),
+        )?;
         transaction.commit()?;
         Ok(document.items.len())
     }
@@ -152,31 +228,44 @@ impl CatalogStore {
         document: &CatalogDocument,
         replace: bool,
     ) -> Result<()> {
+        Self::import_rows(transaction, document, replace, true)
+    }
+
+    pub(crate) fn import_rows(
+        transaction: &Connection,
+        document: &CatalogDocument,
+        replace: bool,
+        include_tombstones: bool,
+    ) -> Result<()> {
+        Self::write_import(
+            transaction,
+            document,
+            replace,
+            document
+                .items
+                .iter()
+                .filter(|item| include_tombstones || !item.deleted)
+                .map(PreparedItem::new),
+        )
+    }
+
+    fn write_import<'a>(
+        transaction: &Connection,
+        document: &CatalogDocument,
+        replace: bool,
+        rows: impl IntoIterator<Item = Result<PreparedItem<'a>>>,
+    ) -> Result<()> {
         if replace {
             transaction.execute("DELETE FROM rust_catalog_summary", [])?;
             transaction.execute("DELETE FROM rust_catalog", [])?;
             transaction.execute("DELETE FROM rust_catalog_tombstones", [])?;
         }
-        // Most items already carry their identity, so they are written as they
-        // are. Only an item whose identity has to be filled in is copied.
-        let with_identity = |item: &CatalogItem, id: Uuid| -> Result<String> {
-            Ok(if item.sync_id == Some(id) {
-                serde_json::to_string(item)?
-            } else {
-                let mut owned = item.clone();
-                owned.sync_id = Some(id);
-                serde_json::to_string(&owned)?
-            })
-        };
-        for item in &document.items {
-            let id = item.id()?.to_string();
+        for row in rows {
+            let row = row?;
+            let item = row.item;
+            let id = row.id.to_string();
             if item.deleted {
                 transaction.execute("DELETE FROM rust_catalog_arrivals WHERE id=?1", [&id])?;
-                let payload = with_identity(
-                    item,
-                    Uuid::parse_str(&id)
-                        .map_err(|_| Error::Invalid("Invalid stored identity".into()))?,
-                )?;
                 transaction
                     .prepare_cached("DELETE FROM rust_catalog_summary WHERE id=?1")?
                     .execute([&id])?;
@@ -188,7 +277,7 @@ impl CatalogStore {
                         "INSERT INTO rust_catalog_tombstones(id,payload) VALUES(?1,?2)
                      ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
                     )?
-                    .execute(params![id, payload])?;
+                    .execute(params![id, row.payload])?;
                 continue;
             }
             // An old ID-free export can refresh an entry already imported with
@@ -196,7 +285,7 @@ impl CatalogStore {
             let stored_id: Option<String> = if item.sync_id.is_none() {
                 let mut lookup = transaction
                     .prepare_cached("SELECT id FROM rust_catalog WHERE name_key=?1 LIMIT 2")?;
-                let mut matches = lookup.query([item.key()])?;
+                let mut matches = lookup.query([&row.key])?;
                 let first = matches.next()?.map(|row| row.get(0)).transpose()?;
                 if matches.next()?.is_some() {
                     return Err(Error::Invalid(format!(
@@ -208,12 +297,14 @@ impl CatalogStore {
             } else {
                 None
             };
-            let id = stored_id.unwrap_or(id);
-            let payload = with_identity(
-                item,
-                Uuid::parse_str(&id)
-                    .map_err(|_| Error::Invalid("Invalid stored identity".into()))?,
-            )?;
+            let (id, payload, summary) = if let Some(old_id) = stored_id.filter(|old| old != &id) {
+                let identity = Uuid::parse_str(&old_id)
+                    .map_err(|_| Error::Invalid("Invalid stored identity".into()))?;
+                let (payload, summary) = encode_item(item, identity)?;
+                (old_id, payload, summary)
+            } else {
+                (id, row.payload, row.summary)
+            };
             transaction.execute("INSERT INTO rust_catalog_changes(id,changed_at) SELECT id,?3 FROM rust_catalog WHERE id=?1 AND payload!=?2 ON CONFLICT(id) DO UPDATE SET changed_at=excluded.changed_at", params![id,payload,now()])?;
             transaction
                 .prepare_cached(
@@ -222,16 +313,11 @@ impl CatalogStore {
                  name_key=excluded.name_key,media_type=excluded.media_type,
                  search_text=excluded.search_text,payload=excluded.payload",
                 )?
-                .execute(params![
-                    id,
-                    item.key(),
-                    item.media_type.to_lowercase(),
-                    item.search_text(),
-                    payload
-                ])?;
+                .execute(params![id, row.key, row.media, row.search, payload])?;
             transaction
-                .prepare_cached(SUMMARY_UPSERT_SQL)?
-                .execute(params![id, payload])?;
+                .prepare_cached("INSERT INTO rust_catalog_summary(id,summary,is_adult) VALUES(?1,?2,?3)
+                    ON CONFLICT(id) DO UPDATE SET summary=excluded.summary,is_adult=excluded.is_adult")?
+                .execute(params![id, summary, row.adult])?;
             transaction
                 .prepare_cached(
                     "INSERT INTO rust_catalog_arrivals(id) VALUES(?1) ON CONFLICT(id) DO NOTHING",
@@ -315,6 +401,93 @@ impl CatalogStore {
         self.filtered_page(query, 500, false, &[])
     }
 
+    /// Public pages can reuse the validated, compact JSON stored in SQLite.
+    pub fn encode_public_page(
+        &self,
+        query: &CatalogQuery,
+        search: bool,
+        max: usize,
+    ) -> Result<EncodedCatalogPage> {
+        query.validate_limit(if search { 500 } else { 100 })?;
+        let cursor = canonical_cursor(query)?;
+        let count = query.limit.unwrap_or(50) as usize;
+        let (filter, mut args) = page_filter(self.1, query, false);
+        args.extend([cursor.into(), (count as i64 + 1).into()]);
+        let column = if query.filters.summary {
+            "s.summary"
+        } else {
+            "c.payload"
+        };
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let _tx = db.unchecked_transaction()?;
+        let (revision, stamp, source) = state(&db)?;
+        let mut body = Vec::with_capacity(max.min(64 << 10));
+        if !search {
+            body.extend_from_slice(format!(r#"{{"revision":{revision},"document":"#).as_bytes());
+        }
+        document_prefix(&mut body, &stamp, source.as_deref())?;
+        const CLOSED: &[u8] = b"]}";
+        const CURSOR_FIELD: &[u8] = br#","continuationToken":"#;
+        let min_footer = CLOSED.len()
+            + if search {
+                0
+            } else {
+                CURSOR_FIELD.len() + b"null}".len()
+            };
+        if body.len() + min_footer > max {
+            return Err(Error::DocumentTooLarge(max));
+        }
+        let mut statement = db.prepare_cached(&format!(
+            "SELECT c.id,{column}{filter} AND c.id>? ORDER BY c.id LIMIT ?"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(&args))?;
+        let mut added = Vec::new();
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            let payload = raw_text(row, 1)?;
+            if added.len() == count
+                || body.len() + payload.len() + usize::from(!added.is_empty()) + min_footer > max
+            {
+                more = true;
+                break;
+            }
+            let key: String = row.get(0)?;
+            added.push((body.len(), key));
+            if added.len() > 1 {
+                body.push(b',');
+            }
+            body.extend_from_slice(payload);
+        }
+        if more && !search {
+            let extra = 34 - b"null".len();
+            while body.len() + min_footer + extra > max {
+                let (offset, _) = added.pop().ok_or(Error::DocumentTooLarge(max))?;
+                body.truncate(offset);
+            }
+        }
+        let continuation_token = if more {
+            let (_, id) = added.last().ok_or(Error::DocumentTooLarge(max))?;
+            Some(
+                Uuid::parse_str(id)
+                    .map_err(|_| Error::Invalid("Identidad de catálogo inválida.".into()))?
+                    .simple()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        body.extend_from_slice(CLOSED);
+        if !search {
+            body.extend_from_slice(CURSOR_FIELD);
+            serde_json::to_writer(&mut body, &continuation_token)?;
+            body.push(b'}');
+        }
+        Ok(EncodedCatalogPage {
+            continuation_token,
+            body,
+        })
+    }
+
     pub fn display_page(
         &self,
         query: &CatalogQuery,
@@ -334,50 +507,9 @@ impl CatalogStore {
         let connection = self.0.lock().map_err(|_| Error::Lock)?;
         let _snapshot = connection.unchecked_transaction()?;
         let (revision, updated_at, source_label) = state(&connection)?;
-        let media = query.media_type.as_ref().map(|v| v.to_lowercase());
-        let q = normalize(&query.q);
-        let cursor = query
-            .cursor
-            .as_ref()
-            .map(|value| {
-                Uuid::parse_str(value)
-                    .map(|id| id.to_string())
-                    .map_err(|_| Error::Invalid("Invalid catalog cursor".into()))
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let cursor = canonical_cursor(query)?;
         let limit = query.limit.unwrap_or(50) as usize;
-        let mut filter = String::from(
-            " FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE instr(c.search_text,?1)>0
-            AND (?2 IS NULL OR c.media_type=?2)
-            AND (?3=0 OR EXISTS(SELECT 1 FROM rust_favorites f WHERE f.id=c.id AND f.profile_id=?4))",
-        );
-        let mut args: Vec<rusqlite::types::Value> = vec![
-            q.into(),
-            media.into(),
-            i64::from(query.favorites_only).into(),
-            self.1.to_string().into(),
-        ];
-        if let Some(list_id) = query.filters.list_id {
-            args.push(list_id.to_string().into());
-            filter.push_str(
-                " AND c.id IN (
-                    SELECT member.value->>'itemId'
-                    FROM rust_profiles p
-                    CROSS JOIN json_each(p.document,'$.lists') list
-                    CROSS JOIN json_each(list.value,'$.items') member
-                    WHERE p.id=?4 AND list.value->>'id'=?5
-                    AND COALESCE(list.value->>'isDeleted',0)=0
-                )",
-            );
-        }
-        crate::filters::apply(&query.filters, &mut filter, &mut args);
-        const HIDE_ADULT_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM json_each(s.summary,'$.genres') tag WHERE tag.value IS NOT NULL AND umd_adult_tag(tag.value))
-            AND NOT EXISTS (SELECT 1 FROM json_each(s.summary,'$.categories') tag WHERE tag.value IS NOT NULL AND umd_adult_tag(tag.value))
-            AND NOT umd_adult_rating(s.summary->>'contentRating')";
-        if hide_adult {
-            filter.push_str(HIDE_ADULT_SQL);
-        }
+        let (filter, mut args) = page_filter(self.1, query, hide_adult);
         let total: i64 = connection
             .prepare_cached(&format!("SELECT count(*){filter}"))?
             .query_row(rusqlite::params_from_iter(&args), |row| row.get(0))?;
@@ -402,9 +534,11 @@ impl CatalogStore {
             // The cursor includes the relative position in the same ordered result, across pages.
             let place = format!("?{}", args.len() + 1);
             format!(
-                "WITH filtered AS (SELECT c.id,c.payload,s.summary {filter}), ranked AS (SELECT c.id AS id,{projection} AS doc,{rank} AS rank FROM filtered c)
-                SELECT doc FROM ranked WHERE (rank,id)>=(COALESCE((SELECT rank FROM ranked WHERE id={place}),(SELECT {rank} FROM rust_catalog_summary c WHERE c.id={place}),CASE WHEN {place}='' THEN 0 ELSE 1 END),{place})
-                AND id!={place} ORDER BY rank,id LIMIT ?"
+                "WITH filtered AS (SELECT c.id,s.summary {filter}), ranked AS (SELECT c.id AS id,{rank} AS rank FROM filtered c),
+                selected AS (SELECT id,rank FROM ranked WHERE (rank,id)>=(COALESCE((SELECT rank FROM ranked WHERE id={place}),(SELECT {rank} FROM rust_catalog_summary c WHERE c.id={place}),CASE WHEN {place}='' THEN 0 ELSE 1 END),{place})
+                AND id!={place} ORDER BY rank,id LIMIT ?)
+                SELECT docs.{projection} FROM selected JOIN {documents} docs ON docs.id=selected.id ORDER BY selected.rank,selected.id",
+                documents = if query.filters.summary { "rust_catalog_summary" } else { "rust_catalog" },
             )
         };
         let mut statement = connection.prepare_cached(&sql)?;
@@ -426,21 +560,23 @@ impl CatalogStore {
         } else {
             None
         };
-        let favorites_sql = if hide_adult {
-            format!(
-                "SELECT f.id FROM rust_favorites f JOIN rust_catalog_summary s ON s.id=f.id WHERE f.profile_id=?1{HIDE_ADULT_SQL} ORDER BY f.id"
-            )
-        } else {
-            "SELECT id FROM rust_favorites WHERE profile_id=?1 ORDER BY id".into()
-        };
-        let mut favorites = connection.prepare_cached(&favorites_sql)?;
-        let favorite_ids = favorites
-            .query_map([self.1.to_string()], |row| row.get::<_, String>(0))?
-            .map(|row| {
-                Uuid::parse_str(&row?)
-                    .map_err(|_| Error::Invalid("Invalid favorite identity".into()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut favorite_ids = Vec::new();
+        {
+            let favorites_sql = if hide_adult {
+                format!(
+                    "SELECT f.id FROM rust_favorites f JOIN rust_catalog_summary s ON s.id=f.id WHERE f.profile_id=?1{HIDE_ADULT_SQL} ORDER BY f.id"
+                )
+            } else {
+                "SELECT id FROM rust_favorites WHERE profile_id=?1 ORDER BY id".into()
+            };
+            let mut favorites = connection.prepare_cached(&favorites_sql)?;
+            for row in favorites.query_map([self.1.to_string()], |row| row.get::<_, String>(0))? {
+                favorite_ids.push(
+                    Uuid::parse_str(&row?)
+                        .map_err(|_| Error::Invalid("Invalid favorite identity".into()))?,
+                );
+            }
+        }
         let mut document = CatalogDocument::new(items);
         document.exported_at = updated_at;
         document.source_label = source_label;
@@ -464,7 +600,62 @@ impl CatalogStore {
     pub fn export_with_limit(&self, max: usize) -> Result<Option<CatalogDocument>> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.unchecked_transaction()?;
-        let bytes: i64 = tx.query_row(
+        Self::bounded_export(&tx, max)
+    }
+
+    /// Uses one SQLite snapshot for both the cache validator and its response.
+    pub fn encode_current(
+        &self,
+        known: Option<&str>,
+        max: usize,
+    ) -> Result<(String, Option<Vec<u8>>)> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let tx = db.unchecked_transaction()?;
+        let (revision, updated_at, source) = state(&tx)?;
+        let validator = format!("\"{revision}-{updated_at}\"");
+        let unchanged = known.is_some_and(|header| {
+            header.split(',').any(|value| {
+                let value = value.trim();
+                value == "*" || value.strip_prefix("W/").unwrap_or(value) == validator
+            })
+        });
+        let document = if unchanged {
+            None
+        } else {
+            let mut statement = tx.prepare("SELECT payload FROM rust_catalog ORDER BY id")?;
+            let rows = statement.query([])?;
+            Some(encode_document(rows, &updated_at, source.as_deref(), max)?)
+        };
+        Ok((format!("W/{validator}"), document))
+    }
+
+    pub fn encode_recent(&self, max: usize) -> Result<Vec<u8>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut statement = db.prepare_cached("SELECT s.summary FROM rust_catalog_arrivals a JOIN rust_catalog_summary s ON s.id=a.id ORDER BY a.rowid DESC LIMIT 12")?;
+        let rows = statement.query([])?;
+        encode_document(rows, &now(), Some("Universal Media Distribution"), max)
+    }
+
+    pub fn encode_public_item(&self, id: Uuid, max: usize) -> Result<Option<Vec<u8>>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut statement = db.prepare_cached("SELECT payload FROM rust_catalog WHERE id=?1")?;
+        let mut rows = statement.query([id.to_string()])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let payload = raw_text(row, 0)?;
+        let mut body = Vec::with_capacity(payload.len().saturating_add(256).min(max));
+        document_prefix(&mut body, &now(), Some("Universal Media Distribution"))?;
+        if body.len() + payload.len() + 2 > max {
+            return Err(Error::DocumentTooLarge(max));
+        }
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"]}");
+        Ok(Some(body))
+    }
+
+    fn bounded_export(db: &Connection, max: usize) -> Result<Option<CatalogDocument>> {
+        let bytes: i64 = db.query_row(
             "SELECT coalesce(sum(octet_length(payload)),0) FROM rust_catalog",
             [],
             |r| r.get(0),
@@ -472,7 +663,7 @@ impl CatalogStore {
         if bytes > max as i64 {
             return Ok(None);
         }
-        Self::export_from(&tx).map(Some)
+        Self::export_from(db).map(Some)
     }
 
     pub(crate) fn export_from(connection: &Connection) -> Result<CatalogDocument> {
@@ -488,19 +679,46 @@ impl CatalogStore {
         Ok(document)
     }
 
+    pub(crate) fn summaries_from(connection: &Connection) -> Result<CatalogDocument> {
+        let mut statement =
+            connection.prepare("SELECT summary FROM rust_catalog_summary ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let summary: String = row.get(0)?;
+            items.push(serde_json::from_str(&summary)?);
+        }
+        Ok(CatalogDocument::new(items))
+    }
+
     pub fn filter_choices(&self) -> Result<serde_json::Value> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let _snapshot = db.unchecked_transaction()?;
+        let (revision, updated, _) = state(&db)?;
+        if let Some((_, _, value)) = self
+            .2
+            .lock()
+            .map_err(|_| Error::Lock)?
+            .filters
+            .as_ref()
+            .filter(|(rev, stamp, _)| *rev == revision && *stamp == updated)
+        {
+            return Ok(value.clone());
+        }
         let values = |sql: &str| -> Result<Vec<String>> {
             let mut stmt = db.prepare(sql)?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         };
         let distributors=format!("SELECT DISTINCT name FROM (SELECT org.value->>'name' name FROM rust_catalog_summary s,json_each(s.summary,'$.contributors') org WHERE coalesce(lower(org.value->>'kind'),'organization')='organization' AND EXISTS(SELECT 1 FROM json_each(org.value,'$.credits') c WHERE lower(trim(c.value->>'role')) IN {}) UNION SELECT p.key FROM rust_catalog_summary s,json_each(s.summary,'$.onlineProviders') p) WHERE name IS NOT NULL ORDER BY name COLLATE NOCASE",crate::filters::DISTRIBUTOR_ROLES_SQL);
-        Ok(serde_json::json!({
+        let choices = serde_json::json!({
             "category":values("SELECT DISTINCT CAST(c.value AS TEXT) FROM rust_catalog_summary s,json_each(s.summary,'$.categories') c WHERE c.type='text' ORDER BY 1 COLLATE NOCASE")?,
             "year":values("SELECT DISTINCT CAST(summary->>'releaseYear' AS TEXT) FROM rust_catalog_summary WHERE summary->>'releaseYear' IS NOT NULL ORDER BY 1 DESC")?,
             "distributor":values(&distributors)?
-        }))
+        });
+        self.2.lock().map_err(|_| Error::Lock)?.filters =
+            Some((revision, updated, choices.clone()));
+        Ok(choices)
     }
     pub fn home_recent(&self) -> Result<serde_json::Value> {
         let added = self.recently_added()?;
@@ -533,6 +751,7 @@ impl CatalogStore {
             .2
             .lock()
             .map_err(|_| Error::Lock)?
+            .metadata
             .as_ref()
             .filter(|(rev, meta)| *rev == revision && meta.updated_at == updated_at)
             .map(|(_, meta)| meta.clone())
@@ -540,28 +759,66 @@ impl CatalogStore {
             return Ok(cached);
         }
         let computed = Self::metadata_from(&connection)?;
-        *self.2.lock().map_err(|_| Error::Lock)? = Some((computed.revision, computed.clone()));
+        self.2.lock().map_err(|_| Error::Lock)?.metadata =
+            Some((computed.revision, computed.clone()));
         Ok(computed)
     }
 
     pub fn publish(&self, document: &CatalogDocument) -> Result<CatalogMetadata> {
         document.validate()?;
+        let prepared = prepare_import(document)?;
         let mut connection = self.0.lock().map_err(|_| Error::Lock)?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        Self::import_into(&transaction, document, true)?;
+        Self::write_import(&transaction, document, true, prepared.into_iter().map(Ok))?;
         let metadata = Self::metadata_from(&transaction)?;
         transaction.commit()?;
-        *self.2.lock().map_err(|_| Error::Lock)? = Some((metadata.revision, metadata.clone()));
+        self.2.lock().map_err(|_| Error::Lock)?.metadata =
+            Some((metadata.revision, metadata.clone()));
         Ok(metadata)
     }
 
     fn metadata_from(connection: &Connection) -> Result<CatalogMetadata> {
-        let revision = state(connection)?.0;
-        let document = Self::export_from(connection)?;
-        let updated_at = document.exported_at.clone();
-        let item_count = document.items.len();
-        let sha256 = format!("{:X}", Sha256::digest(serde_json::to_vec(&document)?));
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (revision, updated_at, source_label) = state(connection)?;
+        let mut hash = HashWriter(Sha256::new());
+        // Hash the same compact JSON as export(), one typed row at a time.
+        hash.0.update(
+            br#"{"format":"universal-media-distribution.catalog","version":1,"exportedAt":"#,
+        );
+        serde_json::to_writer(&mut hash, &updated_at)?;
+        hash.0.update(br#","sourceLabel":"#);
+        serde_json::to_writer(&mut hash, &source_label)?;
+        hash.0.update(br#","items":["#);
+        let mut statement = connection.prepare("SELECT payload FROM rust_catalog ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        let mut item_count = 0;
+        while let Some(row) = rows.next()? {
+            if item_count != 0 {
+                hash.0.update(b",");
+            }
+            let item: CatalogItem =
+                serde_json::from_str(row.get_ref(0)?.as_str().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?)?;
+            serde_json::to_writer(&mut hash, &item)?;
+            item_count += 1;
+        }
+        hash.0.update(b"]}");
+        let sha256 = format!("{:X}", hash.0.finalize());
         Ok(CatalogMetadata {
             revision,
             updated_at,
@@ -572,18 +829,41 @@ impl CatalogStore {
 
     pub fn party_titles(&self, media_type: &str, name: &str) -> Result<Vec<Uuid>> {
         let key = friend_item_key(media_type, name);
+        let (media, name) = key.split_once(':').unwrap();
+        let types: &[&str] = match media {
+            "movie" => &[
+                "movie",
+                "series",
+                "anime_movie",
+                "anime_series",
+                "documentary",
+                "short",
+            ],
+            "book" => &[
+                "book",
+                "novel",
+                "manga",
+                "comic",
+                "light_novel",
+                "web_novel",
+            ],
+            "audio" => &["album", "single", "audiobook", "podcast", "radio_drama"],
+            _ => return Ok(Vec::new()),
+        };
+        let keys: Vec<_> = types
+            .iter()
+            .map(|kind| format!("{media}:{kind}:{name}"))
+            .collect();
         let db = self.0.lock().map_err(|_| Error::Lock)?;
-        let mut stmt=db.prepare_cached("SELECT c.id,json_extract(s.summary,'$.name') FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE c.media_type=?1 ORDER BY c.id")?;
-        let mut rows = stmt.query([media_type.trim().to_ascii_lowercase()])?;
+        let mut stmt=db.prepare_cached("SELECT id FROM rust_catalog WHERE name_key IN (SELECT value FROM json_each(?1)) ORDER BY id")?;
+        let mut rows = stmt.query([serde_json::to_string(&keys)?])?;
         let mut matches = Vec::new();
         while let Some(row) = rows.next()? {
-            if friend_item_key(media_type, &row.get::<_, String>(1)?) == key {
-                matches.push(
-                    row.get::<_, String>(0)?
-                        .parse()
-                        .map_err(|_| Error::Invalid("Identidad de catálogo inválida.".into()))?,
-                );
-            }
+            matches.push(
+                row.get::<_, String>(0)?
+                    .parse()
+                    .map_err(|_| Error::Invalid("Identidad de catálogo inválida.".into()))?,
+            );
         }
         Ok(matches)
     }
@@ -615,6 +895,20 @@ impl CatalogStore {
             .map(|text| serde_json::from_str(&text))
             .transpose()
             .map_err(Into::into)
+    }
+
+    pub fn summaries(&self, ids: &[Uuid]) -> Result<Vec<CatalogItem>> {
+        let connection = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut query = connection.prepare_cached(
+            "SELECT s.summary FROM json_each(?1) ids JOIN rust_catalog_summary s ON s.id=ids.value ORDER BY ids.key",
+        )?;
+        let mut rows = query.query([serde_json::to_string(ids)?])?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            items.push(serde_json::from_str(&json)?);
+        }
+        Ok(items)
     }
 
     pub fn set_favorite(&self, id: Uuid, enabled: bool) -> Result<()> {
@@ -651,7 +945,7 @@ impl CatalogStore {
         Self::import_into(&tx, &CatalogDocument::new(vec![item.clone()]), false)?;
         tx.commit()?;
         if let Ok(mut cache) = self.2.lock() {
-            *cache = None;
+            *cache = CatalogCaches::default();
         }
         Ok(item)
     }
@@ -670,7 +964,7 @@ impl CatalogStore {
         Self::import_into(&transaction, &CatalogDocument::new(vec![item]), false)?;
         transaction.commit()?;
         if let Ok(mut cache) = self.2.lock() {
-            *cache = None;
+            *cache = CatalogCaches::default();
         }
         Ok(true)
     }
@@ -747,9 +1041,216 @@ use rusqlite::OptionalExtension;
 /// a filter or a search result needs.
 pub(crate) const SUMMARY_SQL: &str =
     "json_remove(payload,'$.units','$.seasons','$.sources','$.distributionRights')";
-const SUMMARY_UPSERT_SQL: &str = "INSERT INTO rust_catalog_summary(id,summary)
-    VALUES(?1,json_remove(?2,'$.units','$.seasons','$.sources','$.distributionRights'))
-    ON CONFLICT(id) DO UPDATE SET summary=excluded.summary";
+
+fn raw_text<'a>(row: &'a rusqlite::Row<'_>, column: usize) -> Result<&'a [u8]> {
+    row.get_ref(column)?
+        .as_str()
+        .map(str::as_bytes)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+            .into()
+        })
+}
+
+fn document_prefix(body: &mut Vec<u8>, stamp: &str, source: Option<&str>) -> Result<()> {
+    body.extend_from_slice(
+        br#"{"format":"universal-media-distribution.catalog","version":1,"exportedAt":"#,
+    );
+    serde_json::to_writer(&mut *body, stamp)?;
+    body.extend_from_slice(br#","sourceLabel":"#);
+    serde_json::to_writer(&mut *body, &source)?;
+    body.extend_from_slice(br#","items":["#);
+    Ok(())
+}
+
+fn encode_document(
+    mut rows: rusqlite::Rows<'_>,
+    stamp: &str,
+    source: Option<&str>,
+    max: usize,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(max.min(64 << 10));
+    document_prefix(&mut body, stamp, source)?;
+    if body.len() + 2 > max {
+        return Err(Error::DocumentTooLarge(max));
+    }
+    let mut separator = 0;
+    while let Some(row) = rows.next()? {
+        let data = raw_text(row, 0)?;
+        if body.len() + data.len() + separator + 2 > max {
+            return Err(Error::DocumentTooLarge(max));
+        }
+        if separator != 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(data);
+        separator = 1;
+    }
+    body.extend_from_slice(b"]}");
+    Ok(body)
+}
+
+struct PreparedItem<'a> {
+    item: &'a CatalogItem,
+    id: Uuid,
+    key: String,
+    media: String,
+    search: String,
+    payload: String,
+    summary: String,
+    adult: bool,
+}
+
+impl<'a> PreparedItem<'a> {
+    fn new(item: &'a CatalogItem) -> Result<Self> {
+        let id = item.id()?;
+        let (payload, summary) = encode_item(item, id)?;
+        let (key, media, search) = if item.deleted {
+            Default::default()
+        } else {
+            (
+                item.key(),
+                item.media_type.to_lowercase(),
+                item.search_text(),
+            )
+        };
+        Ok(Self {
+            item,
+            id,
+            key,
+            media,
+            search,
+            payload,
+            summary,
+            adult: item.adult(),
+        })
+    }
+}
+
+fn encode_item(item: &CatalogItem, id: Uuid) -> Result<(String, String)> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row<'a> {
+        sync_id: Uuid,
+        media_type: &'a str,
+        subtype: &'a str,
+        name: &'a str,
+        deleted: bool,
+        #[serde(flatten)]
+        metadata: std::collections::BTreeMap<&'a str, &'a serde_json::Value>,
+    }
+    let mut row = Row {
+        sync_id: id,
+        media_type: &item.media_type,
+        subtype: &item.subtype,
+        name: &item.name,
+        deleted: item.deleted,
+        metadata: item
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+    };
+    let payload = serde_json::to_string(&row)?;
+    if item.deleted {
+        return Ok((payload, String::new()));
+    }
+    for key in ["units", "seasons", "sources", "distributionRights"] {
+        row.metadata.remove(key);
+    }
+    Ok((payload, serde_json::to_string(&row)?))
+}
+
+fn prepare_import(document: &CatalogDocument) -> Result<Vec<PreparedItem<'_>>> {
+    let thread_limit = if cfg!(target_os = "android") { 2 } else { 4 };
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = available
+        .min(thread_limit)
+        .min(document.items.len().div_ceil(128));
+    if workers < 2 {
+        return document.items.iter().map(PreparedItem::new).collect();
+    }
+    std::thread::scope(|scope| {
+        let part = document.items.len().div_ceil(workers);
+        let jobs: Vec<_> = document
+            .items
+            .chunks(part)
+            .map(|items| {
+                scope.spawn(move || {
+                    items
+                        .iter()
+                        .map(PreparedItem::new)
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect();
+        let mut rows = Vec::with_capacity(document.items.len());
+        for job in jobs {
+            rows.extend(
+                job.join()
+                    .map_err(|_| Error::Invalid("No se pudo preparar el catálogo.".into()))??,
+            );
+        }
+        Ok(rows)
+    })
+}
+
+fn canonical_cursor(query: &CatalogQuery) -> Result<String> {
+    Ok(query
+        .cursor
+        .as_ref()
+        .map(|value| {
+            Uuid::parse_str(value)
+                .map(|id| id.to_string())
+                .map_err(|_| Error::Invalid("Invalid catalog cursor".into()))
+        })
+        .transpose()?
+        .unwrap_or_default())
+}
+
+const HIDE_ADULT_SQL: &str = " AND NOT s.is_adult";
+
+fn page_filter(
+    profile: Uuid,
+    query: &CatalogQuery,
+    hide_adult: bool,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let media = query.media_type.as_ref().map(|v| v.to_lowercase());
+    let q = normalize(&query.q);
+    let mut filter = String::from(
+            " FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE instr(c.search_text,?1)>0
+            AND (?2 IS NULL OR c.media_type=?2)
+            AND (?3=0 OR EXISTS(SELECT 1 FROM rust_favorites f WHERE f.id=c.id AND f.profile_id=?4))",
+        );
+    let mut args: Vec<rusqlite::types::Value> = vec![
+        q.into(),
+        media.into(),
+        i64::from(query.favorites_only).into(),
+        profile.to_string().into(),
+    ];
+    if let Some(list_id) = query.filters.list_id {
+        args.push(list_id.to_string().into());
+        filter.push_str(
+            " AND c.id IN (
+                    SELECT member.value->>'itemId'
+                    FROM rust_profiles p
+                    CROSS JOIN json_each(p.document,'$.lists') list
+                    CROSS JOIN json_each(list.value,'$.items') member
+                    WHERE p.id=?4 AND list.value->>'id'=?5
+                    AND COALESCE(list.value->>'isDeleted',0)=0
+                )",
+        );
+    }
+    crate::filters::apply(&query.filters, &mut filter, &mut args);
+    if hide_adult {
+        filter.push_str(HIDE_ADULT_SQL);
+    }
+    (filter, args)
+}
 
 fn state(connection: &Connection) -> Result<(i64, String, Option<String>)> {
     Ok(connection

@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net11.0</TargetFramework>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\UniversalMediaDistribution.Torrenting.Abstractions\UniversalMediaDistribution.Torrenting.Abstractions.csproj" />
-  </ItemGroup>
-</Project>

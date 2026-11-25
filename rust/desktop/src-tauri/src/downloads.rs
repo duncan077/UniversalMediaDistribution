@@ -7,13 +7,13 @@ use serde::Serialize;
 use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 pub struct Downloads {
     pub(crate) fast_resume: std::sync::atomic::AtomicBool,
     root: PathBuf,
     private_session: OnceCell<Arc<Session>>,
-    session: OnceCell<Arc<Session>>,
+    session: Mutex<Option<Arc<Session>>>,
 }
 
 impl Downloads {
@@ -22,14 +22,43 @@ impl Downloads {
             root,
             fast_resume: true.into(),
             private_session: OnceCell::new(),
-            session: OnceCell::new(),
+            session: Mutex::new(None),
         }
     }
-    async fn session(&self) -> CommandResult<&Arc<Session>> {
-        self.session
-            .get_or_try_init(|| async {
-                let files = self.root.join("files");
-                std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
+    async fn public(&self, create: bool, resume: bool) -> CommandResult<Option<Arc<Session>>> {
+        let mut session = self.session.lock().await;
+        if session.is_none() {
+            if !create {
+                if !resume {
+                    return Ok(None);
+                }
+                let path = self.root.join("session/session.json");
+                let saved = work(move || {
+                    let file = match std::fs::File::open(path) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(false)
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    #[derive(serde::Deserialize)]
+                    struct Persisted {
+                        torrents: std::collections::HashMap<String, serde::de::IgnoredAny>,
+                    }
+                    let state: Persisted = serde_json::from_reader(std::io::BufReader::new(file))
+                        .map_err(|e| e.to_string())?;
+                    Ok(!state.torrents.is_empty())
+                })
+                .await?;
+                if !saved {
+                    return Ok(None);
+                }
+            }
+            let files = self.root.join("files");
+            tokio::fs::create_dir_all(&files)
+                .await
+                .map_err(|e| e.to_string())?;
+            *session = Some(
                 Session::new_with_opts(
                     files,
                     SessionOptions {
@@ -45,9 +74,22 @@ impl Downloads {
                     },
                 )
                 .await
-                .map_err(|e| format!("No se pudo iniciar BitTorrent. {e}"))
-            })
-            .await
+                .map_err(|e| format!("No se pudo iniciar BitTorrent. {e}"))?,
+            );
+        }
+        Ok(session.clone())
+    }
+
+    async fn stop_empty_public(&self, current: &Arc<Session>) {
+        let mut slot = self.session.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|session| Arc::ptr_eq(session, current))
+            && current.with_torrents(|torrents| torrents.next().is_none())
+        {
+            current.stop().await;
+            *slot = None;
+        }
     }
     async fn private(&self) -> CommandResult<&Arc<Session>> {
         self.private_session
@@ -69,11 +111,22 @@ impl Downloads {
             })
             .await
     }
-    pub(super) async fn for_id(&self, id: usize) -> CommandResult<(&Arc<Session>, usize)> {
+    pub(super) async fn for_id(&self, id: usize) -> CommandResult<(Arc<Session>, usize)> {
         if id >= PRIVATE_ID {
-            Ok((self.private().await?, id - PRIVATE_ID))
+            Ok((
+                self.private_session
+                    .get()
+                    .cloned()
+                    .ok_or("No se encontró la descarga.")?,
+                id - PRIVATE_ID,
+            ))
         } else {
-            Ok((self.session().await?, id))
+            Ok((
+                self.public(false, true)
+                    .await?
+                    .ok_or("No se encontró la descarga.")?,
+                id,
+            ))
         }
     }
 }
@@ -182,15 +235,20 @@ pub async fn clear_profile(
             let (private, raw) = key.split_once(':').ok_or("Identidad torrent inválida.")?;
             let id = raw.parse().map_err(|_| "Identidad torrent inválida.")?;
             let session = if private == "private" {
-                downloads.private().await?
+                downloads.private_session.get().cloned()
             } else {
-                downloads.session().await?
+                downloads.public(false, true).await?
             };
-            if session.get(TorrentIdOrHash::Hash(id)).is_some() {
+            if let Some(session) =
+                session.filter(|session| session.get(TorrentIdOrHash::Hash(id)).is_some())
+            {
                 session
                     .delete(TorrentIdOrHash::Hash(id), true)
                     .await
                     .map_err(|_| "No se pudo eliminar una descarga del perfil.")?;
+                if private != "private" {
+                    downloads.stop_empty_public(&session).await;
+                }
             }
         }
         members.remove(&user);
@@ -353,12 +411,15 @@ pub async fn add_download(
             (AddTorrent::from_bytes(bytes), hash, false)
         }
     };
-    let session = if use_private {
-        downloads.private().await?
-    } else {
-        downloads.session().await?
-    };
     let _owner_guard = OWNERS.lock().await;
+    let session = if use_private {
+        downloads.private().await?.clone()
+    } else {
+        downloads
+            .public(true, true)
+            .await?
+            .ok_or("No se pudo iniciar BitTorrent.")?
+    };
     let task = session.add_torrent(
         source,
         Some(AddTorrentOptions {
@@ -418,15 +479,8 @@ pub async fn list_downloads(
 ) -> CommandResult<Vec<Download>> {
     let mut results = Vec::new();
     for (session, offset) in [
-        (
-            if active_only == Some(true) {
-                downloads.session.get()
-            } else {
-                Some(downloads.session().await?)
-            },
-            0,
-        ),
-        (downloads.private_session.get(), PRIVATE_ID),
+        (downloads.public(false, active_only != Some(true)).await?, 0),
+        (downloads.private_session.get().cloned(), PRIVATE_ID),
     ] {
         let Some(session) = session else { continue };
         results.extend(session.with_torrents(|items| {
@@ -477,11 +531,17 @@ pub async fn delete_download(
     delete_files: bool,
     downloads: State<'_, Downloads>,
 ) -> CommandResult<()> {
+    let _owner_guard = OWNERS.lock().await;
+    let public = id < PRIVATE_ID;
     let (session, id) = downloads.for_id(id).await?;
     session
         .delete(TorrentIdOrHash::Id(id), delete_files)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if public {
+        downloads.stop_empty_public(&session).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -553,10 +613,11 @@ pub async fn catalog_download_files(
         return Err("Referencia al torrent inválida.".into());
     }
     let session = if private {
-        downloads.private().await?
+        downloads.private_session.get().cloned()
     } else {
-        downloads.session().await?
-    };
+        downloads.public(false, true).await?
+    }
+    .ok_or("Agregá el torrent de esta edición a Descargas.")?;
     let id = session
         .get(TorrentIdOrHash::Hash(
             hash.parse().map_err(|_| "Hash de torrent inválido.")?,
@@ -808,5 +869,6 @@ pub async fn torrent_options(
             downloads.fast_resume.store(on, Ordering::Relaxed);
         }
         Ok(downloads.fast_resume.load(Ordering::Relaxed))
-    }).await
+    })
+    .await
 }

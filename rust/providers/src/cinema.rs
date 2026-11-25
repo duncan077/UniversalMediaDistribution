@@ -431,14 +431,26 @@ impl Provider {
             return Ok(seasons);
         }
         let mut total = 0;
-        for (n, url) in pages {
-            let html = self.html(url.as_str()).await?;
-            let eps = list_episodes(&self::links(&self.base, &Document::from(html)), n)?;
-            total += eps.units.len();
-            if total > 20000 {
-                return Err(invalid());
+        let pages: Vec<_> = pages.into_iter().collect();
+        for batch in pages.chunks(3) {
+            let results = self
+                .request_batch(batch.to_vec(), |mut worker, (n, url)| async move {
+                    let html = worker.html(url.as_str()).await?;
+                    let base = worker.base;
+                    tokio::task::spawn_blocking(move || {
+                        list_episodes(&self::links(&base, &Document::from(html)), n)
+                    })
+                    .await
+                    .map_err(|_| invalid())?
+                })
+                .await?;
+            for ((n, _), eps) in batch.iter().zip(results) {
+                total += eps.units.len();
+                if total > 20000 {
+                    return Err(invalid());
+                }
+                seasons.insert(*n, eps);
             }
-            seasons.insert(n, eps);
         }
         Ok(seasons)
     }

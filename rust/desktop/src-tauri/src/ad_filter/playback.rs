@@ -3,6 +3,55 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bounds {
+    pub(super) x: f64,
+    pub(super) y: f64,
+    pub(super) width: f64,
+    pub(super) height: f64,
+    pub(super) page_width: f64,
+}
+
+impl Bounds {
+    pub(super) fn validate(self) -> CommandResult<Self> {
+        let dimensions = [self.x, self.y, self.width, self.height, self.page_width];
+        if dimensions.iter().all(|v| (0.0..=32_768.0).contains(v))
+            && self.width >= 1.0
+            && self.height >= 1.0
+            && self.page_width >= 1.0
+        {
+            Ok(self)
+        } else {
+            Err("Tamaño de reproductor inválido.".into())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn provider_layout(
+    window: tauri::WebviewWindow,
+    session: Uuid,
+    bounds: Bounds,
+    focus: Option<bool>,
+) -> CommandResult<()> {
+    if window.label() != "main" {
+        return Err("Acción reservada a la biblioteca.".into());
+    }
+    let bounds = bounds.validate()?;
+    #[cfg(windows)]
+    return super::windows::layout(window.app_handle(), session, bounds, focus.unwrap_or_default());
+    #[cfg(target_os = "linux")]
+    return super::linux::layout(window.app_handle(), session, bounds, focus.unwrap_or_default());
+    #[cfg(target_os = "android")]
+    return super::android::layout(window.app_handle(), session, bounds, focus).await;
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    {
+        let _ = (session, bounds, focus);
+        Err("Plataforma no compatible.".into())
+    }
+}
+
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -24,8 +73,6 @@ pub struct Sample {
     plays: u32,
     pauses: u32,
     seeks: u32,
-    #[serde(default, rename = "publicSource")]
-    public_source: bool,
 }
 #[derive(Serialize)]
 pub struct Report {
@@ -54,31 +101,13 @@ pub async fn provider_playback(
         position
     );
     #[cfg(windows)]
-    let result = {
-        let Some(child) = window.get_webview_window(&format!("provider-{session}")) else {
-            return Ok(Report {
-                closed: true,
-                media: None,
-            });
-        };
-        if action == Action::Close {
-            child.destroy().map_err(|e| e.to_string())?;
-            return Ok(Report {
-                closed: true,
-                media: None,
-            });
-        }
-        let (send, mut recv) = tokio::sync::mpsc::channel(1);
-        child
-            .eval_with_callback(script, move |value| {
-                let _ = send.try_send(value);
-            })
-            .map_err(|e| e.to_string())?;
-        tokio::time::timeout(std::time::Duration::from_secs(4), recv.recv())
-            .await
-            .map_err(|_| "El reproductor no respondió.")?
-            .ok_or("Se cerró el reproductor.")?
-    };
+    let result = super::windows::command(
+        window.app_handle(),
+        session,
+        script,
+        action == Action::Close,
+    )
+    .await?;
     #[cfg(target_os = "android")]
     let result = super::android::command(
         window.app_handle(),
@@ -106,6 +135,9 @@ pub async fn provider_playback(
             media: None,
         });
     }
+    if action != Action::Close && super::online() {
+        super::player_in_use();
+    }
     let media: Option<Sample> =
         serde_json::from_str(&result).map_err(|_| "Respuesta de reproducción inválida.")?;
     let media =
@@ -120,7 +152,7 @@ pub async fn provider_playback(
 pub async fn provider_public_stream(
     window: tauri::WebviewWindow,
     session: Uuid,
-) -> CommandResult<crate::streams::Stream> {
+) -> CommandResult<Handoff> {
     if window.label() != "main" {
         return Err("Acción reservada a la biblioteca.".into());
     }
@@ -137,6 +169,8 @@ pub async fn provider_public_stream(
     struct Observed {
         page: String,
         addresses: Vec<String>,
+        position: f64,
+        paused: bool,
     }
     let observed: Observed = serde_json::from_str(&raw).map_err(|_| unavailable)?;
     let parse = |raw: &str| {
@@ -156,7 +190,11 @@ pub async fn provider_public_stream(
             .filter_map(|raw| parse(raw))
         {
             if let Ok(stream) = crate::streams::probe_public_media(address, &page).await {
-                return Ok(stream);
+                return Ok(Handoff {
+                    stream,
+                    position: observed.position.max(0.0),
+                    paused: observed.paused,
+                });
             }
         }
         Err(unavailable.to_owned())
@@ -165,4 +203,11 @@ pub async fn provider_public_stream(
     tokio::time::timeout(std::time::Duration::from_secs(20), resolution)
         .await
         .map_err(|_| unavailable.to_owned())?
+}
+
+#[derive(Serialize)]
+pub struct Handoff {
+    stream: crate::streams::Stream,
+    position: f64,
+    paused: bool,
 }

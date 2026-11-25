@@ -88,7 +88,10 @@ fn account_snapshot(document: &Value, catalog: &mut CatalogDocument) -> Result<V
         if let Ok(key) = id(&reference["itemId"]) {
             referenced.insert(crate::reconcile_catalog::destination(key, &redirects)?);
         } else if let Some(item) = titles.resolve(&redirects, reference) {
-            referenced.insert(crate::reconcile_catalog::destination(item.id()?, &redirects)?);
+            referenced.insert(crate::reconcile_catalog::destination(
+                item.id()?,
+                &redirects,
+            )?);
         }
     }
     let mut selected = without_items(document);
@@ -311,7 +314,9 @@ impl Titles {
                     "missing:{media}:{name}:{sub}"
                 ))));
             }
-            return Err(invalid("El respaldo contiene una referencia sin identidad."));
+            return Err(invalid(
+                "El respaldo contiene una referencia sin identidad.",
+            ));
         };
         let mut seen = HashSet::new();
         while let Some(next) = self.redirects.get(&key) {
@@ -519,7 +524,7 @@ fn merge_personal(
 /// A copy of a backup without its catalog items. Merging personal state reads
 /// only the personal collections, so copying every title with them held two
 /// or three extra catalogs in memory during a sync.
-fn without_items(document: &Value) -> Value {
+pub(crate) fn without_items(document: &Value) -> Value {
     let Some(fields) = document.as_object() else {
         return document.clone();
     };
@@ -586,10 +591,7 @@ impl CatalogStore {
     /// SQLite counts this connection's writes and other connections' commits separately.
     pub fn sync_marker(&self) -> Result<(u64, i64)> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
-        Ok((
-            db.total_changes(),
-            db.query_row("PRAGMA data_version", [], |r| r.get(0))?,
-        ))
+        connection_marker(&db)
     }
     /// Merge under the same write lock as local edits. The caller uploads the
     /// returned document with the revision it read and retries on conflicts.
@@ -642,22 +644,42 @@ impl CatalogStore {
         } else {
             validate_backup_with_limit
         };
-        let mut remote_catalog = remote
-            .map(|r| validate(r, max))
-            .transpose()?;
+        let mut remote_catalog = remote.map(|r| validate(r, max)).transpose()?;
         let scoped_remote = if personal {
-            remote.zip(remote_catalog.as_mut())
+            remote
+                .zip(remote_catalog.as_mut())
                 .map(|(doc, catalog)| account_snapshot(doc, catalog))
                 .transpose()?
         } else {
             None
         };
         let remote = scoped_remote.as_ref().or(remote);
-        let mut db = self.0.lock().map_err(|_| Error::Lock)?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for _ in 0..5 {
+            if let Some(result) =
+                self.reconcile_attempt(remote, remote_catalog.as_ref(), max, personal, restore)?
+            {
+                return Ok(result);
+            }
+        }
+        Err(invalid(
+            "La biblioteca cambió durante la sincronización. Volvé a intentar.",
+        ))
+    }
+
+    fn reconcile_attempt(
+        &self,
+        remote: Option<&Value>,
+        remote_catalog: Option<&CatalogDocument>,
+        max: usize,
+        personal: bool,
+        restore: Option<(&str, Uuid, i64)>,
+    ) -> Result<Option<(bool, Option<Value>)>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let marker = connection_marker(&db)?;
+        let tx = db.unchecked_transaction()?;
         let original = read_state(&tx, self.1)?;
         let mut local_catalog = if personal {
-            scoped_catalog(&tx, &original, remote_catalog.as_ref(), remote)?
+            scoped_catalog(&tx, &original, remote_catalog, remote)?
         } else {
             Self::export_from(&tx)?
         };
@@ -676,6 +698,8 @@ impl CatalogStore {
         }
         let shared: bool =
             tx.query_row("SELECT count(*)>1 FROM rust_profiles", [], |r| r.get(0))?;
+        tx.commit()?;
+        drop(db);
         let mut local = original.clone();
         if restore.is_some() {
             for field in COLLECTIONS {
@@ -686,7 +710,7 @@ impl CatalogStore {
         }
         bind_legacy_targets(&mut local, &local_catalog)?;
         let mut right = remote.map_or(Value::Null, without_items);
-        if let Some(catalog) = &remote_catalog {
+        if let Some(catalog) = remote_catalog {
             bind_legacy_targets(&mut right, catalog)?;
         }
         // The catalog items of `output` are written once the merge is known.
@@ -716,7 +740,7 @@ impl CatalogStore {
         let empty = CatalogDocument::new(vec![]);
         let merged = crate::reconcile_catalog::merge(
             &local_catalog,
-            remote_catalog.as_ref().unwrap_or(&empty),
+            remote_catalog.unwrap_or(&empty),
             titles.redirects,
         )?;
         titles.redirects = merged.redirects;
@@ -806,7 +830,10 @@ impl CatalogStore {
         });
         output["catalogRedirects"] = if let Some(ids) = &referenced {
             Value::Array(
-                complete_redirects.as_array().into_iter().flatten()
+                complete_redirects
+                    .as_array()
+                    .into_iter()
+                    .flatten()
                     .filter(|row| redirect_reaches(&row["fromId"], &titles.redirects, ids))
                     .cloned()
                     .collect(),
@@ -817,9 +844,7 @@ impl CatalogStore {
         output["catalog"]["items"] = Value::Array(
             outgoing
                 .into_iter()
-                .filter(|(key, _)| {
-                    referenced.as_ref().is_none_or(|ids| ids.contains(key))
-                })
+                .filter(|(key, _)| referenced.as_ref().is_none_or(|ids| ids.contains(key)))
                 .map(|(_, item)| item)
                 .collect(),
         );
@@ -860,7 +885,9 @@ impl CatalogStore {
         if let Some(ids) = &referenced {
             additions.retain(|item| {
                 !item.deleted
-                    && item.id().is_ok_and(|key| ids.contains(&key) && !live_ids.contains(&key))
+                    && item
+                        .id()
+                        .is_ok_and(|key| ids.contains(&key) && !live_ids.contains(&key))
             });
         }
         let can_redirect = |id: &&Uuid| {
@@ -884,6 +911,12 @@ impl CatalogStore {
             || !additions.is_empty()
             || !obsolete.is_empty()
             || !obsolete_tombstones.is_empty();
+        let mut db = self.0.lock().map_err(|_| Error::Lock)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // total_changes covers this connection and data_version covers other WAL writers.
+        if connection_marker(&tx)? != marker {
+            return Ok(None);
+        }
         if !additions.is_empty() {
             Self::import_into(&tx, &CatalogDocument::new(additions), false)?;
         }
@@ -1026,6 +1059,13 @@ impl CatalogStore {
             self.write_backup_revision(&tx, server, account, revision)?;
         }
         tx.commit()?;
-        Ok((changed, upload.then_some(output)))
+        Ok(Some((changed, upload.then_some(output))))
     }
+}
+
+fn connection_marker(db: &rusqlite::Connection) -> Result<(u64, i64)> {
+    Ok((
+        db.total_changes(),
+        db.query_row("PRAGMA data_version", [], |r| r.get(0))?,
+    ))
 }

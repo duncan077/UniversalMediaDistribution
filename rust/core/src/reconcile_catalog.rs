@@ -40,27 +40,35 @@ const COLLECTIONS: [&str; 10] = [
     "onlineProviders",
 ];
 
-fn priority(item: &CatalogItem) -> (i64, String, String, bool, String) {
+fn priority(item: &CatalogItem) -> (i64, &str, &str, bool) {
     let v = item.metadata.get("syncVersion").unwrap_or(&Value::Null);
-    let scalar = match serde_json::to_value(item) {
-        Ok(mut scalar) => {
-            if let Some(fields) = scalar.as_object_mut() {
-                for key in COLLECTIONS {
-                    fields.remove(key);
-                }
-                fields.remove("syncId");
-            }
-            scalar.to_string()
-        }
-        Err(_) => String::new(),
-    };
     (
         v["clock"].as_i64().unwrap_or_default(),
-        v["deviceId"].as_str().unwrap_or_default().into(),
-        v["operationId"].as_str().unwrap_or_default().into(),
+        v["deviceId"].as_str().unwrap_or_default(),
+        v["operationId"].as_str().unwrap_or_default(),
         item.deleted,
-        scalar,
     )
+}
+fn scalar_priority(item: &CatalogItem) -> String {
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Field<'a> {
+        Text(&'a str),
+        Deleted(bool),
+        Metadata(&'a Value),
+    }
+    let mut fields = std::collections::BTreeMap::from([
+        ("name", Field::Text(&item.name)),
+        ("mediaType", Field::Text(&item.media_type)),
+        ("subtype", Field::Text(&item.subtype)),
+        ("deleted", Field::Deleted(item.deleted)),
+    ]);
+    for (key, value) in &item.metadata {
+        if key != "syncId" && !COLLECTIONS.contains(&key.as_str()) {
+            fields.insert(key, Field::Metadata(value));
+        }
+    }
+    serde_json::to_string(&fields).unwrap_or_default()
 }
 fn order_collection(v: &mut Value) {
     if let Value::Array(rows) = v {
@@ -82,6 +90,7 @@ fn fold(left: &CatalogItem, right: &CatalogItem) -> CatalogItem {
     }
     let (winner, other) = if priority(left)
         .cmp(&priority(right))
+        .then_with(|| scalar_priority(left).cmp(&scalar_priority(right)))
         .then_with(|| {
             serde_json::to_string(&left.metadata)
                 .unwrap_or_default()

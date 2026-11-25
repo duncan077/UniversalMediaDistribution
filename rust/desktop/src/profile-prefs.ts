@@ -38,15 +38,27 @@ export function clearProfilePrefs(profileId: string, storage: KeyValueStore = lo
   for (const key of keys) storage.removeItem(key);
 }
 
-export function preferredProvidersForProfile(profileId: string, storage: KeyValueStore = localStorage): string[] {
-  const scopedPrefix = profilePrefKey(profileId, "provider-favorite-");
-  const legacyPrefix = "provider-favorite-";
+export function providerEnabled(profileId: string | null, id: string, storage: KeyValueStore = localStorage): boolean {
+  return getProfilePref(profileId, "provider-enabled-" + id, storage) !== "false";
+}
+
+function providerPrefIds(profileId: string, keyPrefix: string, storage: KeyValueStore): string[] {
+  const scopedPrefix = profilePrefKey(profileId, keyPrefix);
   const providers = new Set<string>();
   for (let i = 0; i < storage.length; i++) {
     const key = storage.key(i);
     if (!key) continue;
     if (key.startsWith(scopedPrefix)) providers.add(key.slice(scopedPrefix.length));
-    else if (key.startsWith(legacyPrefix)) providers.add(key.slice(legacyPrefix.length));
+    else if (key.startsWith(keyPrefix)) providers.add(key.slice(keyPrefix.length));
   }
-  return [...providers].filter(id => getProfilePref(profileId, legacyPrefix + id, storage) === "true");
+  return [...providers];
+}
+
+export function disabledProvidersForProfile(profileId: string, storage: KeyValueStore = localStorage): string[] {
+  return providerPrefIds(profileId, "provider-enabled-", storage).filter(id => !providerEnabled(profileId, id, storage));
+}
+
+export function preferredProvidersForProfile(profileId: string, storage: KeyValueStore = localStorage): string[] {
+  return providerPrefIds(profileId, "provider-favorite-", storage)
+    .filter(id => providerEnabled(profileId, id, storage) && getProfilePref(profileId, "provider-favorite-" + id, storage) === "true");
 }

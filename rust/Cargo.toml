@@ -20,7 +20,7 @@ umd-core = { path = "core" }
 # stays on: the server turns a panicking request into a 500, and a panicking
 # command must not take the whole app down.
 [profile.release]
-lto = "thin"
+lto = true
 codegen-units = 1
 strip = "debuginfo"
 

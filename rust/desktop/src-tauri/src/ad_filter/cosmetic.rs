@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 const SCRIPTLETS: &[&str] = &[
     "abort-current-script",
@@ -17,21 +18,17 @@ const SCRIPTLETS: &[&str] = &[
     "remove-class",
     "set-constant",
 ];
-const LIBRARY: &str = include_str!(
-    "../../../../../src/UniversalMediaDistribution.ContentFiltering/Resources/scriptlets.js"
-);
-const RUNTIME: &str = include_str!(
-    "../../../../../src/UniversalMediaDistribution.ContentFiltering/Resources/runtime.js"
-);
+const LIBRARY: &str = include_str!("scriptlets.js");
+const RUNTIME: &str = include_str!("runtime.js");
 const SEED: &str = include_str!("../../player-assets/player-ad-slots.js");
 
 #[derive(Default)]
 pub(super) struct Rules {
-    by_domain: HashMap<String, Vec<Rule>>,
+    by_domain: HashMap<String, Vec<Arc<Rule>>>,
 }
 struct Rule {
-    body: String,
-    excluded: Vec<String>,
+    body: Box<str>,
+    excluded: Box<[Box<str>]>,
     exception: bool,
     generic: bool,
 }
@@ -54,7 +51,7 @@ impl Rules {
         let mut exclude = Vec::new();
         for d in domains.split(',').filter(|s| !s.is_empty()) {
             if let Some(v) = d.strip_prefix('~') {
-                exclude.push(v.to_ascii_lowercase());
+                exclude.push(v.to_ascii_lowercase().into_boxed_str());
             } else {
                 include.push(d.to_ascii_lowercase());
             }
@@ -66,13 +63,14 @@ impl Rules {
         if generic {
             include.push(String::new());
         }
+        let rule = Arc::new(Rule {
+            body: body.into(),
+            excluded: exclude.into_boxed_slice(),
+            exception,
+            generic,
+        });
         for d in include {
-            self.by_domain.entry(d).or_default().push(Rule {
-                body: body.into(),
-                excluded: exclude.clone(),
-                exception,
-                generic,
-            });
+            self.by_domain.entry(d).or_default().push(rule.clone());
         }
     }
     fn config(&self, host: &str, constrained: bool) -> Value {

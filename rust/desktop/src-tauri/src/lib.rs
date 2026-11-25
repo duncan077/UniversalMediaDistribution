@@ -17,6 +17,8 @@ mod metadata;
 mod native_player;
 mod private_files;
 mod providers;
+#[cfg(target_os = "android")]
+mod reader_tiles;
 mod remote;
 mod streams;
 mod torrent_manifest;
@@ -77,10 +79,50 @@ async fn work<T: Send + 'static>(
         .map_err(|error| error.to_string())?
 }
 
-pub(crate) struct CatalogReads(CatalogStore);
+pub(crate) struct CatalogReads(umd_core::CatalogReaders);
 
 #[derive(Default)]
 struct LibraryStartup(tokio::sync::OnceCell<CommandResult<()>>);
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HomeBootstrap {
+    page: LibraryPage,
+    recent: serde_json::Value,
+    continuing: Vec<serde_json::Value>,
+    lists: Vec<serde_json::Value>,
+    server_address: String,
+}
+
+#[tauri::command]
+async fn home_bootstrap(
+    query: CatalogQuery,
+    hide_adult: bool,
+    preferred_providers: Vec<String>,
+    profile_id: Uuid,
+    reader: State<'_, CatalogReads>,
+) -> CommandResult<HomeBootstrap> {
+    let reader = reader.0.get();
+    work(move || {
+        let profile = reader.for_profile(profile_id).map_err(|e| e.to_string())?;
+        let get = || -> umd_core::Result<HomeBootstrap> {
+            Ok(HomeBootstrap {
+                page: profile.display_page(&query, hide_adult, &preferred_providers)?,
+                recent: reader.home_recent()?,
+                continuing: profile.continue_items(hide_adult, 12)?,
+                lists: profile.personal_lists()?,
+                server_address: reader.setting("server_url")?.unwrap_or_default(),
+            })
+        };
+        get().map_err(|e| e.to_string())
+    }).await
+}
+
+#[tauri::command]
+async fn library_summaries(ids: Vec<Uuid>, reader: State<'_, CatalogReads>) -> CommandResult<Vec<umd_core::CatalogItem>> {
+    let store = reader.0.get();
+    work(move || store.summaries(&ids).map_err(|e| e.to_string())).await
+}
 
 #[tauri::command]
 async fn initialize_library(
@@ -101,7 +143,7 @@ fn open_library(app: &tauri::AppHandle) -> CommandResult<()> {
     };
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let (store, db) = database::LocalDatabase::open(directory.clone())?;
-    let reader = db.open_reader()?;
+    let reader = store.readers(if cfg!(target_os = "android") { 2 } else { 4 }).map_err(|e| e.to_string())?;
     let capibara = capibara::Capibara::new().map_err(|e| e.to_string())?;
     providers::setup_sources(&store)?;
     ad_filter::setup(app, &directory, &store).map_err(|e| e.to_string())?;
@@ -114,15 +156,38 @@ fn open_library(app: &tauri::AppHandle) -> CommandResult<()> {
     app.manage(downloads);
     app.manage(capibara);
     app.manage(CatalogReads(reader));
+    app.state::<artwork::Origin>().set(store.setting("server_url").ok().flatten().and_then(|url| reqwest::Url::parse(&url).ok()));
+    if let Ok(cache) = app.path().app_cache_dir() {
+        app.state::<artwork::Origin>().set_cache(cache);
+    }
     app.manage(store);
     app.manage(db);
+    #[cfg(desktop)]
+    updates::desktop::started();
     Ok(())
 }
 
 #[tauri::command]
 async fn profiles(reader: State<'_, CatalogReads>) -> CommandResult<umd_core::Profiles> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || store.profiles().map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn legacy_preferences(
+    profile_id: Uuid,
+    reader: State<'_, CatalogReads>,
+) -> CommandResult<Option<serde_json::Value>> {
+    let store = reader.0.get();
+    work(move || {
+        store.for_profile(profile_id).map_err(|e| e.to_string())?;
+        store
+            .setting(&format!("legacy-prefs-{profile_id}"))
+            .map_err(|e| e.to_string())?
+            .map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string()))
+            .transpose()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -131,7 +196,7 @@ async fn resume_item(
     hide_adult: bool,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<Option<serde_json::Value>> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
         store
             .for_profile(profile_id).map_err(|e| e.to_string())?
@@ -148,7 +213,7 @@ async fn continue_items(
     limit: Option<usize>,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     let limit = limit.unwrap_or(12).clamp(1, 40);
     work(move || {
         store
@@ -165,8 +230,8 @@ async fn shelf_units(
     profile_id: Uuid,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<std::collections::HashMap<String, serde_json::Value>> {
-    let store = reader.0.clone();
-    work(move || store.for_profile(profile_id).and_then(|store| store.shelf_units(&ids)).map_err(|e| e.to_string())).await
+    let store = reader.0.get();
+    work(move || store.for_profile(profile_id).and_then(|store| store.shelf_updates(&ids)).map_err(|e| e.to_string())).await
 }
 #[tauri::command]
 async fn delete_unit(
@@ -178,12 +243,12 @@ async fn delete_unit(
 }
 #[tauri::command]
 async fn filter_choices(reader: State<'_, CatalogReads>) -> CommandResult<serde_json::Value> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || store.filter_choices().map_err(|e| e.to_string())).await
 }
 #[tauri::command]
 async fn home_recent(reader: State<'_, CatalogReads>) -> CommandResult<serde_json::Value> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || store.home_recent().map_err(|e| e.to_string())).await
 }
 #[tauri::command]
@@ -200,7 +265,7 @@ async fn library(
     profile_id: uuid::Uuid,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<LibraryPage> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
         store
             .for_profile(profile_id).map_err(|e| e.to_string())?
@@ -251,7 +316,7 @@ async fn personal_lists(
     profile_id: uuid::Uuid,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
         store.for_profile(profile_id)
             .and_then(|store| store.personal_lists())
@@ -289,7 +354,7 @@ async fn library_item(
     id: Uuid,
     reader: State<'_, CatalogReads>,
 ) -> CommandResult<umd_core::CatalogItem> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
         store
             .item(id)
@@ -385,7 +450,7 @@ async fn export_catalog(
 
 #[tauri::command]
 async fn server_url(reader: State<'_, CatalogReads>) -> CommandResult<String> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
         store
             .setting("server_url")
@@ -439,10 +504,17 @@ async fn search_remote_catalog(
     store: State<'_, CatalogStore>,
     query: String,
     cursor: Option<String>,
+    media_type: Option<String>,
+    subtype_group: Option<String>,
 ) -> CommandResult<(Vec<umd_core::CatalogItem>, Option<String>)> {
     let query = CatalogQuery {
         q: query,
         cursor,
+        media_type,
+        filters: umd_core::CatalogFilters {
+            subtype_group,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let page = online_page(&store, query, false, false).await?;
@@ -545,8 +617,10 @@ async fn connect_catalog(store: &CatalogStore, address: &str) -> CommandResult<S
 }
 
 #[tauri::command]
-async fn connect_server(store: State<'_, CatalogStore>, base_url: String) -> CommandResult<String> {
-    connect_catalog(&store, &base_url).await
+async fn connect_server(store: State<'_, CatalogStore>, artwork: State<'_, artwork::Origin>, base_url: String) -> CommandResult<String> {
+    let url = connect_catalog(&store, &base_url).await?;
+    artwork.set(reqwest::Url::parse(&url).ok());
+    Ok(url)
 }
 
 #[derive(serde::Serialize)]
@@ -604,13 +678,29 @@ async fn online_page(
                 params.push((key, v));
             }
         }
-        catalog_document(catalog_response(&base, "api/v1/catalog/search", &params).await?).await?
+        let mut response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+        if response.status() == reqwest::StatusCode::BAD_REQUEST
+            && f.subtype_group.as_deref()
+                .is_some_and(|g| matches!(g, "manga" | "prose" | "comic"))
+        {
+            // Older .NET servers accept the book media type and only know the video groups.
+            params.retain(|(name, _)| *name != "subtypeGroup");
+            if query.media_type.is_none() {
+                params.push(("mediaType", "book"));
+            }
+            response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+        }
+        catalog_document(response).await?
     };
     Ok(OnlinePage {
         items: doc
             .items
             .into_iter()
             .filter(|i| i.sync_id.is_some() && !(hide_adult && i.adult()))
+            .filter(|item| {
+                query.filters.subtype_group.as_deref()
+                    .is_none_or(|group| item.matches_subtype_group(group))
+            })
             .collect(),
         next: if recent {
             None
@@ -628,11 +718,15 @@ async fn browse_online_catalog(
     recent: bool,
     hide_adult: bool,
 ) -> CommandResult<OnlinePage> {
-    online_page(&reader.0, query, recent, hide_adult).await
+    online_page(&reader.0.get(), query, recent, hide_adult).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(desktop)]
+    if let Some(code) = updates::desktop::run_helper() {
+        std::process::exit(code);
+    }
     let builder = tauri::Builder::default();
     #[cfg(any(windows, target_os = "linux"))]
     let builder = if std::env::var_os("UMD_RUST_DESKTOP_DATA_DIRECTORY").is_none() {
@@ -649,6 +743,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .register_asynchronous_uri_scheme_protocol("umdstream", torrent_stream::protocol)
         .manage(torrent_stream::Streams::default())
+        .manage(artwork::Origin::default())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -656,6 +751,8 @@ pub fn run() {
         .setup(|app| {
             downloads::setup_magnets(app)?;
             app.manage(media::MediaState::default());
+            #[cfg(target_os = "android")]
+            app.manage(reader_tiles::TileBook::default());
             app.manage(remote::RemoteState::default());
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             app.manage(updates::Updates::default());
@@ -663,8 +760,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             initialize_library,
+            #[cfg(target_os = "android")]
+            reader_tiles::prepare_reader_tiles,
+            #[cfg(target_os = "android")]
+            reader_tiles::release_reader_tiles,
+            home_bootstrap,
+            library_summaries,
             library,
             profiles,
+            legacy_preferences,
             remote::edit_profile,
             remote::account_current,
             remote::account_sync,
@@ -720,10 +824,13 @@ pub fn run() {
             updates::check_update,
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             updates::install_update,
+            #[cfg(desktop)]
+            updates::restart_update,
             connect_server,
             browse_online_catalog,
             native_player::native_playback,
             streams::resolve_video,
+            streams::live_variants,
             hls_proxy::web_stream_relay,
             hls_proxy::close_stream_relay,
             streams::live_channels,
@@ -733,10 +840,11 @@ pub fn run() {
             providers::provider_search,
             providers::provider_updates,
             providers::refresh_saved_editions,
+            providers::import_daily_updates,
             providers::refresh_item,
-            artwork::fetch_artwork,
             providers::provider_interactive,
-            chapter_lookup::find_chapter,
+            chapter_lookup::find_unit_sources,
+            chapter_lookup::select_unit_source,
             providers::provider_add,
             providers::provider_unit,
             providers::open_provider_player,
@@ -744,6 +852,7 @@ pub fn run() {
             ad_filter::filter_status,
             ad_filter::open_filtered_player,
             ad_filter::playback::provider_playback,
+            ad_filter::playback::provider_layout,
             ad_filter::playback::provider_public_stream,
             capibara::capibara_search,
             capibara::capibara_updates,
@@ -830,6 +939,48 @@ mod online_catalog_tests {
             store.setting("server_url").unwrap().as_deref(),
             Some(base.as_str())
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn older_server_book_search_preserves_filters_and_pagination() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let app = Router::new().route(
+            "/api/v1/catalog/search",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                if query.contains_key("subtypeGroup") {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                assert_eq!(query["mediaType"], "book");
+                assert_eq!(query["cursor"], "previous");
+                let document = serde_json::json!({
+                    "format": "universal-media-distribution.catalog", "version":1,
+                    "items": [
+                        {"syncId":Uuid::from_u128(11),"name":"Obra","subtype":"manga","mediaType":"book"},
+                        {"syncId":Uuid::from_u128(12),"name":"Obra","subtype":"novel","mediaType":"book"}
+                    ]
+                });
+                ([("x-umd-next-cursor", "next")], Json(document)).into_response()
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let store = CatalogStore::in_memory().unwrap();
+        store
+            .set_setting("server_url", &format!("http://{}/", socket.local_addr().unwrap()))
+            .unwrap();
+        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let query = CatalogQuery {
+            cursor: Some("previous".into()),
+            filters: umd_core::CatalogFilters {
+                subtype_group: Some("manga".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let page = online_page(&store, query, false, false).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].subtype, "manga");
+        assert_eq!(page.next.as_deref(), Some("next"));
         server.abort();
     }
 }

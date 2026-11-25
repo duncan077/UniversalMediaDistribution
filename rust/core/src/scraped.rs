@@ -352,6 +352,18 @@ impl CatalogStore {
         self.store_provider_title(provider, external, incoming, true, None)
             .map(|(item, _)| item)
     }
+    pub fn merge_provider_update(
+        &self,
+        provider: &str,
+        external: &str,
+        item: CatalogItem,
+    ) -> Result<bool> {
+        if item.deleted {
+            return Ok(false);
+        }
+        self.store_provider_title(provider, external, item, true, None)
+            .map(|(_, changed)| changed)
+    }
     pub fn link_provider_edition(
         &self,
         id: Uuid,
@@ -444,18 +456,13 @@ impl CatalogStore {
                 {
                     continue;
                 }
-                overlay(
-                    &k,
-                    item.metadata.entry(k.clone()).or_insert(Value::Null),
-                    v,
-                );
+                overlay(&k, item.metadata.entry(k.clone()).or_insert(Value::Null), v);
             }
             item
         } else {
             clean
         };
-        let changed = previous.as_ref().map(serde_json::to_value).transpose()?
-            != Some(serde_json::to_value(&merged)?);
+        let changed = previous.as_ref() != Some(&merged);
         if changed {
             Self::import_into(&tx, &CatalogDocument::new(vec![merged.clone()]), false)?;
         }
@@ -501,17 +508,40 @@ impl CatalogStore {
                 })
         };
         let key = item.key();
-        let release_year = year(&item);
-        let compatible = |other: &CatalogItem| {
+        let same_kind = |other: &CatalogItem| {
             let other_key = other.key();
             key.splitn(3, ':')
                 .take(2)
                 .eq(other_key.splitn(3, ':').take(2))
-                && year(other).zip(release_year).is_none_or(|(a, b)| a == b)
+        };
+        let release_year = year(&item);
+        let compatible = |other: &CatalogItem| {
+            same_kind(other) && year(other).zip(release_year).is_none_or(|(a, b)| a == b)
         };
         let mut known = bound.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+        let mut displaced = None;
+        if target.is_none() && item.media_type.eq_ignore_ascii_case("book") {
+            if let Some(id) = known {
+                if let Some(mut old) = Self::item_from(&tx, id)? {
+                    if !same_kind(&old) {
+                        if let Some(links) = old
+                            .metadata
+                            .get_mut("onlineProviders")
+                            .and_then(Value::as_object_mut)
+                        {
+                            if links.get(provider).and_then(Value::as_str) == Some(external) {
+                                links.remove(provider);
+                                Self::import_into(&tx, &CatalogDocument::new(vec![old]), false)?;
+                            }
+                        }
+                        displaced = Some(id);
+                        known = None;
+                    }
+                }
+            }
+        }
         if let Some((id, key)) = target {
-            let local = Self::item_from(&tx, id)?
+            let local = Self::summary_from(&tx, id)?
                 .ok_or_else(|| Error::Invalid("La edición local ya no existe.".into()))?;
             if local.key() != key || !compatible(&local) || known.is_some_and(|found| found != id) {
                 return Err(Error::Invalid(
@@ -524,7 +554,7 @@ impl CatalogStore {
         }
         if known.is_none() && item.sync_id.is_some() {
             let requested = item.id()?;
-            if Self::item_from(&tx, requested)?
+            if Self::summary_from(&tx, requested)?
                 .as_ref()
                 .is_none_or(&compatible)
             {
@@ -532,7 +562,7 @@ impl CatalogStore {
             }
         }
         if known.is_none() {
-            let mut stmt = tx.prepare("SELECT payload FROM rust_catalog WHERE name_key=?")?;
+            let mut stmt = tx.prepare("SELECT s.summary FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE c.name_key=?")?;
             let mut matches = Vec::new();
             for row in stmt.query_map([&key], |r| r.get::<_, String>(0))? {
                 let other: CatalogItem = serde_json::from_str(&row?)?;
@@ -545,10 +575,18 @@ impl CatalogStore {
             }
         }
         let id = known.unwrap_or_else(|| {
-            Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                format!("umd:crawler:{provider}:{external}").as_bytes(),
-            )
+            let namespace = Uuid::NAMESPACE_URL;
+            let external_key = format!("umd:crawler:{provider}:{external}");
+            let id = Uuid::new_v5(&namespace, external_key.as_bytes());
+            if displaced == Some(id) {
+                let subtype = crate::user_state::canonical_subtype("book", &item.subtype);
+                Uuid::new_v5(
+                    &namespace,
+                    format!("{external_key}:book.{subtype}").as_bytes(),
+                )
+            } else {
+                id
+            }
         });
         item.sync_id = Some(id);
         let previous = Self::item_from(&tx, id)?;
@@ -574,8 +612,7 @@ impl CatalogStore {
             }
             item.metadata = metadata;
         }
-        let changed = previous.as_ref().map(serde_json::to_value).transpose()?
-            != Some(serde_json::to_value(&item)?);
+        let changed = previous.as_ref() != Some(&item);
         if changed {
             Self::import_into(&tx, &CatalogDocument::new(vec![item.clone()]), false)?;
         }
@@ -589,6 +626,40 @@ impl CatalogStore {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn a_corrected_novel_binding_does_not_replace_manga_or_its_favorite() {
+        let store = CatalogStore::in_memory().unwrap();
+        let work = |subtype, number| {
+            serde_json::from_value(json!({
+                "name":"Obra","mediaType":"book","subtype":subtype,
+                "units":[{"kind":"chapter","displayNumber":number}]
+            }))
+            .unwrap()
+        };
+        let legacy = store
+            .add_provider_title("zonatmo", "novel/191/obra", work("manga", "97"))
+            .unwrap();
+        let manga_id = legacy.id().unwrap();
+        store.set_favorite(manga_id, true).unwrap();
+        let corrected = store
+            .add_provider_title("zonatmo", "novel/191/obra", work("novel", "185"))
+            .unwrap();
+        assert_ne!(manga_id, corrected.id().unwrap());
+        let manga = store.item(manga_id).unwrap().unwrap().items.remove(0);
+        assert_eq!(manga.subtype, "manga");
+        assert_eq!(manga.metadata["units"][0]["displayNumber"], "97");
+        assert!(manga.metadata["onlineProviders"]["zonatmo"].is_null());
+        assert_eq!(
+            store
+                .page(&crate::CatalogQuery::default())
+                .unwrap()
+                .favorite_ids,
+            vec![manga_id]
+        );
+        assert!(!store
+            .merge_provider_update("zonatmo", "novel/191/obra", work("novel", "185"))
+            .unwrap());
+    }
     #[test]
     fn matching_a_chapter_preserves_local_identity_sources_and_other_profiles() {
         let store = CatalogStore::in_memory().unwrap();
@@ -824,7 +895,10 @@ mod tests {
             "https://cdn.example.org/hero.webp"
         );
         assert_eq!(merged.metadata["publicationStatus"], "ongoing");
-        assert_eq!(merged.metadata["onlineProviders"]["olympusxyz"], "hero-returns");
+        assert_eq!(
+            merged.metadata["onlineProviders"]["olympusxyz"],
+            "hero-returns"
+        );
         let units = merged.metadata["units"].as_array().unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0]["sources"][0]["filePath"], "local/ch1.cbz");

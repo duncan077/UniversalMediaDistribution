@@ -1,7 +1,7 @@
 mod database_backup;
 mod dotnet_backup;
 pub use database_backup::{check_library_backup, library_integrity, library_readable};
-pub use dotnet_backup::prepare_library_restore;
+pub use dotnet_backup::{legacy_private_settings, prepare_library_restore, LegacyPrivateSettings};
 pub mod capibara;
 pub mod public_url;
 mod scraped;

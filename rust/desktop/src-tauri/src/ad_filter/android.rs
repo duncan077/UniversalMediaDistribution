@@ -1,3 +1,4 @@
+use super::playback::Bounds;
 use super::{blocked, CommandResult};
 use jni::{
     objects::{JClass, JString, JValue},
@@ -6,6 +7,18 @@ use jni::{
 };
 use reqwest::Url;
 use tauri::Manager;
+
+#[no_mangle]
+pub extern "system" fn Java_org_universalmediadistribution_rust_PlayerFilter_trimMemory(
+    _: JNIEnv,
+    _: JClass,
+) {
+    tauri::async_runtime::spawn_blocking(|| {
+        super::trim();
+        crate::artwork::trim();
+        crate::providers::trim();
+    });
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_universalmediadistribution_rust_PlayerFilter_denied(
@@ -34,12 +47,19 @@ pub extern "system" fn Java_org_universalmediadistribution_rust_PlayerFilter_inj
     mut env: JNIEnv,
     _: JClass,
     address: JString,
+    embedded: jboolean,
 ) -> jni::sys::jstring {
     let script = env
         .get_string(&address)
         .ok()
         .and_then(|s| Url::parse(&String::from(s)).ok())
-        .map(|u| super::payload(&u))
+        .map(|u| {
+            if embedded != 0 {
+                super::player_payload(&u)
+            } else {
+                super::payload(&u)
+            }
+        })
         .unwrap_or_default();
     env.new_string(script)
         .map(|s| s.into_raw())
@@ -52,7 +72,13 @@ pub async fn open(
     session: uuid::Uuid,
     english: bool,
     interactive: bool,
+    bounds: Option<Bounds>,
 ) -> CommandResult<()> {
+    let bounds = bounds
+        .map(|b| serde_json::to_string(&b))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
     let hide_ads = *super::MODE.lock().unwrap() != super::Mode::Off;
     let main = app
         .get_webview_window("main")
@@ -62,16 +88,18 @@ pub async fn open(
         view.jni_handle().exec(move |env, activity, _| {
             let result = env.new_string(url.as_str()).and_then(|address| {
                 let id = env.new_string(session.to_string())?;
+                let bounds = env.new_string(bounds)?;
                 env.call_method(
                     activity,
                     "openFilteredPlayer",
-                    "(Ljava/lang/String;ZLjava/lang/String;ZZ)V",
+                    "(Ljava/lang/String;ZLjava/lang/String;ZZLjava/lang/String;)V",
                     &[
                         JValue::Object(&address),
                         JValue::Bool(hide_ads as jboolean),
                         JValue::Object(&id),
                         JValue::Bool(english as jboolean),
                         JValue::Bool(interactive as jboolean),
+                        JValue::Object(&bounds),
                     ],
                 )
                 .map(|_| ())
@@ -81,6 +109,44 @@ pub async fn open(
             }
             let _ = send.send(result.map_err(|_| "No se pudo abrir el reproductor.".to_string()));
         })
+    })
+    .map_err(|e| e.to_string())?;
+    recv.await.map_err(|e| e.to_string())?
+}
+
+pub(super) async fn layout(
+    app: &tauri::AppHandle,
+    session: uuid::Uuid,
+    bounds: Bounds,
+    focus: Option<bool>,
+) -> CommandResult<()> {
+    let bounds = serde_json::to_string(&bounds).map_err(|e| e.to_string())?;
+    let main = app
+        .get_webview_window("main")
+        .ok_or("Falta la ventana principal.")?;
+    let (send, recv) = tokio::sync::oneshot::channel();
+    main.with_webview(move |view| {
+        view.jni_handle().exec(move |env, activity, _| {
+            let result = (|| {
+                let id = env.new_string(session.to_string())?;
+                let geometry = env.new_string(bounds)?;
+                env.call_method(
+                    activity,
+                    "layoutProvider",
+                    "(Ljava/lang/String;Ljava/lang/String;I)V",
+                    &[
+                        JValue::Object(&id),
+                        JValue::Object(&geometry),
+                        JValue::Int(focus.map_or(-1, i32::from)),
+                    ],
+                )?;
+                Ok::<_, jni::errors::Error>(())
+            })();
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
+            let _ = send.send(result.map_err(|_| "No se pudo ajustar el reproductor.".to_owned()));
+        });
     })
     .map_err(|e| e.to_string())?;
     recv.await.map_err(|e| e.to_string())?

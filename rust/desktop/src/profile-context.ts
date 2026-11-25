@@ -1,14 +1,16 @@
 import {invoke} from "./bridge";
 import {
   clearProfilePrefs,
+  disabledProvidersForProfile,
   getProfilePref,
   preferredProvidersForProfile,
   profilePrefKey,
   profilePrefPrefix,
+  providerEnabled,
   setProfilePref,
 } from "./profile-prefs";
 
-export {clearProfilePrefs, getProfilePref, preferredProvidersForProfile, profilePrefKey, profilePrefPrefix, setProfilePref};
+export {clearProfilePrefs, getProfilePref, preferredProvidersForProfile, profilePrefKey, profilePrefPrefix, providerEnabled, setProfilePref};
 
 export interface Profiles {
   activeId: string;
@@ -28,7 +30,17 @@ export function activeProfileId(): string | null {
 }
 
 export function windowProfile(): Promise<Profiles> {
-  return context ??= invoke<Profiles>("profiles").then(state => {
+  return context ??= invoke<Profiles>("profiles").then(async state => {
+    const legacy = await invoke<{ receipt: string; values: Record<string, string> } | null>(
+      "legacy_preferences", { profileId: state.activeId },
+    ).catch(() => null);
+    if (legacy) {
+      const receiptKey = profilePrefKey(state.activeId, "legacy-prefs-receipt");
+      if (localStorage.getItem(receiptKey) !== legacy.receipt) {
+        for (const [key, value] of Object.entries(legacy.values)) setProfilePref(state.activeId, key, value);
+        localStorage.setItem(receiptKey, legacy.receipt);
+      }
+    }
     cachedActiveId = state.activeId;
     return state;
   }).catch(error => {
@@ -49,13 +61,16 @@ export function writeProfilePref(key: string, value: string): Promise<void> {
 
 export async function invokeProfile<T>(command: string, args: Record<string,unknown> = {}): Promise<T> {
   const {activeId} = await windowProfile();
-  const view = command === "library"
+  const view = command === "library" || command === "home_bootstrap"
     ? {
         hideAdult: getProfilePref(activeId, "umd-hide-adult") === "true",
         preferredProviders: preferredProvidersForProfile(activeId),
       }
     : {};
-  const result = await invoke<T>(command, {...args, ...view, profileId: activeId});
+  const providerFilter = command === "find_unit_sources" || command === "refresh_item"
+    ? { disabledSites: disabledProvidersForProfile(activeId) }
+    : {};
+  const result = await invoke<T>(command, {...args, ...view, ...providerFilter, profileId: activeId});
   if (personalWrites.has(command) && (command !== "reader_mode" || args.mode != null)) {
     window.dispatchEvent(new Event("umd-profile-changed"));
   }

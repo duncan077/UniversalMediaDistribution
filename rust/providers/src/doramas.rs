@@ -1,12 +1,17 @@
 use super::*;
 use dom_query::Document;
 use regex::Regex;
-use std::sync::LazyLock;
+use std::{collections::HashMap, sync::LazyLock, time::Instant};
 
 const FIELDS: &str = "_id slug name name_es poster_path poster";
 static SERIES_ID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"serie_id\\?["']?\s*:\s*\\?["']([a-zA-Z0-9_-]{1,128})\\?["']"#).unwrap()
 });
+pub(super) struct EpisodeRoutes {
+    series: String,
+    since: Instant,
+    episodes: HashMap<(u32, String), Box<str>>,
+}
 
 fn doramas_artwork(base: &Url, raw: Option<&str>, size: &str) -> Option<String> {
     let raw = raw?.trim();
@@ -82,7 +87,7 @@ impl Provider {
             let client = if url.origin() == self.base.origin() {
                 self.client.clone()
             } else {
-                pinned(&url).await?
+                pinned(&url, self.cookies.as_ref()).await?
             };
             self.api = Some((url, client));
         }
@@ -109,6 +114,28 @@ impl Provider {
             return Err(Failure::new("upstream_response"));
         }
         Ok(reply["data"].take())
+    }
+
+    async fn graph_batch(
+        &mut self,
+        op: &str,
+        query: &str,
+        variables: Value,
+    ) -> Result<Option<Value>> {
+        if !self.doramas_batches {
+            return Ok(None);
+        }
+        match self.graph(op, query, variables).await {
+            Ok(data) => Ok(Some(data)),
+            Err(error)
+                if matches!(error.kind, "upstream_response" | "parse_or_storage_error")
+                    || matches!(error.status, Some(400 | 404 | 405 | 422)) =>
+            {
+                self.doramas_batches = false;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
     pub(super) async fn doramas_page(&mut self, cursor: Option<&str>) -> Result<Page> {
         let (section, n) = cursor
@@ -173,17 +200,70 @@ impl Provider {
         if self.public_doramas() {
             return self.public_doramas_cards("").await;
         }
+        let query=format!("query latestTitles($size:Int){{series:paginationDorama(page:1,perPage:$size,sort:UPDATEDAT_DESC,filter:{{}}){{items{{{FIELDS}}}}} movies:paginationMovie(page:1,perPage:$size,sort:UPDATEDAT_DESC,filter:{{}}){{items{{{FIELDS}}}}}}}");
+        if let Some(data) = self
+            .graph_batch("latestTitles", &query, json!({"size":50}))
+            .await?
+        {
+            if let (Some(series), Some(movies)) = (
+                data["series"]["items"].as_array(),
+                data["movies"]["items"].as_array(),
+            ) {
+                return Ok(dedup(
+                    series
+                        .iter()
+                        .filter_map(|row| entry(&self.base, row, false))
+                        .chain(movies.iter().filter_map(|row| entry(&self.base, row, true))),
+                ));
+            }
+            self.doramas_batches = false;
+        }
         let mut items = self.doramas_page(None).await?.items;
         items.extend(self.doramas_page(Some("movies:1")).await?.items);
         Ok(items)
     }
     async fn doramas_episodes(&mut self, id: &str, season: u32) -> Result<Vec<Value>> {
-        let v=self.graph("listEpisodes","query listEpisodes($season_number:Float!,$serie_id:MongoID!){listEpisodes(sort:NUMBER_ASC,filter:{type_serie:\"dorama\",serie_id:$serie_id,season_number:$season_number}){slug name episode_number season_number}}",json!({"serie_id":id,"season_number":season})).await?;
-        let list = rows(&v["listEpisodes"])?;
+        let mut v=self.graph("listEpisodes","query listEpisodes($season_number:Float!,$serie_id:MongoID!){listEpisodes(sort:NUMBER_ASC,filter:{type_serie:\"dorama\",serie_id:$serie_id,season_number:$season_number}){slug name episode_number season_number}}",json!({"serie_id":id,"season_number":season})).await?;
+        let Value::Array(list) = v["listEpisodes"].take() else {
+            return Err(invalid());
+        };
         if list.len() > 20000 {
             return Err(invalid());
         }
-        Ok(list.clone())
+        Ok(list)
+    }
+
+    async fn season_batch(&mut self, id: &str, seasons: &[u32]) -> Result<Vec<Vec<Value>>> {
+        if seasons.len() > 1 && self.doramas_batches {
+            let mut vars = json!({"serie_id":id});
+            let mut definitions = String::from("$serie_id:MongoID!");
+            let mut fields = String::new();
+            use std::fmt::Write as _;
+            for (idx, number) in seasons.iter().enumerate() {
+                vars[format!("n{idx}")] = json!(number);
+                let _ = write!(definitions, ",$n{idx}:Float!");
+                let _ = write!(fields, "s{idx}:listEpisodes(sort:NUMBER_ASC,filter:{{type_serie:\"dorama\",serie_id:$serie_id,season_number:$n{idx}}}){{slug name episode_number season_number}} ");
+            }
+            let query = format!("query seasonEpisodes({definitions}){{{fields}}}");
+            if let Some(mut data) = self.graph_batch("seasonEpisodes", &query, vars).await? {
+                let mut result = Vec::with_capacity(seasons.len());
+                for idx in 0..seasons.len() {
+                    match data[format!("s{idx}")].take() {
+                        Value::Array(list) if list.len() <= 20_000 => result.push(list),
+                        _ => break,
+                    }
+                }
+                if result.len() == seasons.len() {
+                    return Ok(result);
+                }
+                self.doramas_batches = false;
+            }
+        }
+        let mut result = Vec::with_capacity(seasons.len());
+        for &season in seasons {
+            result.push(self.doramas_episodes(id, season).await?);
+        }
+        Ok(result)
     }
     pub(super) async fn doramas_detail(&mut self, e: &Entry) -> Result<Value> {
         let movie = media(&e.external_id)?;
@@ -236,7 +316,7 @@ impl Provider {
             .or_else(|| string(&e.preview["providerSeriesId"]))
             .ok_or_else(invalid)?;
         let data=self.graph("listSeasons","query listSeasons($serie_id:MongoID!){listSeasons(sort:NUMBER_ASC,filter:{serie_id:$serie_id}){season_number}}",json!({"serie_id":id})).await?;
-        let mut seasons = Vec::new();
+        let mut numbers = Vec::new();
         let mut seen = HashSet::new();
         for s in rows(&data["listSeasons"])? {
             let Some(n) = integer(&s["season_number"])
@@ -245,18 +325,42 @@ impl Provider {
             else {
                 continue;
             };
-            if seasons.len() >= 512 {
+            if numbers.len() >= 512 {
                 return Err(invalid());
             }
-            let list = self.doramas_episodes(&id, n).await?;
-            let units: Vec<_> = list
-                .iter()
-                .filter_map(|e| Some((string(&e["episode_number"])?, e["name"].as_str())))
-                .enumerate()
-                .map(|(i, (n, name))| episode(n, i, name))
-                .collect();
-            seasons.push(json!({"number":n,"sortOrder":n,"displayName":format!("Temporada {n}"),"units":units}));
+            numbers.push(n);
         }
+        let mut seasons = Vec::with_capacity(numbers.len());
+        let mut routes = HashMap::new();
+        for batch in numbers.chunks(16) {
+            let lists = self.season_batch(&id, batch).await?;
+            for (&season, list) in batch.iter().zip(lists) {
+                let units: Vec<_> = list
+                    .into_iter()
+                    .filter_map(|row| {
+                        let number = string(&row["episode_number"])?;
+                        if routes.len() < 4096 {
+                            if let Some(slug) =
+                                row["slug"].as_str().filter(|slug| segment(slug, 512))
+                            {
+                                routes
+                                    .entry((season, canonical_number(&number)))
+                                    .or_insert_with(|| slug.into());
+                            }
+                        }
+                        Some((number, row))
+                    })
+                    .enumerate()
+                    .map(|(i, (number, row))| episode(number, i, row["name"].as_str()))
+                    .collect();
+                seasons.push(json!({"number":season,"sortOrder":season,"displayName":format!("Temporada {season}"),"units":units}));
+            }
+        }
+        self.doramas_routes = Some(EpisodeRoutes {
+            series: e.external_id.clone(),
+            since: Instant::now(),
+            episodes: routes,
+        });
         item["seasons"] = json!(seasons);
         Ok(item)
     }
@@ -288,6 +392,16 @@ impl Provider {
                     &target,
                 )
                 .await;
+        }
+        if let Some(slug) = self
+            .doramas_routes
+            .as_ref()
+            .filter(|cached| {
+                cached.series == route && cached.since.elapsed() < Duration::from_secs(120)
+            })
+            .and_then(|cached| cached.episodes.get(&(season, target.clone())))
+        {
+            return self.public_video(&format!("episodios/{slug}")).await;
         }
         let html = self.html(route).await?;
         let id = series_id(&html).ok_or_else(invalid)?;

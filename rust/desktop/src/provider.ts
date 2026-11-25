@@ -1,9 +1,11 @@
 import {ui, displayTitle} from "./locale";
 import {invoke} from "./bridge";
-import {activeProfileId, getProfilePref, invokeProfile, setProfilePref, windowProfile, writeProfilePref} from "./profile-context";
+import {attachArtworkImage} from "./artwork";
+import {activeProfileId, getProfilePref, invokeProfile, providerEnabled, setProfilePref, windowProfile, writeProfilePref} from "./profile-context";
 import type {CatalogItem} from "./main";
 import {remoteUrl} from "./safety";
 import {isPageActive, navigateTo, onPageEnter} from "./router";
+import {bookGroupLabel, catalogGroup, groupMedia} from "./catalog-types";
 
 interface Edition { id: number; joint: boolean; scan: string; slug: string }
 interface Entry { externalId: string; preview: { name: string; mediaType?:string;subtype?:string; genres?: string[]; categories?: string[]; thumbnailRef?: string | null; releaseYear?: number | null } }
@@ -34,6 +36,7 @@ function similar(a:string,b:string) {
 export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean) => Promise<void>) {
   const form = document.querySelector<HTMLFormElement>("#provider-form")!;
   const site = document.querySelector<HTMLSelectElement>("#provider-site")!;
+  const type = document.querySelector<HTMLSelectElement>("#provider-type")!;
   const input = document.querySelector<HTMLInputElement>("#provider-query")!;
   const status = document.querySelector<HTMLElement>("#provider-status")!;
   const results = document.querySelector<HTMLElement>("#provider-results")!;
@@ -42,45 +45,69 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
   let query = "";
   type Source = { id: string; name: string; cursor: string | null; favorite: boolean };
   let pending: Source[] = [];
-  const options = Array.from(site.options).filter(o => !["all", "local", "server"].includes(o.value));
+  const providerOptions = () => Array.from(site.options).filter(o => !["all", "local", "server"].includes(o.value));
+  const options = providerOptions();
+  const explorePrefs = document.getElementById("provider-preferences")!;
+  const settingsPrefs = document.getElementById("settings-provider-preferences")!;
   const hide = document.getElementById("hide-adult") as HTMLInputElement;
-  const prefBoxes: { box: HTMLInputElement; key: string; kind: "enabled" | "favorite" }[] = [];
+  const prefBoxes: { box: HTMLInputElement; id: string; kind: "enabled" | "favorite" }[] = [];
 
   const syncPrefs = (profileId: string | null) => {
     hide.checked = getProfilePref(profileId, "umd-hide-adult") === "true";
-    for (const { box, key, kind } of prefBoxes) {
-      box.checked = kind === "enabled" ? getProfilePref(profileId, key) !== "false" : getProfilePref(profileId, key) === "true";
+    for (const { box, id, kind } of prefBoxes) {
+      box.checked = kind === "enabled" ? providerEnabled(profileId, id) : getProfilePref(profileId, "provider-favorite-" + id) === "true";
     }
+    for (const option of providerOptions()) {
+      option.hidden = option.disabled = !providerEnabled(profileId, option.value);
+    }
+    if (site.selectedOptions[0]?.disabled) site.value = "all";
   };
   const applyPref = (key: string, value: string) => {
     const id = activeProfileId();
+    const onSaved = () => {
+      syncPrefs(activeProfileId());
+      clear();
+      if (key.startsWith("provider-enabled-")) {
+        window.dispatchEvent(new Event("umd-provider-availability-changed"));
+      }
+      window.dispatchEvent(new Event("umd-catalog-changed"));
+    };
     if (id) {
       setProfilePref(id, key, value);
-      clear();
-      window.dispatchEvent(new Event("umd-catalog-changed"));
-      return;
+      onSaved();
+    } else {
+      void writeProfilePref(key, value).then(onSaved).catch(() => syncPrefs(activeProfileId()));
     }
-    void writeProfilePref(key, value).then(() => {
-      clear();
-      window.dispatchEvent(new Event("umd-catalog-changed"));
-    }).catch(() => {});
   };
   hide.onchange = () => applyPref("umd-hide-adult", String(hide.checked));
-  for (const o of options) {
-    const line = document.createElement("div");
-    for (const kind of ["enabled", "favorite"] as const) {
-      const label = document.createElement("label");
-      const box = document.createElement("input");
-      const key = "provider-" + kind + "-" + o.value;
-      box.type = "checkbox";
-      prefBoxes.push({ box, key, kind });
-      label.append(box, " " + (kind === "enabled" ? ui("Consultar {0}", o.text) : ui("Priorizar {0}", o.text)));
-      box.onchange = () => applyPref(key, String(box.checked));
-      line.append(label);
-    }
-    document.getElementById("provider-preferences")!.append(line);
+  function preferenceBox(id: string, kind: "enabled" | "favorite", text: string) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.onchange = () => applyPref("provider-" + kind + "-" + id, String(box.checked));
+    prefBoxes.push({ box, id, kind });
+    label.append(box, " " + text);
+    return label;
   }
-  syncPrefs(activeProfileId());
+  function renderPrefs() {
+    prefBoxes.length = 0;
+    const explore = document.createDocumentFragment();
+    const settings = document.createDocumentFragment();
+    for (const {value: id, text: name} of providerOptions()) {
+      const line = document.createElement("div");
+      line.append(preferenceBox(id, "enabled", ui("Consultar {0}", name)), preferenceBox(id, "favorite", ui("Priorizar {0}", name)));
+      explore.append(line);
+      const row = document.createElement("li");
+      const label = preferenceBox(id, "enabled", name);
+      label.className = "toggle-row";
+      row.append(label);
+      settings.append(row);
+    }
+    explorePrefs.replaceChildren(explore);
+    settingsPrefs.replaceChildren(settings);
+    syncPrefs(activeProfileId());
+  }
+  renderPrefs();
   void windowProfile().then(({ activeId }) => syncPrefs(activeId)).catch(() => {});
   type Location = {id:string;name:string;base:string};
   const settings = document.getElementById("source-settings") as HTMLFormElement;
@@ -105,6 +132,7 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       for (const opt of options) opt.text=locations.find(l=>l.id===opt.value)?.name || defaults.get(opt.value)!;
       for(const l of locations.filter(l=>l.id.startsWith("json-"))) {const opt=new Option(l.name,l.id);opt.dataset.custom="1";site.add(opt);}
       site.value=Array.from(site.options).some(o=>o.value===current)?current:"all";
+      renderPrefs();
       choose.replaceChildren(new Option(ui("Agregar proveedor JSON"),""),...Array.from(site.options).filter(o=>!["local","server","all","capibaratraductor"].includes(o.value)).map(o=>new Option(o.text,o.value)));
       if(edit) choose.value=edit.id || locations.at(-1)?.id || "";
       selected(); feedback.textContent=edit || del ? ui("Preferencias guardadas.") : "";
@@ -122,7 +150,8 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
     const data=hit.item || hit.entry?.preview;
     const type = data?.mediaType?.toLowerCase() || (hit.edition ? "book" : provider);
     const name = hit.title.normalize("NFKD").replace(/\p{M}/gu,"").toLowerCase().replace(/[^\p{L}\p{N}]/gu,"");
-    const key = [type,type==="book" ? data?.subtype?.split(".").pop() || "manga" : "",name.match(/\d+/g)?.join(",") || ""].join("|");
+    const subtype = data?.subtype?.split(".").pop()?.replace(/[- ]/g, "_").toLowerCase() || (hit.edition ? "manga" : "");
+    const key = [type,type==="book" ? subtype || provider + ":" + (hit.entry?.externalId ?? hit.item?.syncId) : "",name.match(/\d+/g)?.join(",") || ""].join("|");
     const year = data?.releaseYear || null;
     const matches = editions.get(key) || [];
     const match = matches.find(candidate => (!year || !candidate.year || candidate.year===year) && similar(name,candidate.name));
@@ -141,22 +170,27 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
 
   let refreshedAt = 0;
   let refreshing = false;
+  const refreshAfter = Date.now() + (/Android/i.test(navigator.userAgent) ? 60_000 : 0);
   const refreshSaved = async () => {
-    if (refreshing || document.hidden || Date.now() - refreshedAt < 3600000) return;
+    if (refreshing || document.hidden || Date.now() < refreshAfter || Date.now() - refreshedAt < 3600000) return;
     refreshing = true;
     try {
       const { activeId } = await windowProfile();
-      const sites = options.filter(o => getProfilePref(activeId, "provider-enabled-" + o.value) !== "false").map(o => o.value);
-      const updated = await invoke<number>("refresh_saved_editions", { sites });
+      const sites = options.filter(o => providerEnabled(activeId, o.value)).map(o => o.value);
+      const hideAdult = getProfilePref(activeId, "umd-hide-adult") === "true";
+      const refresh = (command: string, extra: Record<string, unknown> = {}) =>
+        invoke<number>(command, { sites, ...extra }).then(updated => {
+          if (updated) window.dispatchEvent(new Event("umd-catalog-changed"));
+        });
+      await Promise.allSettled([refresh("refresh_saved_editions"), refresh("import_daily_updates", { hideAdult })]);
       refreshedAt = Date.now();
-      if (updated) window.dispatchEvent(new Event("umd-catalog-changed"));
     } catch {
       /* Retry later or when back online instead of locking out for an hour. */
     } finally {
       refreshing = false;
     }
   };
-  void refreshSaved();
+  window.setTimeout(() => void refreshSaved(), Math.max(0, refreshAfter - Date.now()));
   window.setInterval(() => void refreshSaved(), 3600000);
   document.addEventListener("visibilitychange", () => void refreshSaved());
   window.addEventListener("online", () => void refreshSaved());
@@ -181,21 +215,10 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
         const img = document.createElement("img");
         img.alt = "";
         img.loading = "lazy";
-        img.decoding = "async";
-        img.referrerPolicy = "no-referrer";
-        img.addEventListener("error", () => {
-          void invoke<string>("fetch_artwork", { url: coverUrl, providers: [provider] })
-            .then(dataUrl => {
-              if (!img.isConnected) return;
-              img.addEventListener("error", () => { img.remove(); thumb.textContent = hit.title.slice(0, 2).toUpperCase(); }, { once: true });
-              img.src = dataUrl;
-            })
-            .catch(() => {
-              img.remove();
-              thumb.textContent = hit.title.slice(0, 2).toUpperCase();
-            });
-        }, { once: true });
-        img.src = coverUrl;
+        attachArtworkImage(img, coverUrl, [provider], () => {
+          img.remove();
+          thumb.textContent = hit.title.slice(0, 2).toUpperCase();
+        });
         thumb.append(img);
       } else {
         thumb.textContent = hit.title.slice(0, 2).toUpperCase();
@@ -207,7 +230,9 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
     const titleEl = document.createElement("strong");
     titleEl.textContent = hit.title;
     const group = document.createElement("small");
-    group.textContent = hit.group;
+    const item = hit.item ?? hit.entry?.preview;
+    const labelType = bookGroupLabel(hit.edition ? "manga" : catalogGroup(item?.mediaType, item?.subtype));
+    group.textContent = labelType ? hit.group + " · " + ui(labelType) : hit.group;
     label.append(titleEl, group);
 
     const add = document.createElement("button");
@@ -244,15 +269,17 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
 
   let daily = false;
   async function read(source: Source): Promise<{ hits: Hit[]; next: string | null }> {
+    const mediaType = groupMedia(type.value) || null;
+    const subtypeGroup = type.value && type.value !== "audio" ? type.value : null;
     if (source.id === "local" || source.id === "server") {
       let items: CatalogItem[], next: string | null;
       if (source.id === "local") {
         const page = await invokeProfile<{ document: { items: CatalogItem[] }; continuationToken: string | null }>("library",
-          { query: { q: query, cursor: source.cursor, limit: 25 } });
+          { query: { q: query, cursor: source.cursor, mediaType, subtypeGroup, limit: 25, summary: true } });
         items = page.document.items;
         next = page.continuationToken;
       } else {
-        [items, next] = await invoke<[CatalogItem[], string | null]>("search_remote_catalog", { query, cursor: source.cursor });
+        [items, next] = await invoke<[CatalogItem[], string | null]>("search_remote_catalog", { query, cursor: source.cursor, mediaType, subtypeGroup });
       }
       return { hits: items.map(item => ({ item, title: displayTitle(item), group: source.name, cover: item.thumbnailRef })), next };
     }
@@ -285,9 +312,17 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
     if (request !== generation) return;
     if (first) {
       pending = Array.from(site.options)
-        .filter(o => o.value !== "all" && (!daily || !["local", "server"].includes(o.value)) && (site.value === "all"
-          ? (o.value !== "server" || (!!connected && getProfilePref(profileId,"online-catalog")!=="off")) && getProfilePref(profileId, "provider-enabled-" + o.value) !== "false"
-          : o.value === site.value))
+        .filter(o => {
+          const id = o.value;
+          if (id === "all") return false;
+          if (id === "local" || id === "server") {
+            if (daily) return false;
+          } else if (!providerEnabled(profileId, id)) {
+            return false;
+          }
+          if (site.value !== "all") return site.value === id;
+          return id !== "server" || (!!connected && getProfilePref(profileId, "online-catalog") !== "off");
+        })
         .map(o => ({
           id: o.value,
           name: o.text,
@@ -314,6 +349,9 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
           if (request !== generation) return;
           for (const hit of data.hits) {
             if (hiddenTitle(hit.item ?? hit.entry?.preview)) continue;
+            const data = hit.item ?? hit.entry?.preview;
+            const hitGroup = hit.edition ? "manga" : catalogGroup(data?.mediaType, data?.subtype);
+            if (type.value && hitGroup !== type.value) continue;
             const key = source.id + ":" + (hit.item?.syncId ?? hit.entry?.externalId ?? String(hit.edition?.joint) + ":" + hit.edition?.id);
             if (shown.has(key)) continue;
             shown.add(key);
@@ -364,9 +402,10 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       : foundText + (failed.length ? " · " + ui("Fuentes sin respuesta: {0}", failed.join(", ")) : "");
   }
 
-  function openSearch(initialQuery?: string) {
+  function openSearch(initialQuery?: string, initialGroup = "") {
     void windowProfile().then(({ activeId }) => syncPrefs(activeId)).catch(() => {});
-    navigateTo("provider", { resetStack: true });
+    navigateTo("provider", initialQuery ? { push: true } : { resetStack: true });
+    type.value = initialGroup;
     if (initialQuery && initialQuery.trim()) {
       clear();
       site.value = "all";
@@ -384,6 +423,10 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
 
   document.getElementById("provider-open")!.addEventListener("click", () => openSearch());
   site.addEventListener("change", clear);
+  type.addEventListener("change", () => {
+    clear();
+    if (daily || (query = input.value.trim())) void search(true);
+  });
   form.addEventListener("submit", event => {
     event.preventDefault();
     clear();
@@ -401,7 +444,9 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
   librarySearch.addEventListener("keydown", e => {
     if (e.key !== "Enter" || !librarySearch.value.trim()) return;
     e.preventDefault();
-    openSearch(librarySearch.value.trim());
+    const group = document.querySelector<HTMLSelectElement>("#subtype-group")?.value;
+    const media = document.querySelector<HTMLSelectElement>("#media-type")?.value;
+    openSearch(librarySearch.value.trim(), group || (media === "audio" ? "audio" : ""));
   });
   more.addEventListener("click", () => { if (pending.length) void search(false); });
   return openSearch;

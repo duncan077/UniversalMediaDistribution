@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {readdirSync, readFileSync} from "node:fs";
 import test from "node:test";
+import {catalogGroup, groupMedia} from "../src/catalog-types.ts";
 import {
   isHttpsUrl,
   mediaUrl,
@@ -11,9 +12,11 @@ import {
 } from "../src/safety.ts";
 import {
   clearProfilePrefs,
+  disabledProvidersForProfile,
   getProfilePref,
   preferredProvidersForProfile,
   profilePrefKey,
+  providerEnabled,
   setProfilePref,
 } from "../src/profile-prefs.ts";
 
@@ -28,6 +31,14 @@ function memoryStorage(initial = {}) {
     snapshot() { return Object.fromEntries(map); },
   };
 }
+
+test("catalog filters preserve the type when opening same-name books", () => {
+  assert.equal(catalogGroup("book", "book.manga"), "manga");
+  assert.equal(catalogGroup("book", "book.manhwa"), "manga");
+  assert.equal(catalogGroup("book", "book.light_novel"), "prose");
+  assert.equal(catalogGroup("book", "book.comic"), "comic");
+  assert.equal(groupMedia("prose"), "book");
+});
 
 test("remoteUrl rejects credentials and non-HTTP(S) schemes", () => {
   assert.equal(remoteUrl("https://example.com/poster.jpg"), "https://example.com/poster.jpg");
@@ -135,6 +146,21 @@ test("per-profile preferences isolate profiles, preserve legacy fallback, and cl
   assert.equal(storage.getItem(profilePrefKey("p1", "reader-speed")), null);
   assert.equal(storage.getItem(profilePrefKey("p2", "reader-speed")), "3");
   assert.equal(storage.getItem("umd-ui-language"), "en");
+});
+
+test("provider availability respects profile overrides and keeps priority when re-enabled", () => {
+  const storage = memoryStorage({
+    "provider-enabled-jkanime": "false",
+    "provider-favorite-jkanime": "true",
+  });
+  assert.equal(providerEnabled("p1", "manhwaweb", storage), true);
+  assert.deepEqual(preferredProvidersForProfile("p1", storage), []);
+
+  setProfilePref("p1", "provider-enabled-jkanime", "true", storage);
+  setProfilePref("p1", "provider-enabled-json-example", "false", storage);
+  assert.deepEqual(disabledProvidersForProfile("p1", storage), ["json-example"]);
+  assert.deepEqual(disabledProvidersForProfile("p2", storage), ["jkanime"]);
+  assert.deepEqual(preferredProvidersForProfile("p1", storage), ["jkanime"]);
 });
 
 test("locale.ts ui() guards prototype keys with Object.hasOwn and translates English strings", async () => {

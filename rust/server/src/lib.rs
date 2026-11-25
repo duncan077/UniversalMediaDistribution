@@ -1,14 +1,15 @@
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use umd_core::{CatalogDocument, CatalogQuery, CatalogStore};
 use uuid::Uuid;
 mod admin;
@@ -32,6 +33,15 @@ pub struct ServerState {
 
 pub fn router(state: ServerState) -> Router {
     let limits = state.accounts.limits;
+    let work = CatalogWork {
+        readers: state
+            .catalog
+            .readers(4)
+            .map(Arc::new)
+            .map_err(|error| tracing::warn!(%error, "Catalog readers unavailable"))
+            .ok(),
+        ..CatalogWork::default()
+    };
     Router::new()
         .route("/api/v1/catalog/current", get(current).put(publish))
         .route("/api/v1/catalog/metadata", get(metadata))
@@ -42,11 +52,16 @@ pub fn router(state: ServerState) -> Router {
         // Catalog pages are JSON that shrinks about tenfold. Release packages
         // are merged after this layer: they are already compressed and must
         // keep their byte ranges and Content-Length.
-        .layer(tower_http::compression::CompressionLayer::new().gzip(true))
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .quality(tower_http::CompressionLevel::Fastest),
+        )
         .layer(axum::middleware::from_fn_with_state(
             limits::Rate::new(limits.requests),
             limits::catalog_rate,
         ))
+        .layer(Extension(work))
         .merge(admin::routes(&state))
         .merge(
             accounts::routes(&state)
@@ -79,32 +94,69 @@ async fn capabilities(State(state): State<ServerState>) -> Json<Value> {
     }))
 }
 
-async fn current(State(state): State<ServerState>) -> ApiResult {
-    let document = blocking(move || state.catalog.export_with_limit(30 << 20))
-        .await?
-        .ok_or_else(|| {
-            ApiError(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "El catálogo supera 30 MiB. Consultá sus páginas.".into(),
-            )
-        })?;
-    limits::catalog_json(&document, 30 << 20)
+async fn current(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    let known = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|tag| tag.to_str().ok())
+        .map(str::to_owned);
+    work.run(move || {
+        let (tag, document) = catalog.encode_current(known.as_deref(), 30 << 20)?;
+        let response = document.map_or_else(
+            || StatusCode::NOT_MODIFIED.into_response(),
+            limits::json_bytes,
+        );
+        Ok((
+            [("etag", tag), ("cache-control", "no-cache".into())],
+            response,
+        )
+            .into_response())
+    })
+    .await
 }
 
-async fn metadata(State(state): State<ServerState>) -> ApiResult {
-    let metadata = blocking(move || state.catalog.metadata()).await?;
+async fn metadata(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    let metadata = work.run(move || Ok(catalog.metadata()?)).await?;
     Ok(Json(metadata).into_response())
 }
 
-// Extract and authorize headers before parsing an administrative catalog body.
+// Admit only one authenticated upload before reading an administrative catalog body.
 async fn publish(
     State(state): State<ServerState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
+    Extension(work): Extension<CatalogWork>,
+    request: Request,
 ) -> ApiResult {
-    authorize_publication(&state, &headers)?;
-    let document = CatalogDocument::parse_with_limit(&body, state.accounts.limits.json)?;
-    let metadata = blocking(move || state.catalog.publish(&document)).await?;
+    authorize_publication(&state, request.headers())?;
+    let upload = work
+        .upload
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| CatalogWork::busy())?;
+    let limit = state.accounts.limits.json;
+    let body = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "El catálogo no se pudo leer dentro del límite permitido.".into(),
+            )
+        })?;
+    let metadata = work
+        .run(move || {
+            let _upload = upload;
+            let document = CatalogDocument::parse_with_limit(&body, limit)?;
+            drop(body);
+            Ok(state.catalog.publish(&document)?)
+        })
+        .await?;
     Ok(Json(metadata).into_response())
 }
 
@@ -180,50 +232,49 @@ impl Search {
     }
 }
 
-async fn items(State(state): State<ServerState>, Query(query): Query<Search>) -> ApiResult {
-    let mut query = query.query()?;
-    loop {
-        let store = state.catalog.clone();
-        let q = query.clone();
-        let page = blocking(move || store.page(&q)).await?.page;
-        match limits::catalog_json(&page, 8 << 20) {
-            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, _)) if page.document.items.len() > 1 => {
-                query.limit = Some((page.document.items.len() / 2) as u32)
-            }
-            result => return result,
-        }
-    }
+async fn items(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+    Query(query): Query<Search>,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    let query = query.query()?;
+    work.run(move || {
+        let page = catalog.encode_public_page(&query, false, 8 << 20)?;
+        Ok(limits::json_bytes(page.body))
+    })
+    .await
 }
 
-async fn recent(State(state): State<ServerState>) -> ApiResult {
-    limits::catalog_json(
-        &blocking(move || state.catalog.recently_added()).await?,
-        8 << 20,
-    )
+async fn recent(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    work.run(move || Ok(limits::json_bytes(catalog.encode_recent(8 << 20)?)))
+        .await
 }
 
-async fn search(State(state): State<ServerState>, Query(query): Query<Search>) -> ApiResult {
-    let mut query = query.query()?;
+async fn search(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+    Query(query): Query<Search>,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    let query = query.query()?;
     let summary = query.filters.summary;
-    let (page, mut response) = loop {
-        let store = state.catalog.clone();
-        let q = query.clone();
-        let page = blocking(move || store.search(&q)).await?;
-        match limits::catalog_json(&page.page.document, 8 << 20) {
-            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, _))
-                if page.page.document.items.len() > 1 =>
-            {
-                query.limit = Some((page.page.document.items.len() / 2) as u32)
-            }
-            result => break (page, result?),
-        }
-    };
+    let (cursor, mut response) = work
+        .run(move || {
+            let page = catalog.encode_public_page(&query, true, 8 << 20)?;
+            Ok((page.continuation_token, limits::json_bytes(page.body)))
+        })
+        .await?;
     if summary {
         response
             .headers_mut()
             .insert("x-umd-summary", "true".parse().unwrap());
     }
-    if let Some(cursor) = page.page.continuation_token {
+    if let Some(cursor) = cursor {
         response
             .headers_mut()
             .insert("x-umd-next-cursor", cursor.parse().unwrap());
@@ -231,18 +282,74 @@ async fn search(State(state): State<ServerState>, Query(query): Query<Search>) -
     Ok(response)
 }
 
-async fn item(State(state): State<ServerState>, Path(id): Path<Uuid>) -> ApiResult {
-    let document = blocking(move || state.catalog.item(id)).await?;
-    limits::catalog_json(
-        &document.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Title not found".into()))?,
-        8 << 20,
-    )
+async fn item(
+    State(state): State<ServerState>,
+    Extension(work): Extension<CatalogWork>,
+    Path(id): Path<Uuid>,
+) -> ApiResult {
+    let catalog = work.reader(&state.catalog);
+    work.run(move || {
+        let document = catalog
+            .encode_public_item(id, 8 << 20)?
+            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Title not found".into()))?;
+        Ok(limits::json_bytes(document))
+    })
+    .await
 }
 
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> umd_core::Result<T> + Send + 'static,
-) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(work)
+#[derive(Clone)]
+struct CatalogWork {
+    readers: Option<Arc<umd_core::CatalogReaders>>,
+    admitted: Arc<Semaphore>,
+    workers: Arc<Semaphore>,
+    upload: Arc<Semaphore>,
+}
+
+impl Default for CatalogWork {
+    fn default() -> Self {
+        Self {
+            readers: None,
+            admitted: Arc::new(Semaphore::new(16)),
+            workers: Arc::new(Semaphore::new(2)),
+            upload: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+impl CatalogWork {
+    fn reader(&self, writer: &CatalogStore) -> CatalogStore {
+        self.readers
+            .as_ref()
+            .map_or_else(|| writer.clone(), |pool| pool.get())
+    }
+
+    fn busy() -> ApiError {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "El catálogo está ocupado. Reintentá en unos segundos.".into(),
+        )
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        task: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let admitted = self
+            .admitted
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Self::busy())?;
+        let worker = self
+            .workers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Self::busy())?;
+        tokio::task::spawn_blocking(move || {
+            // The permits also cover jobs whose HTTP caller disconnected.
+            let _permits = (admitted, worker);
+            task()
+        })
         .await
         .map_err(|error| {
             tracing::error!(%error, "Catalog worker failed");
@@ -251,7 +358,42 @@ async fn blocking<T: Send + 'static>(
                 "Catalog worker failed".into(),
             )
         })?
-        .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn disconnected_catalog_request_keeps_its_blocking_slot_until_the_work_finishes() {
+    let work = CatalogWork {
+        admitted: Arc::new(Semaphore::new(1)),
+        ..CatalogWork::default()
+    };
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (finish, waiting) = std::sync::mpsc::channel();
+    let other = work.clone();
+    let request = tokio::spawn(async move {
+        other
+            .run(move || {
+                let _ = started.send(());
+                let _ = waiting.recv();
+                Ok(())
+            })
+            .await
+    });
+    running.await.unwrap();
+    request.abort();
+    let _ = request.await;
+    assert!(matches!(
+        work.run(|| Ok(())).await,
+        Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, _))
+    ));
+    finish.send(()).unwrap();
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(2), work.admitted.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(permit);
+    assert!(work.run(|| Ok(())).await.is_ok());
 }
 
 type ApiResult = Result<Response, ApiError>;

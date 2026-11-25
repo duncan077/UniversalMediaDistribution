@@ -133,80 +133,199 @@ pub(crate) fn extract_anime_streams(base: &Url, html: &str) -> Result<Vec<Value>
     Err(Failure::new("unsupported"))
 }
 
-impl Provider {
-    pub(super) async fn index(&mut self) -> Result<&[Entry]> {
-        if self.index.is_none() {
-            let mut entries = match self.site {
-                Site::Olympus => {
-                    let v = self.json("api/series/list", 16).await?;
-                    dedup(rows(&v["data"])?.iter().filter_map(|r| {
-                        let slug = r["slug"].as_str()?;
-                        let name = string(&r["name"])?;
-                        let thumb = artwork_url(&self.base, r["cover"].as_str());
-                        (segment(slug, 240)
-                            && r["type"]
-                                .as_str()
-                                .is_none_or(|t| t.eq_ignore_ascii_case("comic")))
-                        .then(|| book(slug, &name, thumb))
-                    }))
-                }
-                Site::AnimeTmo => {
-                    let v = self.json("wp-content/uploads/az-catalog.json", 4).await?;
-                    let entries = rows(&v)?;
-                    if entries.len() > 20000 {
-                        return Err(invalid());
+pub(super) struct CompactEntry {
+    pub(super) external_id: Box<str>,
+    pub(super) normalized: Box<str>,
+    name: Box<str>,
+    thumbnail: Option<Box<str>>,
+    anime: Option<AnimePreview>,
+}
+
+struct AnimePreview {
+    movie: bool,
+    label: Box<str>,
+    year: Option<u16>,
+    genres: Value,
+    status: Value,
+}
+
+impl CompactEntry {
+    pub(super) fn entry(&self) -> Entry {
+        let Some(anime) = &self.anime else {
+            return book(
+                &self.external_id,
+                &self.name,
+                self.thumbnail.as_deref().map(str::to_owned),
+            );
+        };
+        let mut categories = vec!["Anime"];
+        if !anime.label.is_empty() {
+            categories.push(&anime.label);
+        }
+        Entry {
+            external_id: self.external_id.to_string(),
+            preview: json!({
+                "name": self.name,
+                "mediaType": "movie",
+                "subtype": if anime.movie { "anime_movie" } else { "anime_series" },
+                "thumbnailRef": self.thumbnail,
+                "releaseYear": anime.year,
+                "genres": anime.genres,
+                "publicationStatus": anime.status,
+                "categories": categories
+            }),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OlympusRow<'a> {
+    #[serde(borrow)]
+    slug: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    name: std::borrow::Cow<'a, str>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    cover: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AnimeRow<'a> {
+    id: i64,
+    #[serde(borrow)]
+    slug: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    title: std::borrow::Cow<'a, str>,
+    type_name: Option<String>,
+    type_slug: Option<String>,
+    cover: Option<String>,
+    poster: Option<String>,
+    image: Option<String>,
+    img: Option<String>,
+    thumbnail: Option<String>,
+    #[serde(default)]
+    year: Value,
+    #[serde(default)]
+    genres: Value,
+    #[serde(default)]
+    stat_name: Value,
+}
+
+fn parse_index(site: Site, base: &Url, bytes: &[u8]) -> Result<Vec<CompactEntry>> {
+    use serde_json::value::RawValue;
+    #[derive(serde::Deserialize)]
+    struct OlympusData<'a> {
+        #[serde(borrow)]
+        data: Vec<&'a RawValue>,
+    }
+    let mut entries: Vec<_> = match site {
+        Site::Olympus => {
+            let data: OlympusData = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+            data.data
+                .into_iter()
+                .filter_map(|value| {
+                    let row: OlympusRow = serde_json::from_str(value.get()).ok()?;
+                    let name = row.name.trim();
+                    if name.is_empty()
+                        || !segment(&row.slug, 240)
+                        || row
+                            .kind
+                            .as_deref()
+                            .is_some_and(|kind| !kind.eq_ignore_ascii_case("comic"))
+                    {
+                        return None;
                     }
-                    dedup(entries.iter().filter_map(|r| {
-                        let id = r["id"].as_i64().filter(|v| *v > 0)?;
-                        let slug = r["slug"].as_str()?;
-                        if !segment(slug, 200) || slug.contains('_') {
-                            return None;
-                        }
-                        let name = string(&r["title"])?;
-                        let label = string(&r["type_name"])
-                            .or_else(|| string(&r["type_slug"]))
-                            .unwrap_or_default();
-                        let subtype =
-                            if movie(&label) || r["type_slug"].as_str().is_some_and(movie) {
-                                "anime_movie"
-                            } else {
-                                "anime_series"
-                            };
-                        let mut categories = vec!["Anime"];
-                        if !label.is_empty() {
-                            categories.push(&label);
-                        }
-                        let thumb = artwork_url(
-                            &self.base,
-                            r["cover"]
-                                .as_str()
-                                .or_else(|| r["poster"].as_str())
-                                .or_else(|| r["image"].as_str())
-                                .or_else(|| r["img"].as_str())
-                                .or_else(|| r["thumbnail"].as_str()),
-                        );
-                        Some(Entry {
-                            external_id: format!("{id}/{slug}"),
-                            preview: json!({
-                                "name": name,
-                                "mediaType": "movie",
-                                "subtype": subtype,
-                                "thumbnailRef": thumb,
-                                "releaseYear": integer(&r["year"]).filter(|y| (1800..=2200).contains(y)),
-                                "genres": r["genres"],
-                                "publicationStatus": r["stat_name"],
-                                "categories": categories
-                            }),
-                        })
-                    }))
-                }
-                _ => return Err(invalid()),
-            };
-            if entries.is_empty() {
+                    Some(CompactEntry {
+                        external_id: row.slug.into_owned().into_boxed_str(),
+                        normalized: umd_core::normalize(name).into(),
+                        name: name.into(),
+                        thumbnail: artwork_url(base, row.cover.as_deref())
+                            .map(String::into_boxed_str),
+                        anime: None,
+                    })
+                })
+                .collect()
+        }
+        Site::AnimeTmo => {
+            let data: Vec<&RawValue> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+            if data.len() > 20000 {
                 return Err(invalid());
             }
-            entries.sort_by(|a, b| a.external_id.cmp(&b.external_id));
-            self.index = Some(entries);
+            data.into_iter()
+                .filter_map(|value| {
+                    let row: AnimeRow = serde_json::from_str(value.get()).ok()?;
+                    let name = row.title.trim();
+                    if name.is_empty()
+                        || row.id <= 0
+                        || !segment(&row.slug, 200)
+                        || row.slug.contains('_')
+                    {
+                        return None;
+                    }
+                    let label = row
+                        .type_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .or(row.type_slug.as_deref().map(str::trim))
+                        .unwrap_or_default();
+                    let cover = row
+                        .cover
+                        .or(row.poster)
+                        .or(row.image)
+                        .or(row.img)
+                        .or(row.thumbnail);
+                    Some(CompactEntry {
+                        external_id: format!("{}/{}", row.id, row.slug).into(),
+                        normalized: umd_core::normalize(name).into(),
+                        name: name.into(),
+                        thumbnail: artwork_url(base, cover.as_deref()).map(String::into_boxed_str),
+                        anime: Some(AnimePreview {
+                            movie: movie(label) || row.type_slug.as_deref().is_some_and(movie),
+                            label: label.into(),
+                            year: integer(&row.year)
+                                .filter(|y| (1800..=2200).contains(y))
+                                .map(|year| year as u16),
+                            genres: row.genres,
+                            status: row.stat_name,
+                        }),
+                    })
+                })
+                .collect()
+        }
+        _ => return Err(invalid()),
+    };
+    if entries.is_empty() {
+        return Err(invalid());
+    }
+    entries.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+    entries.dedup_by(|a, b| a.external_id == b.external_id);
+    Ok(entries)
+}
+
+pub(super) struct OlympusChapters {
+    requested: String,
+    slug: String,
+    since: Instant,
+    entries: BTreeMap<String, (String, Value)>,
+}
+
+impl Provider {
+    pub(super) async fn index(&mut self) -> Result<&[CompactEntry]> {
+        if self.index.is_none() {
+            let (route, limit) = match self.site {
+                Site::Olympus => ("api/series/list", 16 << 20),
+                Site::AnimeTmo => ("wp-content/uploads/az-catalog.json", 4 << 20),
+                _ => return Err(invalid()),
+            };
+            let bytes = self.bytes(route, "application/json", limit).await?;
+            let base = self.base.clone();
+            let site = self.site;
+            self.index = Some(
+                tokio::task::spawn_blocking(move || parse_index(site, &base, &bytes))
+                    .await
+                    .map_err(|_| invalid())??,
+            );
         }
         Ok(self.index.as_deref().unwrap_or_default())
     }
@@ -218,7 +337,7 @@ impl Provider {
         let sorted = self.index().await?;
         let page = sorted.get(offset..).ok_or_else(invalid)?;
         Page::directory(
-            page.iter().take(500).cloned().collect(),
+            page.iter().take(500).map(CompactEntry::entry).collect(),
             (page.len() > 500).then(|| (offset + 500).to_string()),
         )
     }
@@ -272,7 +391,14 @@ impl Provider {
         }
         let url = |s: &str| format!("api/series/{s}?type=comic");
         match self.json(&url(slug), 4).await {
-            Ok(v) => Ok((slug.clone(), v)),
+            Ok(v)
+                if v["data"]["type"]
+                    .as_str()
+                    .is_none_or(|kind| kind.eq_ignore_ascii_case("comic")) =>
+            {
+                Ok((slug.clone(), v))
+            }
+            Ok(_) => Err(Failure::new("unsupported")),
             Err(err) if err.status == Some(404) => {
                 let wanted = umd_core::normalize(e.preview["name"].as_str().unwrap_or_default());
                 let stable = REVISION.replace(slug, "");
@@ -281,13 +407,12 @@ impl Provider {
                     REVISION
                         .replace(&c.external_id, "")
                         .eq_ignore_ascii_case(&stable)
-                        && umd_core::normalize(c.preview["name"].as_str().unwrap_or_default())
-                            == wanted
+                        && c.normalized.as_ref() == wanted
                 });
                 let Some(first) = choices.next() else {
                     return Err(err);
                 };
-                let new = first.external_id.clone();
+                let new = first.external_id.to_string();
                 if choices.next().is_some() || new == *slug {
                     return Err(err);
                 }
@@ -309,41 +434,50 @@ impl Provider {
         target: Option<&str>,
     ) -> Result<BTreeMap<String, (String, Value)>> {
         let mut chapters = BTreeMap::new();
-        let mut page = 1;
+        let path =
+            |page| format!("api/series/{slug}/chapters?page={page}&direction=asc&type=comic");
+        let mut next = 1;
+        let mut last = 1;
         loop {
-            let v = self
-                .json(
-                    &format!("api/series/{slug}/chapters?page={page}&direction=asc&type=comic"),
-                    4,
+            let values = if target.is_some() || next == 1 {
+                vec![self.json(&path(next), 4).await]
+            } else {
+                self.request_batch(
+                    (next..=last.min(next + 2)).map(path).collect(),
+                    |mut worker, route: String| async move { Ok(worker.json(&route, 4).await) },
                 )
-                .await?;
-            for row in rows(&v["data"])? {
-                let (Some(id), Some(name)) = (string(&row["id"]), string(&row["name"])) else {
-                    continue;
-                };
-                if !segment(&id, 128) {
-                    continue;
+                .await?
+            };
+            for response in values {
+                let v = response?;
+                let page = next;
+                next += 1;
+                for row in rows(&v["data"])? {
+                    let (Some(id), Some(name)) = (string(&row["id"]), string(&row["name"])) else {
+                        continue;
+                    };
+                    if !segment(&id, 128) {
+                        continue;
+                    }
+                    let n = clean_number(&name);
+                    if !n.is_empty() {
+                        chapters
+                            .entry(n)
+                            .or_insert_with(|| (id, json!(date(&row["published_at"]))));
+                    }
+                    if chapters.len() > 20000 {
+                        return Err(invalid());
+                    }
                 }
-                let n = clean_number(&name);
-                if !n.is_empty() {
-                    chapters
-                        .entry(n)
-                        .or_insert_with(|| (id, json!(date(&row["published_at"]))));
-                }
-                if chapters.len() > 20000 {
+                last = integer(&v["meta"]["last_page"]).unwrap_or(1);
+                if last > 500 {
                     return Err(invalid());
                 }
+                if target.is_some_and(|n| chapters.contains_key(n)) || page >= last {
+                    return Ok(chapters);
+                }
             }
-            let last = integer(&v["meta"]["last_page"]).unwrap_or(1);
-            if last > 500 {
-                return Err(invalid());
-            }
-            if target.is_some_and(|n| chapters.contains_key(n)) || page >= last {
-                break;
-            }
-            page += 1;
         }
-        Ok(chapters)
     }
     pub(super) async fn olympus_detail(&mut self, e: &Entry) -> Result<Value> {
         let (slug, v) = self.olympus_series(e).await?;
@@ -358,7 +492,8 @@ impl Provider {
             .flatten()
             .filter_map(|r| string(&r["name"]))
             .collect();
-        let mut chapters: Vec<_> = self.chapters(&slug, None).await?.into_iter().collect();
+        let entries = self.chapters(&slug, None).await?;
+        let mut chapters: Vec<_> = entries.iter().collect();
         chapters.sort_by(|a, b| numeric_sort(&a.0, &b.0));
         let units: Vec<_> = chapters
             .into_iter()
@@ -367,6 +502,12 @@ impl Provider {
                 json!({"kind":"chapter","displayNumber":n,"sortOrder":i,"releaseDate":d})
             })
             .collect();
+        self.olympus_routes = Some(OlympusChapters {
+            requested: e.external_id.clone(),
+            slug,
+            since: Instant::now(),
+            entries,
+        });
         Ok(json!({
             "mediaType": "book",
             "subtype": "manga",
@@ -383,13 +524,26 @@ impl Provider {
         if self.site != Site::Olympus || chapter.trim().is_empty() || chapter.len() > 240 {
             return Err(invalid());
         }
-        let (slug, _) = self.olympus_series(e).await?;
         let n = clean_number(chapter);
-        let (id, _) = self
-            .chapters(&slug, Some(&n))
-            .await?
-            .remove(&n)
-            .ok_or_else(invalid)?;
+        let cached = self
+            .olympus_routes
+            .as_ref()
+            .filter(|cached| {
+                cached.requested == e.external_id
+                    && cached.since.elapsed() < Duration::from_secs(120)
+            })
+            .and_then(|cached| Some((cached.slug.clone(), cached.entries.get(&n)?.0.clone())));
+        let (slug, id) = if let Some(hit) = cached {
+            hit
+        } else {
+            let (slug, _) = self.olympus_series(e).await?;
+            let (id, _) = self
+                .chapters(&slug, Some(&n))
+                .await?
+                .remove(&n)
+                .ok_or_else(invalid)?;
+            (slug, id)
+        };
         let route = |r: &str| format!("api/capitulo/{slug}/{r}?type=comic");
         let key = if is_finite_number(&n) { &n } else { &id };
         let v = match self.json(&route(key), 24).await {

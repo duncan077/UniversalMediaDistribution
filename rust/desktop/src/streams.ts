@@ -2,6 +2,7 @@ import {activeProfileId,getProfilePref,windowProfile,writeProfilePref} from "./p
 import {ui} from "./locale";
 import {invoke} from "./bridge";
 import {playBroadcast, type Stream} from "./player";
+import {followProvider} from "./provider-playback";
 import {isHttpsUrl} from "./safety";
 import {isPageActive, navigateTo, onPageEnter, onPageLeave} from "./router";
 
@@ -27,6 +28,7 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
   let opening = false;
   const addresses: Record<string, string> = {
     playlist: "https://iptv-org.github.io/iptv/countries/ar.m3u",
+    "ip-tv-app": "https://ip-tv.app/Argentina",
     video: "",
     cablevision: "https://www.cablevisionhd.com/parrilla-directo.php",
     "tv-internet": "https://www.tvporinternet.org/",
@@ -49,13 +51,18 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
   controls.append(heading, grid);
   for (const id of Object.keys(addresses).filter(id => id !== "video")) {
     const label = document.createElement("label"); label.className="toggle-row";
-    const check=document.createElement("input"); check.type="checkbox"; check.checked=true;
+    const check=document.createElement("input"); check.type="checkbox"; check.checked=id !== "ip-tv-app";
     const text = document.createElement("span"); text.textContent = providerName(id);
     enabled.set(id,check); label.append(check,text); grid.append(label);
     check.onchange=()=>{void writeProfilePref("tv-enabled-"+id,String(check.checked)); if(kind.value==="all") byId<HTMLFormElement>("form").requestSubmit();};
   }
   byId("form").after(controls);
-  const loadPrefs=windowProfile().then(()=>{for(const [id,box] of enabled) box.checked=getProfilePref(activeProfileId(),"tv-enabled-"+id)!=="false";}).catch(()=>{});
+  const loadPrefs=windowProfile().then(()=>{
+    for (const [id,box] of enabled) {
+      const saved = getProfilePref(activeProfileId(),"tv-enabled-"+id);
+      if (saved !== null) box.checked = saved !== "false";
+    }
+  }).catch(()=>{});
   showAddress();
   let mode = kind.value;
 
@@ -67,11 +74,16 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
     byId("web").hidden = kind.value !== "video" || !isHttpsUrl(address.value);
   }
   async function open(name: string, url: string, request: number) {
-    const result = await invoke<Stream>("resolve_video", { address: url });
+    const live = mode !== "video";
+    const variants = live
+      ? (await invoke<(Stream & { label: string })[]>("live_variants", { address: url }))
+        .map((source, index) => ({ ...source, live: true, label: source.label || (index === 0 ? ui("Calidad automática") : ui("Señal {0}", index + 1)) }))
+      : undefined;
+    const result = variants?.[0] ?? await invoke<Stream>("resolve_video", { address: url });
     if (request !== generation || !isPageActive("streams")) return;
     status.textContent = "";
     clearFallback();
-    await playBroadcast(name, {...result,live:mode!=="video"}, report);
+    await playBroadcast(name, { ...result, live }, report, variants);
   }
 
   function populateGroups() {
@@ -132,8 +144,19 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
             web.className = "primary";
             web.textContent = ui("Ver en UMD");
             web.onclick = async () => {
-              try { await invoke("open_filtered_player", { address: c.url, language: document.documentElement.lang }); }
-              catch (err) { status.textContent = String(err); }
+              web.disabled = true;
+              try {
+                await followProvider(
+                  c.url,
+                  null,
+                  c.name,
+                  0,
+                  () => {},
+                  captured => playBroadcast(c.name, { ...captured.stream, live: mode !== "video" }, report),
+                  { live: mode !== "video" },
+                );
+              } catch (err) { status.textContent = String(err); }
+              finally { web.disabled = false; }
             };
             fallback.replaceChildren(web);
             fallback.hidden = false;
@@ -222,7 +245,16 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
   const web = byId<HTMLButtonElement>("web");
   web.onclick = async () => {
     web.disabled = true;
-    try { await invoke("open_filtered_player", { address: address.value, language: document.documentElement.lang }); }
+    try {
+      await followProvider(
+        address.value,
+        null,
+        ui("Video online"),
+        0,
+        () => {},
+        captured => playBroadcast(ui("Video online"), captured.stream, report),
+      );
+    }
     catch (e) { status.textContent = String(e); }
     finally { web.disabled = false; }
   };
@@ -262,7 +294,7 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
       } else {
         const sources = mode === "all" ? [...enabled].filter(([,box]) => box.checked).map(([id]) => id) : [mode];
         const results = await Promise.allSettled(sources.map(async id => {
-          const rows = await invoke<Channel[]>("live_channels", {address: mode === "all" ? addresses[id] : address.value, grid: id !== "playlist"});
+          const rows = await invoke<Channel[]>("live_channels", {address: mode === "all" ? addresses[id] : address.value, grid: !["playlist", "ip-tv-app"].includes(id)});
           return rows.map(row => ({...row, provider: id}));
         }));
         if (request !== generation) return;

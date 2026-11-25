@@ -62,11 +62,23 @@ fn key(group: &str, row: &Value) -> Option<String> {
 }
 
 fn records(doc: &Value) -> Option<BTreeMap<String, &Value>> {
+    records_with_items(doc, rows(doc, "items"))
+}
+
+fn records_with_items<'a>(
+    doc: &'a Value,
+    items: impl IntoIterator<Item = &'a Value>,
+) -> Option<BTreeMap<String, &'a Value>> {
     if doc["version"] != 4 {
         return None;
     }
     let mut result = BTreeMap::new();
-    for group in GROUPS {
+    for row in items {
+        if result.insert(key("items", row)?, row).is_some() {
+            return None;
+        }
+    }
+    for &group in &GROUPS[1..] {
         for row in rows(doc, group) {
             if result.insert(key(group, row)?, row).is_some() {
                 return None;
@@ -137,13 +149,38 @@ pub struct BackupRevisionIndex {
 
 impl BackupRevisionIndex {
     pub fn advance(&mut self, previous: Option<&Value>, next: &Value, revision: i64) {
+        self.advance_records(previous.and_then(records), next, revision);
+    }
+
+    /// Merge an owned snapshot and advance stamps without retaining a second catalog.
+    pub fn apply_patch(
+        &mut self,
+        base: Value,
+        patch: &Value,
+        revision: i64,
+        max: usize,
+    ) -> Result<Option<Value>> {
+        let Some((merged, baseline, old_titles)) = merge_owned_patch(base, patch, max)? else {
+            return Ok(None);
+        };
+        // Catalog patches only append titles. Existing rows keep their identity and order.
+        let old = records_with_items(&baseline, rows(&merged, "items").take(old_titles));
+        self.advance_records(old, &merged, revision);
+        Ok(Some(merged))
+    }
+
+    fn advance_records(
+        &mut self,
+        old: Option<BTreeMap<String, &Value>>,
+        next: &Value,
+        revision: i64,
+    ) {
         let Some(current) = records(next) else {
             self.floor = revision;
             self.indexed = false;
             self.revisions.clear();
             return;
         };
-        let old = previous.and_then(records);
         if !self.indexed
             || old.as_ref().is_none_or(|old| {
                 old.len() != self.revisions.len()
@@ -195,9 +232,10 @@ pub fn account_backup_patch(previous: &Value, next: &Value) -> Option<Value> {
 fn build_patch(previous: &Value, next: &Value, allow_omitted_titles: bool) -> Option<Value> {
     let old = records(previous)?;
     let current = records(next)?;
-    if old.keys().any(|k| {
-        !(allow_omitted_titles && k.starts_with("items:")) && !current.contains_key(k)
-    }) {
+    if old
+        .keys()
+        .any(|k| !(allow_omitted_titles && k.starts_with("items:")) && !current.contains_key(k))
+    {
         return None;
     }
     extract(next, |k| {
@@ -390,12 +428,21 @@ pub fn merge_backup_patch_with_limit(
     patch: &Value,
     max: usize,
 ) -> Result<Option<Value>> {
-    let mut catalog = crate::validate_backup_with_limit(base, max)?;
+    Ok(merge_owned_patch(base.clone(), patch, max)?.map(|(merged, _, _)| merged))
+}
+
+fn merge_owned_patch(
+    mut merged: Value,
+    patch: &Value,
+    max: usize,
+) -> Result<Option<(Value, Value, usize)>> {
+    let mut catalog = crate::validate_backup_with_limit(&merged, max)?;
     let incoming = crate::validate_backup_with_limit(patch, max)?;
-    if base["version"] != 4 || patch["version"] != 4 {
+    if merged["version"] != 4 || patch["version"] != 4 {
         return Ok(None);
     }
-    let mut merged = base.clone();
+    let baseline = crate::reconcile::without_items(&merged);
+    let old_titles = catalog.items.len();
     let known = catalog
         .items
         .iter()
@@ -406,7 +453,7 @@ pub fn merge_backup_patch_with_limit(
     let titles = merged["catalog"]["items"]
         .as_array_mut()
         .ok_or_else(|| Error::Invalid("Catálogo de respaldo inválido.".into()))?;
-    for (i, item) in incoming.items.iter().enumerate() {
+    for (i, item) in incoming.items.into_iter().enumerate() {
         if let Some(index) = known.get(&item.id()?) {
             if titles[*index] != patch["catalog"]["items"][i] {
                 return Ok(None);
@@ -416,11 +463,11 @@ pub fn merge_backup_patch_with_limit(
                 return Ok(None);
             }
             titles.push(patch["catalog"]["items"][i].clone());
-            catalog.items.push(item.clone());
+            catalog.items.push(item);
         }
     }
     let mut redirect_sources = HashSet::new();
-    for doc in [base, patch] {
+    for doc in [&baseline, patch] {
         for row in rows(doc, "catalogRedirects") {
             if let Some(id) = row["fromId"]
                 .as_str()
@@ -437,12 +484,13 @@ pub fn merge_backup_patch_with_limit(
     {
         return Ok(None);
     }
-    crate::reconcile::merge_patch_state(base, patch, &catalog, &mut merged)?;
+    crate::reconcile::merge_patch_state(&baseline, patch, &catalog, &mut merged)?;
     for field in ["exportedAt", "deviceId", "deviceName"] {
         merged[field] = patch[field].clone();
     }
-    crate::validate_backup_with_limit(&merged, max)?;
-    Ok(Some(merged))
+    crate::user_state::validate_envelope(&merged, max)?;
+    crate::user_state::validate_personal(&merged, &catalog)?;
+    Ok(Some((merged, baseline, old_titles)))
 }
 
 #[cfg(test)]

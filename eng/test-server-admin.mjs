@@ -5,8 +5,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
-const html = readFileSync(new URL("../src/UniversalMediaDistribution.Server/Admin/index.html", import.meta.url), "utf8");
-const script = readFileSync(new URL("../src/UniversalMediaDistribution.Server/Admin/app.js", import.meta.url), "utf8");
+const html = readFileSync(new URL("../rust/server/src/admin/assets/index.html", import.meta.url), "utf8");
+const script = readFileSync(new URL("../rust/server/src/admin/assets/app.js", import.meta.url), "utf8");
 
 class Element {
   children = []; listeners = new Map(); dataset = {}; value = ""; checked = false; disabled = false; hidden = false;

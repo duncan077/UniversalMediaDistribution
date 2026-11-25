@@ -106,7 +106,7 @@ impl Provider {
             if i > 0 {
                 let host = HOSTS[(initial.unwrap() + i) % HOSTS.len()];
                 let url = Url::parse(&format!("https://{host}/")).map_err(|_| invalid())?;
-                match pinned(&url).await {
+                match pinned(&url, self.cookies.as_ref()).await {
                     Ok(c) => {
                         self.base = url;
                         self.client = c;
@@ -213,55 +213,69 @@ impl Provider {
             return Err(invalid());
         }
         let mut seen = HashSet::new();
+        let seasons: Vec<_> = seasons
+            .iter()
+            .filter_map(|season| {
+                let number = integer(&season["season_number"])
+                    .or_else(|| integer(&season["number"]))
+                    .filter(|n| *n >= 0 && seen.insert(*n))?;
+                Some((number, season))
+            })
+            .collect();
         let mut output = Vec::new();
         let mut count = 0;
-        for season in seasons {
-            let Some(n) = integer(&season["season_number"])
-                .or_else(|| integer(&season["number"]))
-                .filter(|n| *n >= 0 && seen.insert(*n))
-            else {
-                continue;
-            };
-            let v = self
-                .framex_json(&format!("api/season?id={id}&season={n}"))
+        for batch in seasons.chunks(3) {
+            let values = self
+                .request_batch(
+                    batch
+                        .iter()
+                        .map(|(n, _)| format!("api/season?id={id}&season={n}"))
+                        .collect(),
+                    |mut worker, path: String| async move {
+                        let value = worker.framex_json(&path).await?;
+                        Ok((value, worker.base))
+                    },
+                )
                 .await?;
-            if integer(&v["season_number"]).or_else(|| integer(&v["number"])) != Some(n) {
-                if n == 0 {
-                    continue;
-                }
-                return Err(invalid());
-            }
-            let episodes = rows(&v["episodes"])?;
-            count += episodes.len();
-            if count > 20000 {
-                return Err(invalid());
-            }
-            let mut units = Vec::new();
-            let mut seen = HashSet::new();
-            for (i, row) in episodes.iter().enumerate() {
-                let number = integer(&row["episode_number"])
-                    .or_else(|| integer(&row["number"]))
-                    .filter(|n| *n > 0)
-                    .ok_or_else(invalid)?;
-                if integer(&row["season_number"]).is_some_and(|actual| actual != n) {
+            for (&(n, season), (v, base)) in batch.iter().zip(values) {
+                if integer(&v["season_number"]).or_else(|| integer(&v["number"])) != Some(n) {
+                    if n == 0 {
+                        continue;
+                    }
                     return Err(invalid());
                 }
-                if seen.insert(number) {
-                    let mut unit = episode(number, i, row["name"].as_str());
-                    unit["releaseDate"] = json!(date(&row["air_date"]));
-                    unit["thumbnailRef"] = json!(framex_artwork(
-                        &self.base,
-                        row["still"].as_str().or_else(|| row["still_path"].as_str()),
-                        "w500",
-                    ));
-                    units.push(unit);
+                let episodes = rows(&v["episodes"])?;
+                count += episodes.len();
+                if count > 20000 {
+                    return Err(invalid());
                 }
+                let mut units = Vec::new();
+                let mut seen = HashSet::new();
+                for (i, row) in episodes.iter().enumerate() {
+                    let number = integer(&row["episode_number"])
+                        .or_else(|| integer(&row["number"]))
+                        .filter(|n| *n > 0)
+                        .ok_or_else(invalid)?;
+                    if integer(&row["season_number"]).is_some_and(|actual| actual != n) {
+                        return Err(invalid());
+                    }
+                    if seen.insert(number) {
+                        let mut unit = episode(number, i, row["name"].as_str());
+                        unit["releaseDate"] = json!(date(&row["air_date"]));
+                        unit["thumbnailRef"] = json!(framex_artwork(
+                            &base,
+                            row["still"].as_str().or_else(|| row["still_path"].as_str()),
+                            "w500",
+                        ));
+                        units.push(unit);
+                    }
+                }
+                let mut entry = json!({"number":n,"sortOrder":n,"units":units});
+                if let Some(display_name) = string(&v["name"]).or_else(|| string(&season["name"])) {
+                    entry["displayName"] = json!(display_name);
+                }
+                output.push(entry);
             }
-            let mut entry = json!({"number":n,"sortOrder":n,"units":units});
-            if let Some(display_name) = string(&v["name"]).or_else(|| string(&season["name"])) {
-                entry["displayName"] = json!(display_name);
-            }
-            output.push(entry);
         }
         item["seasons"] = json!(output);
         Ok(item)

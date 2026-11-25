@@ -1,7 +1,7 @@
 {
   "name": "umd-desktop",
   "private": true,
-  "version": "0.1.19",
+  "version": "0.1.22",
   "type": "module",
   "scripts": {
     "predev": "node prepare-pdf.mjs",
@@ -9,7 +9,8 @@
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "android:apk": "tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64"
   },
   "dependencies": {
     "@fontsource-variable/archivo": "^5.3.0",

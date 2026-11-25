@@ -2,6 +2,7 @@ import {ui} from "./locale";
 import {invokeProfile} from "./profile-context";
 import type {CatalogItem} from "./main";
 import {isPageActive, navigateTo, onPageEnter} from "./router";
+import {bookGroupLabel, catalogGroup} from "./catalog-types";
 
 interface Person { accountId: string; username: string; displayName: string }
 interface Friend extends Person { shareProgress: boolean }
@@ -14,7 +15,10 @@ interface State {
 interface Progress {
   unitKind?: string; displayNumber?: string; seasonNumber?: number; isCompleted: boolean;
 }
-interface Title extends Progress { title: string; viewerFavorite: boolean; friendFavorite: boolean }
+interface Title extends Progress {
+  title: string; itemKey?: string; mediaType?: string; subtype?: string | null;
+  viewerFavorite: boolean; friendFavorite: boolean;
+}
 interface Comparison { inCommon: Title[]; friendOnly: Title[]; viewerOnly: Title[] }
 interface Activity { key: string; hidden: boolean; matches: (Person & Progress)[] }
 type Action = { kind: string } & Record<string, unknown>;
@@ -70,7 +74,7 @@ export function inlineFriendActivity(item: CatalogItem, signal?: AbortSignal): H
   async function refresh() {
     if (signal?.aborted) return;
     try {
-      const data = await call<Activity>({ kind: "activity", mediaType: item.mediaType, title: item.name });
+      const data = await call<Activity>({ kind: "activity", mediaType: item.mediaType, title: item.name, subtype: item.subtype });
       if (signal?.aborted || !container.isConnected) return;
       container.replaceChildren();
       container.hidden = false;
@@ -105,7 +109,7 @@ export function inlineFriendActivity(item: CatalogItem, signal?: AbortSignal): H
   return container;
 }
 
-export function setupFriends(onSearchTitle?: (query: string) => void) {
+export function setupFriends(onSearchTitle: (query: string, group: string) => void) {
   const content = document.querySelector<HTMLElement>("#friends-content")!;
   const heading = document.querySelector<HTMLElement>("#friends-title")!;
   const status = document.querySelector<HTMLElement>("#friends-status")!;
@@ -255,10 +259,10 @@ export function setupFriends(onSearchTitle?: (query: string) => void) {
         content.append(empty);
         return;
       }
-      for (const [title, rows, searchable] of [
-        [ui("En común"), result.inCommon, false],
-        [ui("Solo de {0}", name(friend)), result.friendOnly, true],
-        [ui("Solo tuyos"), result.viewerOnly, false],
+      for (const [title, rows] of [
+        [ui("En común"), result.inCommon],
+        [ui("Solo de {0}", name(friend)), result.friendOnly],
+        [ui("Solo tuyos"), result.viewerOnly],
       ] as const) {
         if (!rows.length) continue;
         const sec = element("section", "", "surface-panel friends-compare-section");
@@ -266,10 +270,12 @@ export function setupFriends(onSearchTitle?: (query: string) => void) {
         const list = element("ul", "", "compare-list");
         for (const row of rows) {
           const li = element("li");
-          const titleEl = searchable && onSearchTitle
-            ? button(row.title, () => onSearchTitle(row.title), "link-btn")
-            : element("strong", row.title);
+          const media = row.mediaType ?? row.itemKey?.split(/[.:]/, 1)[0];
+          const group = catalogGroup(media, row.subtype);
+          const titleEl = button(row.title, () => onSearchTitle(row.title, group), "link-btn");
           const badges = element("div", "", "compare-badges");
+          const label = bookGroupLabel(group);
+          if (label) badges.append(element("span", ui(label), "entry-badge"));
           badges.append(element("span", position(row), "entry-badge progress"));
           if (row.viewerFavorite) badges.append(element("span", "♥ " + ui("Favorito tuyo"), "entry-badge seen"));
           if (row.friendFavorite) badges.append(element("span", "★ " + ui("Favorito de {0}", name(friend)), "entry-badge"));
@@ -282,9 +288,10 @@ export function setupFriends(onSearchTitle?: (query: string) => void) {
     });
   }
 
-  onPageEnter("friends", home);
+  onPageEnter("friends", () => reload());
   document.querySelector<HTMLButtonElement>("#friends-open")!.onclick = () => {
+    reload = home;
+    if (isPageActive("friends")) { home(); return; }
     navigateTo("friends", { resetStack: true });
-    home();
   };
 }

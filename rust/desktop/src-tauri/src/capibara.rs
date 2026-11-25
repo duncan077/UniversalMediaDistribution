@@ -1,6 +1,6 @@
 use crate::{work, CommandResult};
 
-use reqwest::Client;
+use reqwest::{header, Client};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::Value;
@@ -11,6 +11,7 @@ use std::{
 use tauri::State;
 use umd_core::capibara::*;
 use umd_core::{CatalogDocument, CatalogItem, CatalogStore};
+use umd_providers::browser_http;
 use uuid::Uuid;
 
 const ROOT: &str = "https://capibaratraductor.com";
@@ -21,7 +22,8 @@ pub struct Capibara {
 
 impl Capibara {
     pub fn new() -> Result<Self, reqwest::Error> {
-        let client = Client::builder()
+        let client = browser_http::client_builder()
+            .cookie_store(true)
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
@@ -40,6 +42,7 @@ impl Capibara {
         let mut request = self
             .client
             .get(format!("{}/api/{path}", self.root))
+            .header(header::ACCEPT, "application/json")
             .query(query);
         if let Some(scan) = scan {
             request = request.header("x-organization", scan);
@@ -142,7 +145,7 @@ impl Capibara {
         listing(&data, page)
     }
 
-    async fn daily(&self) -> CommandResult<SearchPage> {
+    pub(super) async fn daily(&self) -> CommandResult<SearchPage> {
         let data = self
             .data(
                 "manga-custom",
@@ -210,10 +213,16 @@ impl Capibara {
                 .item(id)
                 .map_err(|e| e.to_string())?
                 .ok_or("El título ya no está en tu biblioteca.")?;
-            let listed = doc
+            let item = doc
                 .items
                 .first()
-                .and_then(|i| i.metadata.get("units"))
+                .ok_or("El título ya no está en tu biblioteca.")?;
+            if !(item.matches_subtype_group("manga") || item.matches_subtype_group("comic")) {
+                return Err("Esta edición no usa un lector de páginas ilustradas.".into());
+            }
+            let listed = item
+                .metadata
+                .get("units")
                 .and_then(Value::as_array)
                 .is_some_and(|units| {
                     units
@@ -223,11 +232,18 @@ impl Capibara {
             if !listed {
                 return Err("Este capítulo no está disponible.".into());
             }
-            let edition = doc.items[0]
+            let edition = item
                 .metadata
-                .get("onlineProviders")
-                .and_then(|v| v["capibaratraductor"].as_str())
-                .and_then(|s| s.parse().ok())
+                .get("capibaraEdition")
+                .and_then(|value| serde_json::from_value::<Edition>(value.clone()).ok())
+                .filter(Edition::valid)
+                .map(|edition| edition.sync_id())
+                .or_else(|| {
+                    item.metadata
+                        .get("onlineProviders")
+                        .and_then(|v| v["capibaratraductor"].as_str())
+                        .and_then(|s| s.parse().ok())
+                })
                 .unwrap_or(id);
             Ok((edition, number))
         })

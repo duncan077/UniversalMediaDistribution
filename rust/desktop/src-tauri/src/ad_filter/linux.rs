@@ -1,3 +1,4 @@
+use super::playback::Bounds;
 use super::{Mode, SEED};
 use crate::CommandResult;
 use adblock::lists::{FilterSet, ParseOptions, RuleTypes};
@@ -19,7 +20,7 @@ use webkit2gtk::*;
 use webkit2gtk::{ffi, PolicyDecisionType, UserContentManager, WebContext, WebView};
 
 thread_local! {
-    static PLAYERS:RefCell<HashMap<Uuid,(gtk::Window,WebView)>>=RefCell::new(HashMap::new());
+    static PLAYERS:RefCell<HashMap<Uuid,(Option<gtk::Window>,WebView)>>=RefCell::new(HashMap::new());
 }
 pub(super) fn network_rules(lists: &[String]) -> String {
     let mut set = FilterSet::new(true);
@@ -141,12 +142,58 @@ async fn attach(manager: &UserContentManager, root: PathBuf, rules: String) -> C
     recv.await.map_err(|e| e.to_string())?
 }
 
-pub(super) async fn open(app: tauri::AppHandle, url: Url, session: Uuid) -> CommandResult<()> {
+fn player_overlay(app: &tauri::AppHandle) -> CommandResult<gtk::Overlay> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or("Falta la ventana principal.")?;
+    let container = main.default_vbox().map_err(|e| e.to_string())?;
+    let children = container.children();
+    if let Some(overlay) = children
+        .iter()
+        .find_map(|child| child.clone().downcast::<gtk::Overlay>().ok())
+    {
+        return Ok(overlay);
+    }
+    let library = children
+        .iter()
+        .find(|child| child.is::<WebView>())
+        .ok_or("Falta la biblioteca.")?;
+    let overlay = gtk::Overlay::new();
+    container.remove(library);
+    overlay.add(library);
+    container.pack_start(&overlay, true, true, 0);
+    overlay.show();
+    Ok(overlay)
+}
+
+fn place(web: &WebView, overlay: &gtk::Overlay, bounds: Bounds) {
+    let scale = if overlay.allocated_width() > 1 {
+        f64::from(overlay.allocated_width()) / bounds.page_width
+    } else {
+        1.0
+    };
+    let pixels = |v: f64| (v * scale).round() as i32;
+    web.set_margin_start(pixels(bounds.x));
+    web.set_margin_top(pixels(bounds.y));
+    web.set_size_request(pixels(bounds.width).max(1), pixels(bounds.height).max(1));
+}
+
+pub(super) async fn open(
+    app: tauri::AppHandle,
+    url: Url,
+    session: Uuid,
+    bounds: Option<Bounds>,
+) -> CommandResult<()> {
     let rules = isolated_rules(*super::MODE.lock().unwrap());
-    let script = super::payload(&url);
+    let script = if bounds.is_some() {
+        super::player_payload(&url)
+    } else {
+        super::payload(&url)
+    };
     let root = app.state::<super::Directory>().0.join("webkit");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let (send, recv) = tokio::sync::oneshot::channel();
+    let main = app.clone();
     app.run_on_main_thread(move || {
         glib::MainContext::default().spawn_local(async move {
             let manager = UserContentManager::new();
@@ -207,26 +254,62 @@ pub(super) async fn open(app: tauri::AppHandle, url: Url, session: Uuid) -> Comm
                 }
                 deny
             });
-            let window = gtk::Window::new(gtk::WindowType::Toplevel);
-            window.set_default_size(1000, 680);
-            window.set_title(&format!("UMD · {}", url.host_str().unwrap_or_default()));
-            window.add(&web);
-            window.connect_destroy(move |_| {
-                PLAYERS.with(|players| {
-                    players.borrow_mut().remove(&session);
+            let window = if let Some(bounds) = bounds {
+                let overlay = match player_overlay(&main) {
+                    Ok(overlay) => overlay,
+                    Err(e) => {
+                        let _ = send.send(Err(e));
+                        return;
+                    }
+                };
+                web.set_halign(gtk::Align::Start);
+                web.set_valign(gtk::Align::Start);
+                place(&web, &overlay, bounds);
+                overlay.add_overlay(&web);
+                web.show();
+                None
+            } else {
+                let window = gtk::Window::new(gtk::WindowType::Toplevel);
+                window.set_default_size(1000, 680);
+                window.set_title(&format!("UMD · {}", url.host_str().unwrap_or_default()));
+                window.add(&web);
+                window.connect_destroy(move |_| {
+                    PLAYERS.with(|players| players.borrow_mut().remove(&session));
                 });
-            });
+                window.show_all();
+                Some(window)
+            };
             PLAYERS.with(|p| {
                 p.borrow_mut()
                     .insert(session, (window.clone(), web.clone()))
             });
-            window.show_all();
             web.load_uri(url.as_str());
             let _ = send.send(Ok(()));
         });
     })
     .map_err(|e| e.to_string())?;
     recv.await.map_err(|e| e.to_string())?
+}
+
+pub(super) fn layout(
+    app: &tauri::AppHandle,
+    session: Uuid,
+    bounds: Bounds,
+    focus: bool,
+) -> CommandResult<()> {
+    app.run_on_main_thread(move || {
+        PLAYERS.with(|players| {
+            if let Some((None, web)) = players.borrow().get(&session) {
+                if let Some(overlay) = web.parent().and_downcast::<gtk::Overlay>() {
+                    place(web, &overlay, bounds);
+                    if focus {
+                        web.grab_focus();
+                    }
+                }
+            }
+        });
+    })
+    .map_err(|e| e.to_string())
 }
 
 pub(super) async fn command(
@@ -243,7 +326,15 @@ pub(super) async fn command(
             return;
         };
         if close {
-            window.close();
+            if let Some(window) = window {
+                window.close();
+            } else {
+                PLAYERS.with(|players| players.borrow_mut().remove(&id));
+                web.stop_loading();
+                if let Some(overlay) = web.parent().and_downcast::<gtk::Overlay>() {
+                    overlay.remove(&web);
+                }
+            }
             let _ = send.send(Ok("false".into()));
             return;
         }

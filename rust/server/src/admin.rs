@@ -51,13 +51,13 @@ pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
 async fn script() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../../../src/UniversalMediaDistribution.Server/Admin/app.js"),
+        include_str!("admin/assets/app.js"),
     )
 }
 async fn styles() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../../src/UniversalMediaDistribution.Server/Admin/style.css"),
+        include_str!("admin/assets/style.css"),
     )
 }
 async fn admin_headers(request: Request, next: Next) -> Response {
@@ -72,15 +72,16 @@ async fn admin_headers(request: Request, next: Next) -> Response {
     response
 }
 async fn index() -> impl IntoResponse {
-    axum::response::Html(include_str!(
-        "../../../src/UniversalMediaDistribution.Server/Admin/index.html"
-    ))
+    axum::response::Html(include_str!("admin/assets/index.html"))
 }
 pub(crate) async fn count(State(admin): State<Admin>, request: Request, next: Next) -> Response {
     admin.0.requests.fetch_add(1, Ordering::Relaxed);
     let response = next.run(request).await;
     if response.status().is_server_error() {
         admin.0.failed.fetch_add(1, Ordering::Relaxed);
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
         let code = response.status().as_u16();
         let result = tokio::task::spawn_blocking(move || {
             admin.server_event(

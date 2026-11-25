@@ -3,6 +3,77 @@ use umd_core::{CatalogDocument, CatalogQuery, CatalogStore, ListEdit};
 use uuid::Uuid;
 
 #[test]
+fn catalog_and_public_search_separate_same_name_comics_manga_and_novels() {
+    let store = CatalogStore::in_memory().unwrap();
+    let items: Vec<_> = ["book.manga", "book.novel", "book.light_novel", "book.comic"]
+        .into_iter()
+        .map(|subtype| {
+            serde_json::from_value(json!({"name":"Homónimos","mediaType":"book","subtype":subtype}))
+                .unwrap()
+        })
+        .collect();
+    store.import(&CatalogDocument::new(items), false).unwrap();
+    for (group, expected) in [("manga", 1), ("prose", 2), ("comic", 1)] {
+        let query = CatalogQuery {
+            q: "Homonimos".into(),
+            filters: umd_core::CatalogFilters {
+                subtype_group: Some(group.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let local = store.page(&query).unwrap().page.document.items;
+        assert_eq!(local.len(), expected);
+        assert!(local.iter().all(|item| item.matches_subtype_group(group)));
+        let remote = store.encode_public_page(&query, true, 8 << 20).unwrap();
+        assert_eq!(
+            CatalogDocument::parse(&remote.body).unwrap().items.len(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn public_page_stops_at_encoded_budget_and_resumes_without_repeating_rows() {
+    let store = CatalogStore::in_memory().unwrap();
+    let items: Vec<_> = (1..=3)
+        .map(|n| {
+            json!({
+                "syncId": Uuid::from_u128(n), "name": format!("Título {n}"), "mediaType":"movie",
+                "subtype":"movie", "description": "é".repeat(480),
+            })
+        })
+        .collect();
+    let catalog = CatalogDocument::parse(
+        json!({"format":umd_core::CATALOG_FORMAT,"version":1,"items":items})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    store.import(&catalog, true).unwrap();
+    for search in [false, true] {
+        let mut query = CatalogQuery::default();
+        for n in 1..=3 {
+            let encoded = store.encode_public_page(&query, search, 1600).unwrap();
+            assert!(encoded.body.len() <= 1600);
+            let body: serde_json::Value = serde_json::from_slice(&encoded.body).unwrap();
+            let items = if search {
+                &body["items"]
+            } else {
+                &body["document"]["items"]
+            };
+            assert_eq!(items.as_array().unwrap().len(), 1);
+            assert_eq!(items[0]["syncId"], json!(Uuid::from_u128(n)));
+            if !search {
+                assert_eq!(body["continuationToken"], json!(encoded.continuation_token));
+            }
+            query.cursor = encoded.continuation_token;
+            assert_eq!(query.cursor.is_some(), n < 3);
+        }
+    }
+}
+
+#[test]
 fn concurrent_publications_return_metadata_for_their_own_document() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("server.db");
@@ -285,11 +356,16 @@ fn a_catalog_reader_sees_committed_data_during_a_background_write() {
     let pending = writer
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    pending.execute(
-        "INSERT INTO rust_favorites(profile_id,id) VALUES(?1,?2)",
-        rusqlite::params![profile_id, title.to_string()],
-    ).unwrap();
-    let query = CatalogQuery { favorites_only: true, ..Default::default() };
+    pending
+        .execute(
+            "INSERT INTO rust_favorites(profile_id,id) VALUES(?1,?2)",
+            rusqlite::params![profile_id, title.to_string()],
+        )
+        .unwrap();
+    let query = CatalogQuery {
+        favorites_only: true,
+        ..Default::default()
+    };
     assert_eq!(reader.page(&query).unwrap().total, 0);
     pending.commit().unwrap();
     assert_eq!(reader.page(&query).unwrap().favorite_ids, vec![title]);

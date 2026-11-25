@@ -38,6 +38,34 @@ fn first_img_attr(node: &dom_query::Selection<'_>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn book_categories(subtype: Option<&str>, label: Option<&str>) -> Vec<String> {
+    let mut categories = Vec::new();
+    if subtype == Some("manga") {
+        categories.push("Manga".into());
+    }
+    if let Some(label) =
+        label.filter(|label| !label.is_empty() && !label.eq_ignore_ascii_case("manga"))
+    {
+        categories.push(label.to_owned());
+    }
+    categories
+}
+
+fn preferred_type_label<'a>(label: Option<&'a str>, route: Option<&'a str>) -> Option<&'a str> {
+    let kind = |label: &str| umd_core::provider_book_subtype(label);
+    let label = label.filter(|label| kind(label).is_some());
+    if label
+        .and_then(kind)
+        .is_some_and(|kind| matches!(kind, "manga" | "comic"))
+        && route
+            .and_then(kind)
+            .is_some_and(|kind| !matches!(kind, "manga" | "comic"))
+    {
+        return route;
+    }
+    label.or(route)
+}
+
 impl Manga {
     pub fn base(self) -> &'static str {
         match self {
@@ -57,9 +85,7 @@ impl Manga {
             return None;
         }
         let valid = match (self, parts.as_slice()) {
-            (Self::Zona, [kind, n, _]) => {
-                !matches!(*kind, "novel" | "novela") && n.parse::<u64>().is_ok()
-            }
+            (Self::Zona, [_, n, _]) => n.parse::<u64>().is_ok(),
             (Self::Leer, [_, _]) => true,
             (Self::Uchuujin, [slug]) => !matches!(*slug, "list-mode" | "page"),
             _ => false,
@@ -80,15 +106,25 @@ impl Manga {
         }
         Ok(path)
     }
-    fn entry(self, id: &str, title: &str, thumb: Option<String>) -> Entry {
+    fn type_label<'a>(self, id: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Zona => id.split_once('/').map(|(kind, _)| kind),
+            Self::Leer => Some("Manga"),
+            Self::Uchuujin => None,
+        }
+    }
+
+    fn entry(self, id: &str, title: &str, thumb: Option<String>, label: Option<&str>) -> Entry {
+        let label = preferred_type_label(label, self.type_label(id));
+        let subtype = label.and_then(umd_core::provider_book_subtype);
         Entry {
             external_id: id.to_owned(),
             preview: json!({
                 "name": title,
                 "mediaType": "book",
-                "subtype": "manga",
+                "subtype": subtype,
                 "thumbnailRef": thumb,
-                "categories": ["Manga"]
+                "categories": book_categories(subtype, label)
             }),
         }
     }
@@ -111,12 +147,52 @@ impl Manga {
             .flatten()
             .find(|s| !s.trim().is_empty())?;
             let thumb = artwork_url(base, first_img_attr(&a).as_deref());
+            let label = a.select(".book-type,.type,.typez").first().text();
+            let label = label.trim();
             Some(self.entry(
                 id,
                 &name.split_whitespace().collect::<Vec<_>>().join(" "),
                 thumb,
+                Some(label),
             ))
         }))
+    }
+
+    fn detail_type(
+        self,
+        doc: &Document,
+        id: &str,
+        preview: &Value,
+    ) -> (&'static str, Option<String>) {
+        let label = match self {
+            Self::Zona => content(doc, "h1.book-type,.book-type"),
+            Self::Uchuujin => doc
+                .select("div.imptdt")
+                .iter()
+                .find_map(|node| {
+                    let text = node.text();
+                    let start = text.trim();
+                    let prefix = start.get(..4)?;
+                    (prefix.eq_ignore_ascii_case("tipo") || prefix.eq_ignore_ascii_case("type"))
+                        .then(|| {
+                            start[4..]
+                                .trim_matches(|c: char| c.is_whitespace() || c == ':')
+                                .to_owned()
+                        })
+                })
+                .unwrap_or_default(),
+            Self::Leer => String::new(),
+        };
+        if let Some(label) = preferred_type_label(Some(&label), self.type_label(id)) {
+            if let Some(subtype) = umd_core::provider_book_subtype(label) {
+                return (subtype, Some(label.to_owned()));
+            }
+        }
+        let subtype = preview["subtype"]
+            .as_str()
+            .and_then(umd_core::provider_book_subtype)
+            .unwrap_or("manga");
+        (subtype, None)
     }
     fn chapter_links(
         self,
@@ -477,13 +553,20 @@ impl<'a> IntExpr<'a> {
 }
 
 fn parse_string_table(script: &str, fn_name: &str) -> Option<Vec<String>> {
-    let pattern = format!(
-        r"function\s+{}\s*\(\s*\)\s*\{{\s*var\s+[$A-Za-z_][$A-Za-z0-9_]*\s*=\s*\[",
-        regex::escape(fn_name)
-    );
-    let re = Regex::new(&pattern).ok()?;
-    let m = re.find(script)?;
-    let mut pos = m.end();
+    static TABLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+        r"function\s+([$A-Za-z_][$A-Za-z0-9_]*)\s*\(\s*\)\s*\{\s*var\s+[$A-Za-z_][$A-Za-z0-9_]*\s*=\s*\["
+    ).unwrap()
+    });
+    let mut pos = TABLE
+        .captures_iter(script)
+        .find(|candidate| {
+            candidate
+                .get(1)
+                .is_some_and(|name| name.as_str() == fn_name)
+        })?
+        .get(0)?
+        .end();
     let bytes = script.as_bytes();
     let mut values = Vec::new();
     while pos < bytes.len() {
@@ -724,6 +807,19 @@ pub(super) fn zona_cascade_url(url: &Url) -> Option<Url> {
 }
 
 impl Provider {
+    async fn manga_title_html(&mut self, site: Manga, id: &str) -> Result<String> {
+        let path = site.path(id)?;
+        let (html, final_url) = self.html_with_url(&path).await?;
+        if site == Manga::Zona {
+            let returned = site.id(final_url.path()).ok_or_else(invalid)?;
+            // Slugs can change; the type and numeric work ID identify the edition.
+            if !returned.split('/').take(2).eq(id.split('/').take(2)) {
+                return Err(invalid());
+            }
+        }
+        Ok(html)
+    }
+
     pub(super) async fn manga_page(
         &mut self,
         site: Manga,
@@ -750,6 +846,7 @@ impl Provider {
                         site.id(u.path())?,
                         v["label"].as_str().or(v["value"].as_str())?,
                         thumb,
+                        None,
                     ))
                 }));
                 return Ok(Page { items, next: None });
@@ -809,7 +906,7 @@ impl Provider {
                             && site.path(&key).is_ok()
                         {
                             let thumb = artwork_url(&self.base, first_img_attr(&a).as_deref());
-                            entries.push(site.entry(&key, &title, thumb));
+                            entries.push(site.entry(&key, &title, thumb, None));
                         }
                     }
                 }
@@ -825,8 +922,7 @@ impl Provider {
             .collect())
     }
     pub(super) async fn manga_detail(&mut self, site: Manga, e: &Entry) -> Result<Value> {
-        let path = site.path(&e.external_id)?;
-        let doc = Document::from(self.html(&path).await?);
+        let doc = Document::from(self.manga_title_html(site, &e.external_id).await?);
         let selector = match site {
             Manga::Leer => "h1.title-manga,article.lc-panel h1",
             Manga::Zona => "h1.element-title,h1",
@@ -836,6 +932,7 @@ impl Provider {
         if title.is_empty() {
             return Err(invalid());
         }
+        let (subtype, type_label) = site.detail_type(&doc, &e.external_id, &e.preview);
         let desc = content(
             &doc,
             ".manga-collapse,#sinopsis p,#manga-synopsis,.element-description,.entry-content",
@@ -870,13 +967,13 @@ impl Provider {
             .collect();
         Ok(json!({
             "mediaType": "book",
-            "subtype": "manga",
+            "subtype": subtype,
             "name": title,
             "description": desc,
             "thumbnailRef": thumb,
             "genres": genres,
             "publicationStatus": status,
-            "categories": ["Manga"],
+            "categories": book_categories(Some(subtype), type_label.as_deref()),
             "units": units
         }))
     }
@@ -889,13 +986,16 @@ impl Provider {
         if self.site != Site::Manga(site) {
             return Err(invalid());
         }
-        let path = site.path(id)?;
         let target = canonical_number(chapter);
         if target.is_empty() {
             return Err(invalid());
         }
         let route = {
-            let doc = Document::from(self.html(&path).await?);
+            let doc = Document::from(self.manga_title_html(site, id).await?);
+            let (subtype, _) = site.detail_type(&doc, id, &Value::Null);
+            if !matches!(subtype, "manga" | "comic") {
+                return Err(Failure::new("unsupported"));
+            }
             site.chapter_links(&self.base, id, &doc)?
                 .into_iter()
                 .find(|(n, _, _)| canonical_number(n) == target)
@@ -975,24 +1075,41 @@ impl Provider {
             };
             if !payload.is_empty() && !order_key.is_empty() {
                 for script_url in scripts {
-                    if let Ok(bytes) = self
+                    let cached = self
+                        .leer_decoder
+                        .as_ref()
+                        .filter(|(url, at, _)| {
+                            *url == script_url && at.elapsed() < Duration::from_secs(300)
+                        })
+                        .map(|(_, _, alphabets)| alphabets.clone());
+                    if let Some((decoded, encoded)) = cached {
+                        if let Ok(urls) =
+                            decode_leer_images(&payload, &order_key, &decoded, &encoded, &final_url)
+                        {
+                            return Ok(urls);
+                        }
+                    }
+                    let Ok(bytes) = self
                         .bytes(script_url.as_str(), "application/javascript", 4 << 20)
                         .await
-                    {
-                        if let Ok(script) = String::from_utf8(bytes) {
-                            if let Some((decoded_alpha, encoded_alpha)) =
-                                parse_leer_decoder(&script)
-                            {
-                                if let Ok(urls) = decode_leer_images(
-                                    &payload,
-                                    &order_key,
-                                    &decoded_alpha,
-                                    &encoded_alpha,
-                                    &final_url,
-                                ) {
-                                    return Ok(urls);
-                                }
-                            }
+                    else {
+                        continue;
+                    };
+                    let alphabets = tokio::task::spawn_blocking(move || {
+                        String::from_utf8(bytes)
+                            .ok()
+                            .and_then(|script| parse_leer_decoder(&script))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some((decoded, encoded)) = alphabets {
+                        if let Ok(urls) =
+                            decode_leer_images(&payload, &order_key, &decoded, &encoded, &final_url)
+                        {
+                            self.leer_decoder =
+                                Some((script_url, Instant::now(), (decoded, encoded)));
+                            return Ok(urls);
                         }
                     }
                 }

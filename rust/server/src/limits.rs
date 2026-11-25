@@ -1,4 +1,4 @@
-use super::{accounts::ClientAddress, ApiError, ApiResult};
+use super::accounts::ClientAddress;
 use axum::{
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
@@ -7,7 +7,6 @@ use axum::{
 };
 use std::{
     collections::HashMap,
-    io,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -93,53 +92,15 @@ pub async fn catalog_rate(
     }
     next.run(request).await
 }
-pub fn catalog_json(value: &impl serde::Serialize, max: usize) -> ApiResult {
-    struct Bounded {
-        bytes: Vec<u8>,
-        max: usize,
-    }
-    impl io::Write for Bounded {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            if data.len() > self.max - self.bytes.len() {
-                return Err(io::ErrorKind::FileTooLarge.into());
-            }
-            self.bytes.extend_from_slice(data);
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut writer = Bounded {
-        bytes: Vec::new(),
-        max,
-    };
-    serde_json::to_writer(&mut writer, value).map_err(|e| {
-        if e.io_error_kind() == Some(io::ErrorKind::FileTooLarge) {
-            ApiError(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "El catálogo supera el tamaño permitido. Consultá una página más pequeña.".into(),
-            )
-        } else {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "No se pudo serializar el catálogo.".into(),
-            )
-        }
-    })?;
-    Ok(([(header::CONTENT_TYPE, "application/json")], writer.bytes).into_response())
+pub fn json_bytes(bytes: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn catalog_bounds_encoded_bytes_and_keeps_ip_counters_separate() {
-        assert!(catalog_json(&"é", 4).is_ok());
-        assert!(matches!(
-            catalog_json(&"é", 3),
-            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, _))
-        ));
+    fn catalog_rate_keeps_ip_counters_separate() {
         let rate = Rate::new(1);
         assert_eq!(rate.retry("192.0.2.1".into()), None);
         assert!(rate.retry("192.0.2.1".into()).is_some());

@@ -38,15 +38,23 @@ export function setupDownloads(open: Open) {
   const register=document.getElementById("torrent-register")!;register.hidden=/Android/i.test(navigator.userAgent);
   register.onclick=()=>void invoke("register_magnets").then(()=>{settingsStatus.textContent=ui("Asociación registrada.");}).catch(e=>settingsStatus.textContent=String(e));
   const floating=document.createElement("button");floating.type="button";floating.className="app-notice download-notice";floating.hidden=true;floating.onclick=()=>show();(document.getElementById("app-notice-stack") ?? document.body).append(floating);
+  const transferring = (d: Download) => !d.ready && !d.error && d.state !== "paused";
   let backgroundBusy=false;
+  let backgroundTimer: ReturnType<typeof setTimeout>;
   async function background() {
+    clearTimeout(backgroundTimer);
     if(backgroundBusy || document.hidden || isPageActive("downloads")){floating.hidden=true;return;}
     backgroundBusy=true;
-    try{const list=await invoke<Download[]>("list_downloads",{activeOnly:true});const d=list.find(d=>!d.ready && !d.error && d.state!=="paused");
-      floating.hidden=!d || isPageActive("downloads");if(d)floating.textContent=d.name+" · "+formatBytes(d.received)+" / "+formatBytes(d.total);
+    try{const list=await invoke<Download[]>("list_downloads",{activeOnly:true});const d=list.find(transferring);
+      floating.hidden=!d || document.hidden || isPageActive("downloads");
+      if (!floating.hidden && d) {
+        floating.textContent=d.name+" · "+formatBytes(d.received)+" / "+formatBytes(d.total);
+        backgroundTimer = setTimeout(() => void background(), 4000);
+      }
+    }catch{floating.hidden=true;
     }finally{backgroundBusy=false;}
   }
-  window.setInterval(()=>void background().catch(()=>{floating.hidden=true;}),4000);
+  document.addEventListener("visibilitychange", () => void background());
   const targets = new Map<number, Target>();
   let timer: ReturnType<typeof setTimeout>;
   let generation = 0;
@@ -212,9 +220,11 @@ export function setupDownloads(open: Open) {
   let emptyEl: HTMLElement | null = null;
   async function refresh(request: number) {
     clearTimeout(timer);
+    let active = false;
     try {
       const list = await invoke<Download[]>("list_downloads");
       if (generation !== request || !isPageActive("downloads")) return;
+      active = list.some(transferring);
       updateStats(list);
       const activeIds = new Set(list.map(d => d.id));
       for (const [id, row] of rows) {
@@ -246,7 +256,7 @@ export function setupDownloads(open: Open) {
     } catch (e) {
       if (generation === request) output.textContent = String(e);
     } finally {
-      if (generation === request && isPageActive("downloads")) {
+      if (active && generation === request && isPageActive("downloads")) {
         clearTimeout(timer);
         timer = setTimeout(() => void refresh(request), 2500);
       }
@@ -281,6 +291,7 @@ export function setupDownloads(open: Open) {
         }
       }
       if (isPageActive("downloads")) await refresh(generation);
+      else void background();
     } catch (e) {
       output.textContent = String(e);
     } finally {
@@ -290,12 +301,14 @@ export function setupDownloads(open: Open) {
   }
 
   onPageEnter("downloads", () => {
+    clearTimeout(backgroundTimer);
     floating.hidden=true;
     void refresh(++generation);
   });
   onPageLeave("downloads", () => {
     ++generation;
     clearTimeout(timer);
+    queueMicrotask(() => void background());
   });
 
   document.getElementById("downloads-open")!.onclick = show;

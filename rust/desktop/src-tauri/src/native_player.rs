@@ -2,6 +2,72 @@ use crate::CommandResult;
 use serde_json::Value;
 use tauri::Manager;
 
+#[cfg(any(target_os = "android", test))]
+fn subtitle_cues(text: &str) -> Vec<serde_json::Value> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static BLOCKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n[ \t]*\n").unwrap());
+    static TIMING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"((?:\d{1,3}:)?\d{2}:\d{2}[.,]\d{3})\s+-->\s+((?:\d{1,3}:)?\d{2}:\d{2}[.,]\d{3})",
+        )
+        .unwrap()
+    });
+    static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
+    fn millis(stamp: &str) -> Option<u64> {
+        let (time, fraction) = stamp.rsplit_once(['.', ','])?;
+        let mut seconds = 0_u64;
+        for part in time.split(':') {
+            seconds = seconds * 60 + part.parse::<u64>().ok()?;
+        }
+        Some(seconds * 1000 + fraction.parse::<u64>().ok()?)
+    }
+    let normalized = text.replace('\r', "");
+    let mut cues: Vec<_> = BLOCKS
+        .split(&normalized)
+        .filter_map(|block| {
+            let mut lines = block.lines();
+            let timing = lines.find_map(|line| TIMING.captures(line))?;
+            let start = millis(&timing[1])?;
+            let end = millis(&timing[2])?;
+            let text = lines.collect::<Vec<_>>().join("\n");
+            let clean = TAGS
+                .replace_all(&text, "")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&");
+            Some((
+                start,
+                serde_json::json!({"start":start, "end":end, "text":clean}),
+            ))
+        })
+        .collect();
+    cues.sort_by_key(|(start, _)| *start);
+    cues.into_iter().map(|(_, cue)| cue).collect()
+}
+
+#[cfg(test)]
+#[test]
+fn android_subtitles_accept_vtt_and_srt_and_sort_cues() {
+    let cues = subtitle_cues("WEBVTT\r\n\r\n00:03.000 --> 00:04.500 align:start\r\n<i>hola</i> &amp; adiós\r\n\r\n1\r\n00:00:01,200 --> 00:00:02,500\r\nprimero");
+    assert_eq!(
+        cues,
+        vec![
+            serde_json::json!({"start":1200,"end":2500,"text":"primero"}),
+            serde_json::json!({"start":3000,"end":4500,"text":"hola & adiós"}),
+        ]
+    );
+}
+
+struct ClosingRelay(Option<uuid::Uuid>);
+impl Drop for ClosingRelay {
+    fn drop(&mut self) {
+        if let Some(id) = self.0 {
+            crate::hls_proxy::end(&id.to_string());
+        }
+    }
+}
+
 /// Resolve file handles only from locations already authorized by the native picker.
 fn source(window: &tauri::WebviewWindow, value: &str) -> CommandResult<String> {
     let url = reqwest::Url::parse(value).map_err(|_| "Dirección de reproducción inválida.")?;
@@ -71,9 +137,7 @@ pub async fn native_playback(
         }
         return Ok(serde_json::json!({}));
     }
-    if operation == "close" {
-        crate::hls_proxy::end(args["id"].as_str().unwrap_or(""));
-    }
+    let _relay = ClosingRelay((operation == "close").then_some(id));
     if operation == "start" {
         if let Some(tracks) = args["tracks"].as_array_mut() {
             tracks.truncate(100);
@@ -126,16 +190,21 @@ pub async fn native_playback(
             if !response.status().is_success() {
                 return Err("No se pudo descargar el subtítulo.".into());
             }
-            args["text"] =
-                Value::String(crate::streams::bounded_text(response, 1024 * 1024).await?);
+            let text = crate::streams::bounded_text(response, 1024 * 1024).await?;
+            let cues = crate::work(move || Ok(subtitle_cues(&text))).await?;
+            if cues.is_empty() {
+                return Err("No se encontraron subtítulos válidos.".into());
+            }
+            args["cues"] = Value::Array(cues);
         }
+        let data = args.to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
         window
             .with_webview(move |web| {
                 web.jni_handle().exec(move |env, activity, _| {
                     let result = (|| -> jni::errors::Result<String> {
                         let op = env.new_string(operation)?;
-                        let json = env.new_string(args.to_string())?;
+                        let json = env.new_string(data)?;
                         let text = env
                             .call_method(
                                 activity,

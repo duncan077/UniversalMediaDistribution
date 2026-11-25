@@ -31,7 +31,9 @@ static RAW_HLS: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-const EPISODE_THUMB_BASE: &str = "https://cdn.jkdesa.com/assets/images/animes/video/image_thumb/";
+static EPISODE_THUMB_BASE: LazyLock<Url> = LazyLock::new(|| {
+    Url::parse("https://cdn.jkdesa.com/assets/images/animes/video/image_thumb/").unwrap()
+});
 
 pub(super) fn parse_jk_episode(raw: &str) -> Option<(f64, String)> {
     let n = canonical_number(raw);
@@ -50,8 +52,7 @@ fn jk_episode_thumb(base: &Url, raw: Option<&str>) -> Option<String> {
     if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("//") {
         artwork_url(base, Some(raw))
     } else if !raw.contains('/') && !raw.contains('\\') && !raw.contains("..") {
-        let thumb_base = Url::parse(EPISODE_THUMB_BASE).ok()?;
-        artwork_url(&thumb_base, Some(raw))
+        artwork_url(&EPISODE_THUMB_BASE, Some(raw))
     } else {
         artwork_url(base, Some(raw))
     }
@@ -603,29 +604,52 @@ impl Provider {
         };
         let mut seen = HashSet::new();
         let mut episodes: Vec<(f64, String, Option<String>, Option<String>)> = Vec::new();
-        for p in 1..=1000 {
-            let data = self
-                .jk_post(&format!("ajax/episodes/{id}/{p}"), None)
-                .await?;
-            let before = episodes.len();
-            for row in rows(&data["data"])? {
-                if let Some((ord, num)) = string(&row["number"]).and_then(|s| parse_jk_episode(&s))
-                {
-                    if seen.insert(num.clone()) {
-                        let title = string(&row["title"]);
-                        let thumb = jk_episode_thumb(&self.base, row["image"].as_str());
-                        episodes.push((ord, num, title, thumb));
+        let mut next = 1;
+        let mut first = Some(self.jk_post(&format!("ajax/episodes/{id}/1"), None).await?);
+        let mut last = integer(&first.as_ref().unwrap()["last_page"])
+            .unwrap_or(1)
+            .max(1);
+        if last > 1000 {
+            return Err(invalid());
+        }
+        while next <= last {
+            let values = if let Some(first) = first.take() {
+                vec![Ok(first)]
+            } else {
+                self.request_batch((next..=last.min(next + 2)).map(|p| format!("ajax/episodes/{id}/{p}")).collect(), |mut worker, route: String| async move {
+                    Ok(worker.jk_post(&route, None).await)
+                })
+                .await?
+            };
+            for response in values {
+                let data = response?;
+                let p = next;
+                next += 1;
+                let before = episodes.len();
+                for row in rows(&data["data"])? {
+                    if let Some((ord, num)) =
+                        string(&row["number"]).and_then(|s| parse_jk_episode(&s))
+                    {
+                        if seen.insert(num.clone()) {
+                            let title = string(&row["title"]);
+                            let thumb = jk_episode_thumb(&self.base, row["image"].as_str());
+                            episodes.push((ord, num, title, thumb));
+                        }
                     }
                 }
-            }
-            if episodes.len() > 20000 {
-                return Err(invalid());
-            }
-            if integer(&data["last_page"]).unwrap_or(p) <= p {
-                break;
-            }
-            if before == episodes.len() || p == 1000 {
-                return Err(invalid());
+                if episodes.len() > 20000 {
+                    return Err(invalid());
+                }
+                last = integer(&data["last_page"]).unwrap_or(p).max(p);
+                if last > 1000 {
+                    return Err(invalid());
+                }
+                if p >= last {
+                    break;
+                }
+                if before == episodes.len() {
+                    return Err(invalid());
+                }
             }
         }
         if episodes.is_empty() && movie {

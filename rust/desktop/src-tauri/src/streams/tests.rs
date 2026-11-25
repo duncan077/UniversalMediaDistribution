@@ -2,8 +2,8 @@ use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::cell::Cell;
 
-#[test]
-fn mega_file_links_keep_the_share_key_for_the_official_player() {
+#[tokio::test]
+async fn mega_file_links_keep_the_share_key_for_the_official_player() {
     let id = "aB1_cdE2";
     let key = "a".repeat(43);
     let expected = format!("https://mega.nz/embed/{id}#{key}");
@@ -13,7 +13,10 @@ fn mega_file_links_keep_the_share_key_for_the_official_player() {
         expected.clone(),
     ] {
         assert_eq!(
-            provider_web_address(Url::parse(&address).unwrap()).as_str(),
+            provider_web_address(Url::parse(&address).unwrap())
+                .await
+                .unwrap()
+                .as_str(),
             expected
         );
     }
@@ -63,6 +66,31 @@ async fn upnshare_only_follows_public_targets_from_its_resolver() {
             assert_eq!(stream.referer.as_deref(), Some("https://animeav1.uns.bio/"));
         }
     }
+}
+
+#[tokio::test]
+async fn upnshare_falls_back_to_the_delegated_player_and_rejects_removed_videos() {
+    let original = Url::parse("https://animeav1.uns.bio/#abc123").unwrap();
+    let delegated = Url::parse("https://turboembed.com/test").unwrap();
+    let mut browser = Some(original.clone());
+    let _ = resolve_pages(original.clone(), None, &mut browser, async |url, _| {
+        if url == original {
+            Ok(Page::Redirect(url, delegated.clone()))
+        } else {
+            assert_eq!(url, delegated);
+            Err("Verification required".into())
+        }
+    })
+    .await;
+    assert_eq!(browser, Some(delegated));
+
+    let mut browser = Some(original.clone());
+    let result = resolve_pages(original, None, &mut browser, async |_, _| {
+        Ok(Page::ProviderUnavailable("Video unavailable"))
+    })
+    .await;
+    assert_eq!(result.unwrap_err(), "Video unavailable");
+    assert!(browser.is_none());
 }
 
 #[tokio::test]
@@ -469,4 +497,28 @@ fn speedfiles_and_upzur_decode_without_executing_scripts() {
     let base = Url::parse("https://upzur.com/e/film").unwrap();
     let html = r#"<script>var uHo4sc = ['\x3c/video>', '<video><source src="https://cdn.example/film.mp4">\x3e'];</script>"#;
     assert_eq!(extract(&base, &Document::from(html)).unwrap().url, movie);
+}
+#[test]
+fn tv_grid_keeps_labeled_signals_and_hls_resolutions() {
+    let page = Url::parse("https://example.com/channel").unwrap();
+    let links = live_server_links(
+        &page,
+        r#"
+        <a href="/first">Opción HD</a><button data-src="/second">Servidor FHD</button>
+        <a href="/first">Servidor duplicado</a><a href="/unrelated">Noticias</a>
+        <button data-url="http://127.0.0.1/private">Servidor privado</button>"#,
+    );
+    assert_eq!(
+        links.iter().map(|(_, url)| url.path()).collect::<Vec<_>>(),
+        ["/first", "/second"]
+    );
+    let variants = live_hls_qualities(&page, "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=640x360\nlo.m3u8\n#EXT-X-STREAM-INF:RESOLUTION=1920x1080\nhi.m3u8\n#EXT-X-STREAM-INF:RESOLUTION=1280x720,AUDIO=\"external\"\nneeds-master.m3u8");
+    assert_eq!(
+        variants
+            .iter()
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>(),
+        [1080, 360]
+    );
+    assert_eq!(variants[0].1.path(), "/hi.m3u8");
 }

@@ -4,10 +4,10 @@ Description=UMD catalog metadata backfill and refresh
 [Service]
 Type=oneshot
 # Match the existing umd-server deployment and its durable data directory.
-Environment=UMD_SERVER_DATA_DIRECTORY=%h/apps/umd-server/data
+Environment=UMD_RUST_SERVER_DATA_DIRECTORY=%h/apps/umd-server/data
 EnvironmentFile=%h/apps/umd-server/config/environment
 WorkingDirectory=%h/apps/umd-server
-ExecStart=%h/apps/umd-server/current/UniversalMediaDistribution.Server --scrape-once
+ExecStart=%h/apps/umd-server/current/umd-server --scrape-once
 TimeoutStartSec=55min
 TimeoutStopSec=45s
 KillSignal=SIGTERM

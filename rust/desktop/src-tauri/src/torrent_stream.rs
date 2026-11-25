@@ -56,7 +56,7 @@ impl Streams {
     fn open_archive(&self, archive: Archive, paths: Vec<String>) -> CommandResult<Vec<String>> {
         let mut books = self.2.lock().map_err(|_| "Lector ocupado.")?;
         let token = Uuid::new_v4();
-        if books.len() >= 8 {
+        if books.len() >= if cfg!(target_os = "android") { 2 } else { 8 } {
             books.pop_front();
         }
         books.push_back((token, Arc::new(Mutex::new(archive))));
@@ -72,12 +72,13 @@ pub fn close_book(streams: State<'_, Streams>, id: Uuid) {
         books.retain(|(token, _)| *token != id);
     }
 }
-pub(super) fn open_epub(
+pub(super) fn open_local_archive(
     app: &tauri::AppHandle,
     path: &std::path::Path,
+    epub: bool,
 ) -> CommandResult<Vec<String>> {
     let reader = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let (archive, names) = Archive::open(Box::new(reader), true)?;
+    let (archive, names) = Archive::open(Box::new(reader), epub)?;
     app.state::<Streams>().open_archive(archive, names)
 }
 enum Archive {
@@ -180,6 +181,7 @@ fn raster(name: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         "avif" => Some("image/avif"),
         "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
         _ => None,
     }
 }
@@ -345,6 +347,14 @@ async fn serve(app: tauri::AppHandle, req: Request<Vec<u8>>) -> Response<Vec<u8>
     if !matches!(req.method().as_str(), "HEAD" | "GET") {
         return status(405);
     }
+    if req.uri().path() == "/artwork" {
+        return crate::artwork::serve(&app, &req).await;
+    }
+    #[cfg(target_os = "android")]
+    if let Some(path) = req.uri().path().strip_prefix("/tiles/") {
+        return crate::reader_tiles::serve(&app, path, req.method() == tauri::http::Method::HEAD)
+            .await;
+    }
     let path = percent_encoding::percent_decode_str(req.uri().path().trim_start_matches('/'))
         .decode_utf8_lossy();
     if let Some((token, name)) = path.split_once('/') {
@@ -352,21 +362,7 @@ async fn serve(app: tauri::AppHandle, req: Request<Vec<u8>>) -> Response<Vec<u8>
         else {
             return status(404);
         };
-        let archive = app.state::<Streams>().2.lock().ok().and_then(|book| {
-            book.iter()
-                .find(|(id, _)| *id == token)
-                .map(|(_, archive)| archive.clone())
-        });
-        let Some(archive) = archive else {
-            return status(404);
-        };
-        let resource = crate::work(move || {
-            archive
-                .lock()
-                .map_err(|_| "Lector ocupado.")?
-                .resource(&name)
-        })
-        .await;
+        let resource = archive_resource(&app, token, name).await;
         return match resource {
             Ok((bytes, mime)) => Response::builder()
                 .header("content-type", mime)
@@ -443,6 +439,31 @@ async fn serve(app: tauri::AppHandle, req: Request<Vec<u8>>) -> Response<Vec<u8>
         Err(_) => status(504),
     }
 }
+
+pub(crate) async fn archive_resource(
+    app: &tauri::AppHandle,
+    token: Uuid,
+    name: String,
+) -> CommandResult<(Vec<u8>, &'static str)> {
+    let archive = app
+        .state::<Streams>()
+        .2
+        .lock()
+        .ok()
+        .and_then(|book| {
+            book.iter()
+                .find(|(id, _)| *id == token)
+                .map(|(_, archive)| archive.clone())
+        })
+        .ok_or("El libro ya se cerró.")?;
+    crate::work(move || {
+        archive
+            .lock()
+            .map_err(|_| "Lector ocupado.")?
+            .resource(&name)
+    })
+    .await
+}
 pub fn protocol(
     ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     req: Request<Vec<u8>>,
@@ -470,6 +491,21 @@ pub fn protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comic_pages_do_not_expose_archive_paths() {
+        use std::io::{Cursor, Write};
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("../../page2.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"image").unwrap();
+        let (mut archive, paths) = Archive::open(Box::new(zip.finish().unwrap()), false).unwrap();
+        assert_eq!(paths, ["page-0"]);
+        assert_eq!(
+            archive.resource(&paths[0]).unwrap(),
+            (b"image".to_vec(), "image/png")
+        );
+        assert!(archive.resource("../../page2.png").is_err());
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reads_a_comic_page_from_a_peer_before_the_torrent_finishes() {
         use crate::downloads::tests::local_session;

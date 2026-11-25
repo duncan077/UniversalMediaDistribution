@@ -25,7 +25,7 @@ pub async fn metadata_preferences(
     work(move || {
         metadata_preferences_io(
             profile_id,
-            &app.state::<crate::CatalogReads>().0,
+            &app.state::<crate::CatalogReads>().0.get(),
             &app.state::<crate::private_files::PrivateFiles>(),
             tmdb,
             mal,
@@ -50,7 +50,11 @@ fn metadata_preferences_io(
         .unwrap_or_default();
     if tmdb.is_some() || mal.is_some() || language.is_some() {
         if let Some(lang) = language {
-            if !matches!(lang.as_str(), "" | "es-AR" | "en-US" | "ja-JP") {
+            if !lang.is_empty()
+                && (lang.len() > 35 || !lang.split('-').all(|part| {
+                    !part.is_empty() && part.len() <= 8 && part.bytes().all(|c| c.is_ascii_alphanumeric())
+                }))
+            {
                 return Err("Idioma no compatible.".into());
             }
             prefs.language = Some(lang);

@@ -79,7 +79,7 @@ def package(binary, output, linux_vlc):
                 launcher.external_attr = 0o100755 << 16
                 archive.writestr(launcher, '#!/bin/sh\nset -eu\napp=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport VLC_PLUGIN_PATH="$app/libvlc/plugins"\nexec "$app/umd-desktop" "$@"\n')
                 readme = "Extraé el ZIP con unzip y ejecutá ./UMD en una sesión gráfica. Requiere GTK 3 y WebKitGTK 4.1. El paquete incluye VLC."
-            archive.writestr("LEEME.txt", readme + "\nPara actualizar, cerrá UMD y extraé la nueva versión en otra carpeta. La biblioteca se guarda en tu perfil de usuario.\n")
+            archive.writestr("LEEME.txt", readme + "\nPara actualizar, abrí Configuración → Actualizaciones y elegí Actualizar y reiniciar. La biblioteca se guarda en tu perfil de usuario.\n")
         os.replace(archive_path, final)
     return final
 

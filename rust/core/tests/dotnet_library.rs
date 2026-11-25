@@ -8,17 +8,8 @@ fn oldest_dotnet_library_restores_without_rewriting_the_source() {
     let source = dir.path().join("old.umdbackup");
     let db = Connection::open(&source).unwrap();
     // Use the exact schema that shipped with the first client.
-    let migration = include_str!(
-        "../../../src/UniversalMediaDistribution.Catalog.Sqlite/SqliteCatalogMigrator.cs"
-    );
-    let sql = migration
-        .split_once("string VersionOneSql = \"\"\"")
-        .unwrap()
-        .1
-        .split_once("\"\"\";")
-        .unwrap()
-        .0;
-    db.execute_batch(sql).unwrap();
+    db.execute_batch(include_str!("fixtures/dotnet-v1.sql"))
+        .unwrap();
     db.execute_batch("INSERT INTO catalog_items(id,media_type,subtype_code,name,name_key,created_at,updated_at)
         VALUES('a','movie','movie.series','Serie','SERIE','2024-01-01','2024-01-01');
         INSERT INTO library_entries(catalog_item_id,is_favorite,added_at) VALUES('a',1,'2024-01-01 00:00:00');
@@ -71,23 +62,16 @@ fn dotnet_restore_preserves_credential_key_normalizes_timestamps_and_skips_orpha
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("v8.umdbackup");
     let db = Connection::open(&source).unwrap();
-    let migration = include_str!(
-        "../../../src/UniversalMediaDistribution.Catalog.Sqlite/SqliteCatalogMigrator.cs"
-    );
-    let sql = migration
-        .split_once("string VersionOneSql = \"\"\"")
-        .unwrap()
-        .1
-        .split_once("\"\"\";")
-        .unwrap()
-        .0;
-    db.execute_batch(sql).unwrap();
+    db.execute_batch(include_str!("fixtures/dotnet-v1.sql"))
+        .unwrap();
     // Upgrade minimal v1 schema to v8 with credential_key, lists, and user_sync_records.
     db.execute_batch(
         "ALTER TABLE tracker_endpoints ADD COLUMN credential_key TEXT NULL;
          ALTER TABLE torrent_packages ADD COLUMN language TEXT NOT NULL DEFAULT 'und';
          ALTER TABLE contributors ADD COLUMN url TEXT NULL;
          CREATE TABLE application_settings(key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO application_settings VALUES('content_filter_mode','Complete');
+         INSERT INTO application_settings VALUES('content_filter_hide_adult','True');
          CREATE TABLE catalog_alternative_names(id TEXT PRIMARY KEY, catalog_item_id TEXT NOT NULL, name TEXT NOT NULL, language TEXT, alias_type TEXT);
          CREATE TABLE categories(id TEXT PRIMARY KEY, name TEXT NOT NULL);
          CREATE TABLE catalog_item_categories(catalog_item_id TEXT NOT NULL, category_id TEXT NOT NULL);
@@ -129,6 +113,19 @@ fn dotnet_restore_preserves_credential_key_normalizes_timestamps_and_skips_orpha
     assert!(prepare_library_restore(&source, converted.path()).unwrap());
     let store = CatalogStore::open(converted.path()).unwrap();
     let data = store.backup().unwrap();
+    assert_eq!(
+        store.setting("player_ad_filter").unwrap().as_deref(),
+        Some("complete")
+    );
+    let active = store.profiles().unwrap().active_id;
+    let imported: serde_json::Value = serde_json::from_str(
+        &store
+            .setting(&format!("legacy-prefs-{active}"))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(imported["values"]["umd-hide-adult"], "true");
     umd_core::validate_backup(&data).unwrap();
     assert_eq!(
         data["catalog"]["items"][0]["sources"][0]["torrent"]["trackers"][0]["credentialKey"],

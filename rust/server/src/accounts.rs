@@ -1,15 +1,16 @@
 use crate::{ApiError, ApiResult, ServerState};
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::{Duration, Utc};
 use pbkdf2::pbkdf2_hmac;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,10 +27,33 @@ mod shared_lists;
 #[derive(Clone)]
 pub struct AccountStore {
     db: Arc<Mutex<Connection>>,
+    readers: Arc<Readers>,
     pub(crate) limits: crate::Limits,
     workers: Arc<tokio::sync::Semaphore>,
     admitted: Arc<tokio::sync::Semaphore>,
     hashing: Arc<tokio::sync::Semaphore>,
+    document_bodies: Arc<tokio::sync::Semaphore>,
+}
+
+struct Readers {
+    connections: Vec<Arc<Mutex<Connection>>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+struct DocumentBody {
+    bytes: axum::body::Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl DocumentBody {
+    fn parse<T: serde::de::DeserializeOwned>(&self) -> Result<T, ApiError> {
+        Json::<T>::from_bytes(&self.bytes)
+            .map(|json| json.0)
+            .map_err(|error| {
+                let status = error.into_response().status();
+                ApiError(status, "El cuerpo JSON del respaldo no es válido.".into())
+            })
+    }
 }
 
 impl AccountStore {
@@ -41,11 +65,14 @@ impl AccountStore {
     }
     fn initialize(db: Connection) -> umd_core::Result<Self> {
         db.busy_timeout(std::time::Duration::from_secs(10))?;
-        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
           CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,display_name TEXT NOT NULL,salt BLOB NOT NULL,hash BLOB NOT NULL,created_at TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,expires_at INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS login_failures(key TEXT PRIMARY KEY,window INTEGER NOT NULL,count INTEGER NOT NULL);
-          CREATE TABLE IF NOT EXISTS snapshots(account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,device_id TEXT,document TEXT);")?;
+          CREATE TABLE IF NOT EXISTS snapshots(account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,device_id TEXT,document TEXT);
+          CREATE INDEX IF NOT EXISTS account_sessions_expires ON sessions(expires_at);
+          CREATE INDEX IF NOT EXISTS account_sessions_owner ON sessions(account_id);
+          CREATE INDEX IF NOT EXISTS account_login_failure_window ON login_failures(window);")?;
         if !db
             .prepare("SELECT 1 FROM pragma_table_info('accounts') WHERE name='iterations'")?
             .exists([])?
@@ -56,20 +83,101 @@ impl AccountStore {
         }
         shared_lists::initialize(&db)?;
         friends::initialize(&db)?;
+        friends::rebuild_legacy_books(&db).map_err(|e| umd_core::Error::Invalid(e.1))?;
         incremental::initialize(&db)?;
+        let mut connections = Vec::new();
+        if let Some(path) = db.path().filter(|path| !path.is_empty()) {
+            for _ in 0..4 {
+                let reader =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                reader.busy_timeout(std::time::Duration::from_secs(10))?;
+                connections.push(Arc::new(Mutex::new(reader)));
+            }
+        }
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
+            readers: Arc::new(Readers {
+                connections,
+                next: 0.into(),
+            }),
             limits: crate::Limits::from_env()?,
             workers: Arc::new(tokio::sync::Semaphore::new(4)),
             admitted: Arc::new(tokio::sync::Semaphore::new(64)),
             hashing: Arc::new(tokio::sync::Semaphore::new(4)),
+            document_bodies: Arc::new(tokio::sync::Semaphore::new(2)),
+        })
+    }
+
+    async fn document_body(&self, request: Request) -> Result<DocumentBody, ApiError> {
+        let content_type = request
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
+        if !content_type.as_deref().is_some_and(|value| {
+            value == "application/json"
+                || (value.starts_with("application/") && value.ends_with("+json"))
+        }) {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Se esperaba un cuerpo JSON.".into(),
+            ));
+        }
+        let permit = self
+            .document_bodies
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        let bytes = axum::body::to_bytes(request.into_body(), self.limits.json)
+            .await
+            .map_err(|error| {
+                use std::error::Error as _;
+                if error
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    ApiError(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "El respaldo supera el límite permitido.".into(),
+                    )
+                } else {
+                    bad("No se pudo leer el cuerpo del respaldo.")
+                }
+            })?;
+        Ok(DocumentBody {
+            bytes,
+            _permit: permit,
         })
     }
     async fn work<T: Send + 'static>(
         &self,
         f: impl FnOnce(ConnectionGuard) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        self.admit(1, f).await
+        self.admit(1, self.db.clone(), f).await
+    }
+    async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(ConnectionGuard) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let readers = &self.readers.connections;
+        let connection = if readers.is_empty() {
+            self.db.clone()
+        } else {
+            let index = self
+                .readers
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % readers.len();
+            readers[index].clone()
+        };
+        self.admit(1, connection, f).await
     }
     /// Work that arrives holding a whole backup document. Each one counts as
     /// sixteen ordinary requests, so at most four can be running or waiting
@@ -78,11 +186,12 @@ impl AccountStore {
         &self,
         f: impl FnOnce(ConnectionGuard) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        self.admit(16, f).await
+        self.admit(16, self.db.clone(), f).await
     }
     async fn admit<T: Send + 'static>(
         &self,
         weight: u32,
+        db: Arc<Mutex<Connection>>,
         f: impl FnOnce(ConnectionGuard) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         // Ordinary account work waits its turn instead of failing: four run at
@@ -99,7 +208,6 @@ impl AccountStore {
             .acquire_owned()
             .await
             .map_err(|_| busy())?;
-        let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let _permits = (admitted, permit);
             f(ConnectionGuard(db))
@@ -191,26 +299,31 @@ fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
 /// happen before anyone looked at the token.
 async fn require_session(
     State(state): State<ServerState>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let checked = match bearer(request.headers()) {
         Ok(token) => {
             state
                 .accounts
-                .work(move |db| {
+                .read(move |db| {
                     let db = db.lock()?;
-                    authenticated(&db, &token).map(drop)
+                    authenticated(&db, &token)
                 })
                 .await
         }
         Err(error) => Err(error),
     };
     match checked {
-        Ok(()) => next.run(request).await,
+        Ok(owner) => {
+            request.extensions_mut().insert(SyncAccount(owner));
+            next.run(request).await
+        }
         Err(error) => error.into_response(),
     }
 }
+#[derive(Clone)]
+struct SyncAccount(String);
 
 /// The address a request came from. A reverse proxy on this machine may speak
 /// for its client through `X-Forwarded-For`; nobody else is believed, so a
@@ -516,39 +629,72 @@ struct Upload {
 struct Delete {
     expected_revision: i64,
 }
-async fn snapshot(State(state): State<ServerState>, headers: HeaderMap) -> ApiResult {
-    let token = bearer(&headers)?;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Snapshot {
+    revision: i64,
+    updated_at: String,
+    updated_by_device_id: Option<String>,
+    document: Option<Box<RawValue>>,
+}
+
+async fn snapshot(
+    State(state): State<ServerState>,
+    Extension(SyncAccount(id)): Extension<SyncAccount>,
+    headers: HeaderMap,
+) -> ApiResult {
     let requested = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let (tag, result) = state.accounts.work(move |db| {
-        let db = db.lock()?;
-        let tx = db.unchecked_transaction()?;
-        let id = authenticated(&tx, &token)?;
-        let revision: i64 = tx.query_row(
-            "SELECT revision FROM snapshots WHERE account_id=?1", [&id], |row| row.get(0)
-        ).optional()?.unwrap_or(0);
-        let tag = format!("\"{id}-{revision}\"");
-        if requested.as_deref() == Some(tag.as_str()) {
-            return Ok((tag, None));
-        }
-        let row: Option<(String, Option<String>, Option<String>)> = tx.query_row(
-            "SELECT updated_at,device_id,document FROM snapshots WHERE account_id=?1", [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        ).optional()?;
-        let (updated, device, document) = row.unwrap_or(("1970-01-01T00:00:00Z".into(), None, None));
-        let document: Option<Value> = document.map(|raw| serde_json::from_str(&raw))
-            .transpose().map_err(umd_core::Error::from)?;
-        let snapshot = json!({
-            "revision": revision, "updatedAt": updated, "updatedByDeviceId": device, "document": document
-        });
-        Ok((tag, Some(snapshot)))
-    }).await?;
-    let response = result.map_or_else(
-        || StatusCode::NOT_MODIFIED.into_response(),
-        |v| Json(v).into_response(),
-    );
+    let (tag, result) = state
+        .accounts
+        .read(move |db| {
+            let db = db.lock()?;
+            let tx = db.unchecked_transaction()?;
+            let revision: i64 = tx
+                .query_row(
+                    "SELECT revision FROM snapshots WHERE account_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let tag = format!("\"{id}-{revision}\"");
+            if requested.as_deref() == Some(tag.as_str()) {
+                return Ok((tag, None));
+            }
+            let row: Option<(String, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT updated_at,device_id,document FROM snapshots WHERE account_id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (updated, device, document) =
+                row.unwrap_or(("1970-01-01T00:00:00Z".into(), None, None));
+            let document = document
+                .map(RawValue::from_string)
+                .transpose()
+                .map_err(umd_core::Error::from)?;
+            drop(tx);
+            drop(db);
+            Ok((
+                tag,
+                Some(
+                    Json(Snapshot {
+                        revision,
+                        updated_at: updated,
+                        updated_by_device_id: device,
+                        document,
+                    })
+                    .into_response(),
+                ),
+            ))
+        })
+        .await?;
+    let response = result.unwrap_or_else(|| StatusCode::NOT_MODIFIED.into_response());
     Ok((
         [
             ("etag", tag.as_str()),
@@ -558,79 +704,120 @@ async fn snapshot(State(state): State<ServerState>, headers: HeaderMap) -> ApiRe
     )
         .into_response())
 }
-async fn upload(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-    Json(request): Json<Upload>,
-) -> ApiResult {
-    let token = bearer(&headers)?;
-    write_snapshot(
-        state,
-        token,
-        request.expected_revision,
-        Some(request.document),
-    )
-    .await
+async fn upload(State(state): State<ServerState>, request: Request) -> ApiResult {
+    let token = bearer(request.headers())?;
+    let body = state.accounts.document_body(request).await?;
+    let max_bytes = state.accounts.limits.json;
+    state
+        .accounts
+        .work_document(move |db| {
+            let input: Upload = body.parse()?;
+            let DocumentBody { bytes, _permit } = body;
+            drop(bytes);
+            write_snapshot(
+                db,
+                token,
+                input.expected_revision,
+                Some(input.document),
+                max_bytes,
+            )
+        })
+        .await
 }
 async fn delete_snapshot(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(request): Json<Delete>,
 ) -> ApiResult {
-    write_snapshot(state, bearer(&headers)?, request.expected_revision, None).await
+    let token = bearer(&headers)?;
+    let max_bytes = state.accounts.limits.json;
+    state
+        .accounts
+        .work(move |db| write_snapshot(db, token, request.expected_revision, None, max_bytes))
+        .await
 }
-async fn write_snapshot(
-    state: ServerState,
+fn write_snapshot(
+    store: ConnectionGuard,
     token: String,
     expected: i64,
     document: Option<Value>,
+    max_bytes: usize,
 ) -> ApiResult {
     if expected < 0 {
         return Err(bad("Invalid expectedRevision"));
     }
-    // Only an upload carries a document; a deletion is ordinary work.
-    let heavy = document.is_some();
-    let max_bytes = state.accounts.limits.json;
-    let task = move |store: ConnectionGuard| -> ApiResult {
-        {
-            let db = store.lock()?;
-            authenticated(&db, &token)?;
-        }
-        if let Some(doc) = &document {
-            umd_core::validate_backup_with_limit(doc, max_bytes)?;
-        }
+    let Some(document) = document else {
         let mut db = store.lock()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let owner = authenticated(&tx, &token)?;
-        let (revision, previous) = incremental::current(&tx, &owner)?;
-        let mut document = document;
+        let revision = incremental::revision(&tx, &owner)?;
         if revision != expected {
-            let (Some(before), Some(incoming)) = (previous.as_ref(), document.as_ref()) else {
+            return Ok(incremental::conflict(revision));
+        }
+        let receipt = incremental::persist(
+            &tx,
+            &owner,
+            incremental::next_revision(revision)?,
+            None,
+            None,
+        )?;
+        tx.commit()?;
+        return Ok(Json(receipt).into_response());
+    };
+    umd_core::validate_backup_with_limit(&document, max_bytes)?;
+    for _ in 0..5 {
+        let (owner, revision, raw, mut stamps) = {
+            let db = store.lock()?;
+            let tx = db.unchecked_transaction()?;
+            let owner = authenticated(&tx, &token)?;
+            let (revision, raw) = incremental::current_raw(&tx, &owner)?;
+            let stamps = incremental::index(&tx, &owner)?.unwrap_or_default();
+            (owner, revision, raw, stamps)
+        };
+        let previous: Option<Value> = raw
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()
+            .map_err(umd_core::Error::from)?;
+        let combined = if revision == expected {
+            None
+        } else {
+            let Some(before) = &previous else {
                 return Ok(incremental::conflict(revision));
             };
-            if incoming["version"].as_u64() != Some(4) {
+            if document["version"].as_u64() != Some(4) {
                 return Ok(incremental::conflict(revision));
             }
             let merged = umd_core::CatalogStore::in_memory()?;
             merged.restore_backup_with_limit(before, max_bytes)?;
-            let (_, output) = merged.reconcile_profile_with_limit(Some(incoming), max_bytes)?;
-            let mut combined = output.unwrap_or_else(|| incoming.clone());
-            for key in ["deviceId", "deviceName"] {
-                combined[key] = incoming[key].clone();
+            let (_, output) = merged.reconcile_profile_with_limit(Some(&document), max_bytes)?;
+            if let Some(mut output) = output {
+                for key in ["deviceId", "deviceName"] {
+                    output[key] = document[key].clone();
+                }
+                umd_core::validate_backup_with_limit(&output, max_bytes)?;
+                Some(output)
+            } else {
+                None
             }
-            umd_core::validate_backup_with_limit(&combined, max_bytes)?;
-            document = Some(combined);
+        };
+        let after = combined.as_ref().unwrap_or(&document);
+        let next = incremental::next_revision(revision)?;
+        stamps.advance(previous.as_ref(), after, next);
+        drop(previous);
+        let prepared = incremental::prepare_snapshot(after, &stamps)?;
+        let mut db = store.lock()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        authenticated(&tx, &token)?;
+        if incremental::revision(&tx, &owner)? != revision {
+            continue;
         }
-        let receipt =
-            incremental::save(&tx, &owner, revision, previous.as_ref(), document.as_ref())?;
+        let receipt = incremental::persist(&tx, &owner, next, Some(after), Some(prepared))?;
         tx.commit()?;
-        Ok(Json(receipt).into_response())
-    };
-    if heavy {
-        state.accounts.work_document(task).await
-    } else {
-        state.accounts.work(task).await
+        return Ok(Json(receipt).into_response());
     }
+    let db = store.lock()?;
+    let owner = authenticated(&db, &token)?;
+    Ok(incremental::conflict(incremental::revision(&db, &owner)?))
 }
 pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
     // Everything under /sync requires a session, checked before the body.
@@ -649,7 +836,9 @@ pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
                 )
                 // A snapshot download is the largest response the server sends.
                 .layer::<_, std::convert::Infallible>(
-                    tower_http::compression::CompressionLayer::new().gzip(true),
+                    tower_http::compression::CompressionLayer::new()
+                        .gzip(true)
+                        .quality(tower_http::CompressionLevel::Fastest),
                 ),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -664,7 +853,7 @@ pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
         .route("/api/v1/accounts/me", get(me))
         .route("/api/v1/accounts/session", axum::routing::delete(logout))
         .layer(axum::extract::DefaultBodyLimit::max(8192))
-        .merge(friends::routes())
+        .merge(friends::routes().layer(axum::extract::DefaultBodyLimit::max(256 << 10)))
         .merge(parties::routes())
         .merge(sync)
 }
@@ -672,6 +861,30 @@ pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn snapshot_admission_is_held_until_its_buffer_is_released() {
+        let mut store = AccountStore::in_memory().unwrap();
+        store.limits.json = 64;
+        let request = |body: String| {
+            axum::http::Request::builder()
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let first = store.document_body(request("{}".into())).await.unwrap();
+        let second = store.document_body(request("{}".into())).await.unwrap();
+        assert!(matches!(
+            store.document_body(request("{}".into())).await,
+            Err(ApiError(StatusCode::TOO_MANY_REQUESTS, _))
+        ));
+        drop(first);
+        assert!(matches!(
+            store.document_body(request("too large".repeat(16))).await,
+            Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, _))
+        ));
+        drop(second);
+        assert!(store.document_body(request("{}".into())).await.is_ok());
+    }
     #[test]
     fn expired_sessions_are_rejected_and_tokens_are_hashed() {
         let store = AccountStore::in_memory().unwrap();

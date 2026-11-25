@@ -1,8 +1,9 @@
 use crate::{work, CommandResult};
 use serde::Serialize;
+#[cfg(target_os = "android")]
+use std::io::Read;
 use std::{
     cmp::Ordering,
-    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -96,8 +97,16 @@ fn cbr_pages(path: &Path, cache: &Path) -> CommandResult<(tempfile::TempDir, Vec
         .with_max_header_bytes(16 * 1024 * 1024)
         .with_max_member_output_bytes(MAX_PAGE_BYTES)
         .with_max_total_output_bytes(MAX_COMIC_BYTES)
-        .with_rar50_dictionary_size_limit(MAX_PAGE_BYTES)
-        .with_max_reader_workspace_bytes(128 * 1024 * 1024);
+        .with_rar50_dictionary_size_limit(if cfg!(target_os = "android") {
+            32 << 20
+        } else {
+            MAX_PAGE_BYTES
+        })
+        .with_max_reader_workspace_bytes(if cfg!(target_os = "android") {
+            32 << 20
+        } else {
+            128 << 20
+        });
     let explain = |error: rars::Error| match error.kind() {
         rars::ErrorKind::ResourceLimit => {
             "El CBR supera los límites de tamaño del lector.".to_owned()
@@ -137,63 +146,6 @@ fn cbr_pages(path: &Path, cache: &Path) -> CommandResult<(tempfile::TempDir, Vec
     Ok((temp, pages.into_iter().map(|(_, file)| file).collect()))
 }
 
-fn comic_in(path: &Path, cache: &Path) -> CommandResult<(tempfile::TempDir, Vec<PathBuf>)> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    if archive.len() > MAX_COMIC_ENTRIES {
-        return Err("El archivo contiene demasiadas entradas (máximo 10.000).".into());
-    }
-    let mut names = Vec::new();
-    let mut total = 0u64;
-    for i in 0..archive.len() {
-        let file = archive.by_index(i).map_err(|e| e.to_string())?;
-        if file.is_file() && image(Path::new(file.name())) {
-            total = total
-                .checked_add(file.size())
-                .ok_or("Archivo demasiado grande")?;
-            if file.size() > MAX_PAGE_BYTES || total > MAX_COMIC_BYTES {
-                return Err(
-                    "El cómic supera el límite de extracción de 512 MiB o 64 MiB por imagen."
-                        .into(),
-                );
-            }
-            names.push((i, file.name().to_owned()));
-        }
-    }
-    names.sort_by(|a, b| natural(&a.1, &b.1));
-    let temp = tempfile::tempdir_in(cache).map_err(|e| e.to_string())?;
-    let mut paths = Vec::new();
-    let mut extracted = 0usize;
-    for (index, (i, name)) in names.iter().enumerate() {
-        // Never extract archive paths: generate names inside a fresh private directory.
-        let path = temp
-            .path()
-            .join(format!("{index:05}.{}", extension(Path::new(name))));
-        let mut entry = archive.by_index(*i).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        (&mut entry)
-            .take(MAX_PAGE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_PAGE_BYTES as usize {
-            return Err("Imagen demasiado grande.".into());
-        }
-        extracted = extracted
-            .checked_add(bytes.len())
-            .ok_or("Archivo demasiado grande")?;
-        if extracted > MAX_COMIC_BYTES as usize {
-            return Err("El cómic supera el límite de extracción de 512 MiB.".into());
-        }
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(&bytes))
-            .map_err(|e| e.to_string())?;
-        paths.push(path);
-    }
-    if paths.is_empty() {
-        return Err("No se encontraron imágenes en el cómic.".into());
-    }
-    Ok((temp, paths))
-}
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BookArchive {
@@ -307,7 +259,10 @@ pub async fn open_catalog_book(
     .await
     .map_err(|_| "Se agotó el tiempo al descargar el libro.")??;
     let (opened, extracted) = work(move || open_downloaded_file(&app, &path, &cache)).await?;
-    media.keep(request, extracted)?;
+    media.keep(
+        request,
+        extracted.or_else(|| opened.streaming.then_some(download)),
+    )?;
     Ok(opened)
 }
 
@@ -347,21 +302,17 @@ pub fn open_downloaded_file(
         ext = "epub".into();
     }
     let (kind, paths) = match ext.as_str() {
-        "epub" => {
-            let paths = crate::torrent_stream::open_epub(app, path)?;
+        "epub" | "cbz" | "zip" => {
+            let epub = ext == "epub";
+            let paths = crate::torrent_stream::open_local_archive(app, path, epub)?;
             return Ok((
                 OpenedMedia {
-                    kind: "epub".into(),
+                    kind: if epub { "epub" } else { "images" }.into(),
                     paths,
                     streaming: true,
                 },
                 None,
             ));
-        }
-        "cbz" | "zip" => {
-            let (dir, pages) = comic_in(path, cache)?;
-            temp = Some(dir);
-            ("images", pages)
         }
         "cbr" | "rar" => {
             let (dir, pages) = cbr_pages(path, cache)?;
@@ -556,12 +507,14 @@ pub async fn get_progress(
     profile_id: uuid::Uuid,
     reader: State<'_, crate::CatalogReads>,
 ) -> CommandResult<Option<serde_json::Value>> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
-        store.for_profile(profile_id)
+        store
+            .for_profile(profile_id)
             .and_then(|store| store.progress(&target))
             .map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 #[tauri::command]
 pub async fn item_progress(
@@ -569,12 +522,14 @@ pub async fn item_progress(
     profile_id: uuid::Uuid,
     reader: State<'_, crate::CatalogReads>,
 ) -> CommandResult<Vec<serde_json::Value>> {
-    let store = reader.0.clone();
+    let store = reader.0.get();
     work(move || {
-        store.for_profile(profile_id)
+        store
+            .for_profile(profile_id)
             .and_then(|store| store.item_progress(item_id))
             .map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -674,23 +629,5 @@ mod tests {
         let mut v = vec!["p10.png", "p2.png", "p1.png"];
         v.sort_by(|a, b| natural(a, b));
         assert_eq!(v, vec!["p1.png", "p2.png", "p10.png"]);
-    }
-    #[test]
-    fn ignores_zip_paths_and_rejects_empty_archive() {
-        let input = tempfile::NamedTempFile::new().unwrap();
-        let mut zip = zip::ZipWriter::new(input.reopen().unwrap());
-        zip.start_file("../../page2.png", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(b"image").unwrap();
-        zip.finish().unwrap();
-        let (temp, paths) = comic_in(input.path(), &std::env::temp_dir()).unwrap();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0].parent(), Some(temp.path()));
-        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"image");
-        let empty = tempfile::NamedTempFile::new().unwrap();
-        zip::ZipWriter::new(empty.reopen().unwrap())
-            .finish()
-            .unwrap();
-        assert!(comic_in(empty.path(), &std::env::temp_dir()).is_err());
     }
 }

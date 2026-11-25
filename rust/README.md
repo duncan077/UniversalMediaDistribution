@@ -30,7 +30,7 @@ respaldos de cuenta llevan el estado personal y las fichas a las que hace refere
 
 ### Reproducir y leer
 
-En **Buscar en proveedores**, buscá en la biblioteca, el servidor conectado y los proveedores habilitados a la vez, o elegí un sitio. Podés dar prioridad a tus proveedores favoritos y ocultar las fichas identificadas como contenido para adultos. **Agregar** guarda la edición y sus capítulos o temporadas. Mientras la app está abierta, revisa diariamente las ediciones guardadas de los proveedores habilitados. En CapibaraTraductor también podés elegir la traducción por el nombre del grupo.
+En **Buscar en proveedores**, buscá en la biblioteca, el servidor conectado y los proveedores habilitados a la vez, o elegí un sitio. El filtro **Tipo de obra** distingue manga y manhwa, libros y novelas, y cómics. **Agregar** guarda la edición y sus capítulos o temporadas. Mientras la app está abierta, importa las novedades de los proveedores habilitados y revisa las ediciones guardadas. En CapibaraTraductor también podés elegir la traducción por el nombre del grupo.
 
 En la ficha, elegí un capítulo y pulsá **Leer en…**, o elegí un episodio y pulsá **Ver en…** para seleccionar su fuente. Las páginas y los enlaces de reproducción se consultan al abrir la unidad. El vínculo con el proveedor se conserva al exportar e importar el catálogo en otra instalación Rust. FramexTV admite HLS, MP4, DASH y las pistas de subtítulos publicadas por el sitio. Cuando la fuente requiere la página del proveedor, **Ver en UMD** abre una ventana separada con bloqueo de anuncios en Windows (WebView2), Linux (WebKitGTK) y Android/TV. **Abrir en el navegador** usa el navegador del sistema y sus propios filtros.
 
@@ -73,7 +73,7 @@ las rutas del archivo. Las imágenes se muestran en orden numérico y se aplican
 límites de 64 MiB por página y 512 MiB por cómic. Para CBR, elegí un archivo
 de un solo volumen y sin contraseña. Las carpetas tampoco siguen enlaces simbólicos.
 
-Una ficha de manga importada sin vínculo admite **Buscar capítulo en proveedores**. UMD compara el nombre y sus variantes en los seis sitios de lectura, verifica que la edición tenga ese capítulo y guarda el vínculo cuando obtiene las páginas.
+Desde una ficha local podés usar **Buscar capítulo en proveedores** o **Buscar video en proveedores**. UMD compara el nombre y sus variantes, verifica el tipo de obra y la unidad, y muestra las ediciones a medida que terminan las consultas. Guarda el vínculo cuando elegís una edición que ofrece contenido.
 
 Podés actualizar la descripción, portada, géneros, título original y nombres alternativos desde la ficha. Las películas y series usan TMDb, y el anime, manga y las novelas web usan MyAnimeList. Buscá por título y elegí la edición correcta. La credencial se puede ingresar para esa consulta o configurar localmente con `UMD_TMDB_API_KEY` o `UMD_MAL_CLIENT_ID`.
 
@@ -82,7 +82,7 @@ Podés actualizar la descripción, portada, géneros, título original y nombres
 En **Perfiles → Respaldo de la biblioteca**, **Guardar copia completa** crea un archivo SQLite `.umddb` con el catálogo, los perfiles y sus preferencias. **Restaurar copia** valida la integridad del archivo y prepara la restauración para la próxima apertura de UMD. Antes de aplicarla guarda la biblioteca actual en el directorio de datos. Las descargas multimedia se almacenan por separado. Al iniciar, UMD comprueba la integridad de SQLite. Si encuentra daños, conserva la base original y sus archivos auxiliares y abre una biblioteca nueva para que puedas restaurar una copia.
 
 
-**Restaurar copia** también acepta el respaldo SQLite `.umdbackup` del cliente .NET (esquemas 1 a 15). Importa títulos, fuentes, temporadas y capítulos, y conserva los favoritos, las listas, las preferencias de lectura y el progreso de cada perfil. Las sesiones de cuenta, los ajustes locales, el historial de títulos eliminados y las descargas quedan fuera de la conversión.
+**Restaurar copia** también acepta el respaldo SQLite `.umdbackup` del cliente .NET (esquemas 1 a 15). Recupera el catálogo, los títulos eliminados, los perfiles y sus datos personales, y la configuración compatible de proveedores, filtros y servidor. Guarda las sesiones vigentes y las credenciales de metadatos en los archivos privados de cada perfil. Las descargas multimedia se almacenan por separado.
 
 **Perfil** muestra quién está usando la aplicación. Desde ese botón se pueden
 crear, renombrar, cambiar y eliminar perfiles. Todos ven los mismos títulos. Cada
@@ -171,6 +171,17 @@ npm --prefix rust/desktop ci
 npm --prefix rust/desktop run tauri -- android build --debug --apk
 adb install -r rust/desktop/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 ```
+
+Para compilar los paquetes de distribución por arquitectura:
+
+```powershell
+npm --prefix rust/desktop run android:apk
+```
+
+Gradle genera APK separados para `arm64-v8a`, `armeabi-v7a` y `x86_64` en
+`rust/desktop/src-tauri/gen/android/app/build/outputs/apk`. Cada APK conserva
+la entrada de Android TV. Firmá los APK de distribución con la misma clave
+que usaste para las instalaciones que quieras actualizar.
 
 En Android se pueden elegir documentos o varias imágenes con el selector del sistema.
 El mismo APK incluye una entrada para el lanzador de Android TV. Usá las flechas para
@@ -315,7 +326,7 @@ Los paquetes y los manifiestos se guardan respectivamente en `packages/` y `rele
 
 Extraé el ZIP completo. En Windows abrí `umd-desktop.exe` con el runtime WebView2 disponible. En Linux abrí `./UMD` desde una sesión gráfica con GTK 3 y WebKitGTK 4.1. El ZIP de Linux conserva los permisos de ejecución al extraerlo con `unzip`.
 
-En **Configuración → Actualizaciones**, **Descargar ZIP** permite guardar el archivo de una versión nueva. Cerrá la app y extraé el ZIP en otra carpeta. La biblioteca y los perfiles se conservan en el directorio de datos del usuario. Si usabas la versión MSI, abrí el ejecutable extraído para pasar al canal portátil.
+En **Configuración → Actualizaciones**, **Actualizar y reiniciar** descarga y verifica el ZIP, lo descomprime y reinicia UMD en la misma carpeta portable. La carpeta debe permitir escritura. Si la nueva versión falla al iniciar, UMD intenta restaurar la anterior. En Android y Android TV, **Descargar e instalar** abre el instalador del sistema y puede pedir permiso para instalar desde UMD. La biblioteca y los perfiles se conservan en el directorio de datos del usuario.
 
 El canal de escritorio es `tauri-portable`. Los nombres de los ZIP incluyen la versión y el destino, por ejemplo `UMD-0.1.10-win-x64.zip` y `UMD-0.1.10-linux-x64.zip`. El cliente comprueba la firma ECDSA P-256, el SHA-256, el tamaño y la identidad, versión y arquitectura declaradas dentro del ZIP. Android y Android TV siguen usando APK y el canal `tauri-stable`. La clave pública incorporada corresponde a `umd-release-1`. Para compilar una distribución con otra clave, definí `UMD_UPDATE_SIGNING_KEY_ID` y `UMD_UPDATE_SIGNING_PUBLIC_KEY` durante la compilación; la segunda variable contiene la clave pública SPKI DER en base64. La clave privada se usa en el equipo de publicación.
 
@@ -327,7 +338,8 @@ La búsqueda de escritorio incluye los 16 sitios del rastreador. En **Configurac
 
 En **Amigos** podés enviar solicitudes por nombre de usuario, aceptarlas o
 retirarlas y comparar títulos con otro usuario del mismo servidor. La comparación
-usa el último respaldo de cada cuenta. Compartir progreso está desactivado al
+usa el último respaldo de cada cuenta. Seleccioná un título de la comparación
+para buscarlo con su tipo de obra. Compartir progreso está desactivado al
 crear la cuenta. Podés habilitarlo para tus amigos, excluir a una persona u
 ocultar un título desde **Actividad de amigos** en su ficha. Solo se muestra
 la marca de favorito en títulos con progreso. La opción de recibir solicitudes

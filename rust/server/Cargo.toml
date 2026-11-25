@@ -1,6 +1,6 @@
 [package]
 name = "umd-server"
-version = "0.1.19"
+version = "0.1.22"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -8,10 +8,11 @@ rust-version.workspace = true
 umd-core.workspace = true
 umd-providers = { path = "../providers" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 uuid.workspace = true
 axum = { version = "0.8", features = ["ws"] }
+http-body-util = "0.1"
 subtle = "2"
 rusqlite = { version = "0.43", features = ["bundled"] }
 pbkdf2 = "0.12"

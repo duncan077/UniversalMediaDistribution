@@ -7,18 +7,57 @@ use regex::Regex;
 use reqwest::{header, Client, Url};
 use serde::Serialize;
 use serde_json::Value;
-use std::{net::SocketAddr, sync::LazyLock, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use tokio::{net::lookup_host, sync::Semaphore, time::timeout};
 
 static REQUESTS: Semaphore = Semaphore::const_new(4);
 
 use umd_core::public_url::{public_ip, web_url};
+use umd_providers::browser_http;
+
+struct PublicDns;
+impl reqwest::dns::Resolve for PublicDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            // Reqwest supplies the URL's port after resolution. Returning the checked
+            // addresses directly avoids a second DNS lookup at connect time.
+            let addresses: Vec<SocketAddr> = lookup_host((name.as_str(), 0)).await?.collect();
+            if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Public addresses required",
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+static PUBLIC_CLIENT: LazyLock<Result<Client, reqwest::Error>> = LazyLock::new(|| {
+    browser_http::client_builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(45))
+        .pool_max_idle_per_host(2)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(PublicDns))
+        .build()
+});
 
 #[derive(Clone, Copy, PartialEq)]
 enum RequestKind {
     Get,
+    Page,
+    Image,
     Relay,
     LoadX,
+    UpnShare,
 }
 
 pub(crate) async fn get_public(
@@ -26,6 +65,22 @@ pub(crate) async fn get_public(
     request_timeout: Duration,
 ) -> CommandResult<reqwest::Response> {
     fetch(url, request_timeout, None, false).await
+}
+
+pub(crate) async fn get_public_image(
+    url: Url,
+    request_timeout: Duration,
+    referer: Option<&Url>,
+) -> CommandResult<reqwest::Response> {
+    fetch_response(
+        url,
+        request_timeout,
+        None,
+        None,
+        referer,
+        RequestKind::Image,
+    )
+    .await
 }
 
 async fn fetch(
@@ -91,6 +146,7 @@ async fn fetch_response(
     kind: RequestKind,
 ) -> CommandResult<reqwest::Response> {
     let streaming = kind == RequestKind::Relay;
+    let client = PUBLIC_CLIENT.as_ref().map_err(|e| e.to_string())?;
     for _ in 0..6 {
         if !web_url(&url) {
             return Err("Ingresá una dirección pública HTTP o HTTPS.".into());
@@ -101,35 +157,25 @@ async fn fetch_response(
         }) {
             return Err("El bloqueador identificó esta dirección como publicidad.".into());
         }
-        let host = url.host_str().unwrap().trim_matches(['[', ']']);
-        let addresses: Vec<SocketAddr> = lookup_host((host, url.port_or_known_default().unwrap()))
-            .await
-            .map_err(|_| "No se pudo localizar el servidor.")?
-            .collect();
-        if addresses.is_empty() || addresses.iter().any(|a| !public_ip(a.ip())) {
-            return Err("La dirección de la fuente no es pública.".into());
-        }
-        let mut builder = Client::builder()
-            .no_proxy()
-            .connect_timeout(request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses);
-        builder = if streaming {
-            builder.read_timeout(request_timeout)
-        } else {
-            builder.timeout(request_timeout)
-        };
-        let client = builder.build().map_err(|e| e.to_string())?;
-        let mut request = if kind == RequestKind::LoadX {
-            client
+        let mut request = match kind {
+            RequestKind::LoadX => client
                 .post(url.clone())
                 .header(header::ACCEPT, "application/json, */*;q=0.5")
-                .header("X-Requested-With", "XMLHttpRequest")
-        } else {
-            client.get(url.clone())
+                .header("X-Requested-With", "XMLHttpRequest"),
+            RequestKind::Page => client
+                .get(url.clone())
+                .header(header::ACCEPT, browser_http::PAGE_ACCEPT),
+            RequestKind::Image => client.get(url.clone()).header(
+                header::ACCEPT,
+                "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            ),
+            RequestKind::UpnShare => client
+                .get(url.clone())
+                .header(header::ACCEPT, "application/json"),
+            RequestKind::Get | RequestKind::Relay => client.get(url.clone()),
         };
-        if player_page.is_some() {
-            request = request.header(header::USER_AGENT, hosters::BROWSER_USER_AGENT);
+        if !streaming {
+            request = request.timeout(request_timeout);
         }
         if let Some(range) = range {
             request = request.header(header::RANGE, range);
@@ -148,12 +194,6 @@ async fn fetch_response(
                     .header(header::REFERER, reference)
                     .header(header::ORIGIN, origin);
             }
-            if player_page.is_none() {
-                request = request.header(
-                    header::USER_AGENT,
-                    concat!("UniversalMediaDistribution/", env!("CARGO_PKG_VERSION")),
-                );
-            }
         }
         let response = request
             .send()
@@ -171,7 +211,9 @@ async fn fetch_response(
             url = url
                 .join(location)
                 .map_err(|_| "Dirección de destino inválida.")?;
-        } else if response.status().is_success() {
+        } else if response.status().is_success()
+            || kind == RequestKind::UpnShare && matches!(response.status().as_u16(), 404 | 410)
+        {
             return Ok(response);
         } else {
             return Err(format!("La fuente respondió HTTP {}.", response.status()));
@@ -198,7 +240,7 @@ pub(crate) async fn bounded_text(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Stream {
     #[serde(skip_serializing_if = "Option::is_none")]
     referer: Option<String>,
@@ -208,7 +250,7 @@ pub struct Stream {
     tracks: Vec<Subtitle>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct Subtitle {
     url: String,
     language: String,
@@ -364,6 +406,7 @@ enum Page {
     Media(Stream),
     Html(Url, String),
     Redirect(Url, Url),
+    ProviderUnavailable(&'static str),
 }
 
 fn zilla_playlist(page: &Url) -> Option<Url> {
@@ -542,24 +585,55 @@ pub(crate) async fn probe_public_media(mut address: Url, page: &Url) -> CommandR
     Ok(stream)
 }
 
+enum UpnShare {
+    Player(Url),
+    Unavailable,
+}
+
+async fn upnshare_player(url: &Url, endpoint: Url) -> CommandResult<UpnShare> {
+    let response = fetch_response(
+        endpoint,
+        Duration::from_secs(10),
+        Some(url),
+        None,
+        Some(url),
+        RequestKind::UpnShare,
+    )
+    .await?;
+    if matches!(response.status().as_u16(), 404 | 410) {
+        return Ok(UpnShare::Unavailable);
+    }
+    let json: Value = serde_json::from_str(&bounded_text(response, 64 << 10).await?)
+        .map_err(|_| "UPNShare no devolvió una fuente válida.")?;
+    let target = json["url"]
+        .as_str()
+        .and_then(|address| declared::address(url, address, "subdocument"))
+        .filter(|target| target.scheme() == "https")
+        .ok_or("UPNShare no devolvió una fuente válida.")?;
+    {
+        let mut addresses = lookup_host((
+            target.host_str().unwrap(),
+            target.port_or_known_default().unwrap(),
+        ))
+        .await
+        .map_err(|_| "No se pudo localizar el servidor de UPNShare.")?;
+        if !addresses.next().is_some_and(|a| public_ip(a.ip()))
+            || addresses.any(|a| !public_ip(a.ip()))
+        {
+            return Err("La dirección de UPNShare no es pública.".into());
+        }
+    }
+    Ok(UpnShare::Player(target))
+}
+
 async fn load_page(url: Url, parent: Url) -> CommandResult<Page> {
     if let Some(endpoint) = hosters::upnshare_endpoint(&url) {
-        let response = fetch_media(
-            endpoint,
-            Duration::from_secs(10),
-            Some(&url),
-            None,
-            Some(&url),
-        )
-        .await?;
-        let json: Value = serde_json::from_str(&bounded_text(response, 64 << 10).await?)
-            .map_err(|_| "UPNShare no devolvió una fuente válida.")?;
-        let target = json["url"]
-            .as_str()
-            .and_then(|address| declared::address(&url, address, "subdocument"))
-            .filter(|target| target.scheme() == "https")
-            .ok_or("UPNShare no devolvió una fuente válida.")?;
-        return Ok(Page::Redirect(url, target));
+        return match upnshare_player(&url, endpoint).await? {
+            UpnShare::Player(target) => Ok(Page::Redirect(url, target)),
+            UpnShare::Unavailable => Ok(Page::ProviderUnavailable(
+                "UPNShare ya no encuentra este video. Elegí otro servidor.",
+            )),
+        };
     }
     if let Some(address) = pixeldrain::address(&url) {
         let referer = (parent != url).then_some(&parent);
@@ -579,7 +653,15 @@ async fn load_page(url: Url, parent: Url) -> CommandResult<Page> {
         stream.referer = Some(url.to_string());
         return Ok(Page::Media(stream));
     }
-    let response = fetch(url, Duration::from_secs(20), Some(&parent), false).await?;
+    let response = fetch_response(
+        url,
+        Duration::from_secs(20),
+        Some(&parent),
+        None,
+        Some(&parent),
+        RequestKind::Page,
+    )
+    .await?;
     let base = response.url().clone();
     let mime = response
         .headers()
@@ -661,9 +743,17 @@ async fn resolve_pages(
         }
         match load(url, parent).await? {
             Page::Media(stream) => return Ok(stream),
+            Page::ProviderUnavailable(message) => {
+                *browser = None;
+                return Err(message.into());
+            }
             Page::Redirect(mut base, next) => {
+                let from_upnshare = hosters::upnshare_endpoint(&base).is_some();
                 base.set_fragment(None);
-                if browser.is_some() && hosters::alternate_player(&next) {
+                if browser.is_some()
+                    && (hosters::alternate_player(&next)
+                        || from_upnshare && next.scheme() == "https" && web_url(&next))
+                {
                     *browser = Some(next.clone());
                 }
                 url = next;
@@ -698,8 +788,21 @@ async fn resolve_pages(
     Err("La página no publica una fuente compatible con el reproductor.".into())
 }
 
-pub(crate) fn provider_web_address(url: Url) -> Url {
-    hosters::mega_embed(&url).unwrap_or(url)
+pub(crate) async fn provider_web_address(url: Url) -> CommandResult<Url> {
+    if let Some(endpoint) = hosters::upnshare_endpoint(&url) {
+        if let Ok(resolved) =
+            timeout(Duration::from_secs(12), upnshare_player(&url, endpoint)).await
+        {
+            return match resolved {
+                Ok(UpnShare::Player(target)) => Ok(target),
+                Ok(UpnShare::Unavailable) => {
+                    Err("UPNShare ya no encuentra este video. Elegí otro servidor.".into())
+                }
+                Err(_) => Ok(url),
+            };
+        }
+    }
+    Ok(hosters::mega_embed(&url).unwrap_or(url))
 }
 
 #[derive(Serialize)]
@@ -731,6 +834,7 @@ pub async fn resolve_video(
     provider: Option<String>,
     web_fallback: Option<bool>,
     store: tauri::State<'_, umd_core::CatalogStore>,
+    filter: tauri::State<'_, crate::ad_filter::Directory>,
 ) -> CommandResult<VideoResolution> {
     let url = Url::parse(address.trim()).map_err(|_| "Enlace de video inválido.")?;
     if trusted_server(&store, &url)? {
@@ -748,6 +852,7 @@ pub async fn resolve_video(
     let _permit = REQUESTS
         .try_acquire()
         .map_err(|_| "Hay otras fuentes cargando. Volvé a intentar.")?;
+    crate::ad_filter::prepare_player(&filter).await;
     let referer = provider
         .as_deref()
         .and_then(crate::providers::provider_referer)
@@ -766,6 +871,187 @@ pub async fn resolve_video(
         }),
         (Err(error), None) => Err(error),
     }
+}
+
+#[derive(Serialize)]
+pub struct LiveVariant {
+    label: String,
+    #[serde(flatten)]
+    stream: Stream,
+}
+
+fn live_server_links(page: &Url, html: &str) -> Vec<(String, Url)> {
+    let doc = Document::from(html);
+    let mut seen = std::collections::HashSet::new();
+    doc.select("a[href],button[data-src],button[data-url],[data-src],[data-url]")
+        .iter()
+        .filter_map(|node| {
+            let label = node.text().split_whitespace().collect::<Vec<_>>().join(" ");
+            let normalized = umd_core::normalize(&label);
+            if label.len() > 80
+                || !["opcion", "servidor", "fhd", "server"]
+                    .iter()
+                    .any(|term| normalized.contains(term))
+            {
+                return None;
+            }
+            let address = ["href", "data-src", "data-url"]
+                .into_iter()
+                .filter_map(|attr| node.attr(attr))
+                .find_map(|raw| declared::address(page, &raw, "subdocument"))?;
+            (address != *page && seen.insert(address.clone())).then_some((label, address))
+        })
+        .take(6)
+        .collect()
+}
+
+fn live_hls_qualities(base: &Url, text: &str) -> Vec<(u32, Url)> {
+    let text = text.trim_start_matches('\u{feff}');
+    if !text.starts_with("#EXTM3U") {
+        return Vec::new();
+    }
+    let mut resolution = None;
+    let mut variants = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(info) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            // The master is still needed for playlists that reference separate audio or subtitle groups.
+            resolution = if info.contains("AUDIO=") || info.contains("SUBTITLES=") {
+                None
+            } else {
+                info.split(',').find_map(|part| {
+                    part.strip_prefix("RESOLUTION=")
+                        .and_then(|value| value.split_once('x'))
+                        .and_then(|(_, height)| height.parse::<u32>().ok())
+                })
+            };
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Some((height, address)) = resolution
+                .take()
+                .and_then(|height| Some((height, declared::address(base, line, "media")?)))
+            {
+                variants.push((height, address));
+                if variants.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    variants.sort_by_key(|(height, _)| std::cmp::Reverse(*height));
+    variants
+}
+
+#[tauri::command]
+pub async fn live_variants(
+    address: String,
+    filter: tauri::State<'_, crate::ad_filter::Directory>,
+) -> CommandResult<Vec<LiveVariant>> {
+    use futures_util::{stream, StreamExt};
+    let url = Url::parse(address.trim())
+        .ok()
+        .filter(web_url)
+        .ok_or("Enlace de video inválido.")?;
+    let _permit = REQUESTS
+        .try_acquire()
+        .map_err(|_| "Hay otras fuentes cargando. Volvé a intentar.")?;
+    crate::ad_filter::prepare_player(&filter).await;
+    timeout(Duration::from_secs(40), async {
+        let mut direct = None;
+        let (page, mut links) = if let Some(stream) = media(url.clone(), "") {
+            direct = Some(stream);
+            (url.clone(), vec![])
+        } else {
+            match load_page(url.clone(), url.clone()).await? {
+                Page::Html(page, body) => {
+                    let docs = Document::from(body.as_str());
+                    direct = extract(&page, &docs).map(|mut stream| {
+                        stream.referer = Some(page.to_string());
+                        stream
+                    });
+                    let links = live_server_links(&page, &body);
+                    (page, links)
+                }
+                Page::Media(stream) => {
+                    direct = Some(stream);
+                    (url.clone(), vec![])
+                }
+                Page::Redirect(page, next) => (page, vec![("".into(), next)]),
+                Page::ProviderUnavailable(message) => return Err(message.into()),
+            }
+        };
+        if direct.is_none() && links.is_empty() {
+            links.push(("".into(), page.clone()));
+        }
+        let mut results = direct
+            .into_iter()
+            .map(|stream| ("".into(), stream))
+            .collect::<Vec<_>>();
+        let resolved = stream::iter(links)
+            .map(|(label, link)| {
+                let page = page.clone();
+                async move {
+                    resolve_pages(link, Some(page), &mut None, load_page)
+                        .await
+                        .ok()
+                        .map(|stream| (label, stream))
+                }
+            })
+            .buffered(2)
+            .collect::<Vec<_>>()
+            .await;
+        results.extend(resolved.into_iter().flatten());
+        let variants = stream::iter(results)
+            .map(|(label, stream)| async move {
+                let mut alternatives = vec![];
+                if stream.hls {
+                    if let Ok(url) = Url::parse(&stream.url) {
+                        let referer = stream
+                            .referer
+                            .as_deref()
+                            .and_then(|raw| Url::parse(raw).ok());
+                        if let Ok(response) = fetch_media(
+                            url,
+                            Duration::from_secs(8),
+                            referer.as_ref(),
+                            None,
+                            referer.as_ref(),
+                        )
+                        .await
+                        {
+                            let base = response.url().clone();
+                            if let Ok(text) = bounded_text(response, 1 << 20).await {
+                                alternatives = live_hls_qualities(&base, &text)
+                                    .into_iter()
+                                    .map(|(height, address)| {
+                                        let mut stream = stream.clone();
+                                        stream.url = address.into();
+                                        let label = format!("{label} {height}p").trim().to_owned();
+                                        LiveVariant { label, stream }
+                                    })
+                                    .collect();
+                            }
+                        }
+                    }
+                }
+                (LiveVariant { label, stream }, alternatives)
+            })
+            .buffered(2)
+            .collect::<Vec<_>>()
+            .await;
+        let mut seen = std::collections::HashSet::new();
+        let result: Vec<_> = variants
+            .into_iter()
+            .flat_map(|(initial, alternatives)| std::iter::once(initial).chain(alternatives))
+            .filter(|item| seen.insert(item.stream.url.clone()))
+            .take(24)
+            .collect();
+        if result.is_empty() {
+            Err("El canal no ofreció una señal compatible.".into())
+        } else {
+            Ok(result)
+        }
+    })
+    .await
+    .map_err(|_| "Se agotó el tiempo al cargar las señales del canal.")?
 }
 
 #[derive(Serialize)]

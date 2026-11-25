@@ -48,6 +48,7 @@ impl Admin {
    CREATE TABLE IF NOT EXISTS cursors(provider TEXT,cursor TEXT,PRIMARY KEY(provider,cursor));
    CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,started INTEGER NOT NULL,finished INTEGER,status TEXT NOT NULL,updated INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,time INTEGER NOT NULL,level TEXT NOT NULL,provider TEXT,run TEXT,stage TEXT NOT NULL,status TEXT NOT NULL,message TEXT NOT NULL,http_status INTEGER);
+   CREATE INDEX IF NOT EXISTS crawler_event_time ON events(time);
    CREATE TRIGGER IF NOT EXISTS prune_events AFTER INSERT ON events BEGIN DELETE FROM events WHERE id<=NEW.id-10000; END;")?;
         let tx = db.transaction()?;
         for &(p, _) in PROVIDERS {
@@ -74,6 +75,14 @@ impl Admin {
             .db
             .lock()
             .map_err(|_| "Crawler database unavailable".into())
+    }
+
+    async fn storage<T: Send + 'static>(
+        &self,
+        task: impl FnOnce(Self) -> Res<T> + Send + 'static,
+    ) -> Res<T> {
+        let admin = self.clone();
+        Ok(tokio::task::spawn_blocking(move || task(admin)).await??)
     }
     pub(super) fn lock(&self) -> Res<Option<File>> {
         let file = File::options()
@@ -333,11 +342,14 @@ impl Admin {
                         &Failure::new("parse_or_storage_error"),
                     );
                 };
-                let repeating = {
-                    let mut db = self.db()?;
+                let provider = id.to_owned();
+                let next = reply.next.clone();
+                let repeating = self.storage(move |admin| {
+                    let id = provider.as_str();
+                    let mut db = admin.db()?;
                     let tx = db.transaction()?;
                     let mut repeat = stage == "discovery"
-                        && if let Some(next) = &reply.next {
+                        && if let Some(next) = &next {
                             next.is_empty()
                                 || next.len() > 8192
                                 || tx.execute(
@@ -378,13 +390,13 @@ impl Admin {
                         } else {
                             tx.execute(
                                 "UPDATE providers SET cursor=?,complete=?,discovery=? WHERE id=?",
-                                params![reply.next, reply.next.is_none(), now(), id],
+                                params![next, next.is_none(), now(), id],
                             )?;
                         }
                         tx.commit()?;
                     }
-                    repeat
-                };
+                    Ok(repeat)
+                }).await?;
                 if repeating {
                     return self.provider_error(
                         id,
@@ -405,12 +417,13 @@ impl Admin {
         }
         let mut consecutive = 0;
         loop {
-            let job=self.db()?.query_row("SELECT external,preview FROM titles WHERE provider=?1 AND (due<=?2 OR (?3 AND failures>0)) AND last_run IS NOT ?4 ORDER BY due,external LIMIT 1",params![id,now(),retry,run],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
-            let Some((external, raw)) = job else { break };
-            let entry = Preview {
-                external_id: external.clone(),
-                preview: serde_json::from_str(&raw)?,
-            };
+            let (provider, run_id) = (id.to_owned(), run.to_owned());
+            let entry = self.storage(move |admin| {
+                let job=admin.db()?.query_row("SELECT external,preview FROM titles WHERE provider=?1 AND (due<=?2 OR (?3 AND failures>0)) AND last_run IS NOT ?4 ORDER BY due,external LIMIT 1",params![provider,now(),retry,run_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
+                job.map(|(external_id, raw)| Ok(Preview { external_id, preview: serde_json::from_str(&raw)? })).transpose()
+            }).await?;
+            let Some(entry) = entry else { break };
+            let external = entry.external_id.clone();
             if id != "umd-json-api" {
                 tokio::time::sleep_until(next_request).await;
             }
@@ -443,14 +456,15 @@ impl Admin {
             match result {
                 Ok(changed) => {
                     consecutive = 0;
-                    let mut db = self.db()?;
-                    let tx = db.transaction()?;
-                    tx.execute("UPDATE titles SET due=?,success=?,failures=0,last_run=? WHERE provider=? AND external=?",params![now()+7*86400,now(),run,id,external])?;
-                    tx.execute(
-                        "UPDATE runs SET updated=updated+? WHERE id=?",
-                        params![changed, run],
-                    )?;
-                    tx.commit()?;
+                    let (provider, run_id) = (id.to_owned(), run.to_owned());
+                    self.storage(move |admin| {
+                        let mut db = admin.db()?;
+                        let tx = db.transaction()?;
+                        tx.execute("UPDATE titles SET due=?,success=?,failures=0,last_run=? WHERE provider=? AND external=?",params![now()+7*86400,now(),run_id,provider,external])?;
+                        tx.execute("UPDATE runs SET updated=updated+? WHERE id=?", params![changed, run_id])?;
+                        tx.commit()?;
+                        Ok(())
+                    }).await?;
                 }
                 Err(e) => {
                     if matches!(
@@ -465,15 +479,17 @@ impl Admin {
                     }
                     let unsupported = e.kind == "unsupported";
                     consecutive = if unsupported { 0 } else { consecutive + 1 };
-                    {
-                        let mut db = self.db()?;
+                    let (provider, run_id) = (id.to_owned(), run.to_owned());
+                    self.storage(move |admin| {
+                        let mut db = admin.db()?;
                         let tx = db.transaction()?;
-                        tx.execute("UPDATE titles SET failures=CASE WHEN ?1 THEN 0 ELSE failures+1 END,due=?2+CASE WHEN ?1 THEN 604800 ELSE min(86400,3600*(1<<min(failures,5))) END,last_run=?3 WHERE provider=?4 AND external=?5",params![unsupported,now(),run,id,external])?;
+                        tx.execute("UPDATE titles SET failures=CASE WHEN ?1 THEN 0 ELSE failures+1 END,due=?2+CASE WHEN ?1 THEN 604800 ELSE min(86400,3600*(1<<min(failures,5))) END,last_run=?3 WHERE provider=?4 AND external=?5",params![unsupported,now(),run_id,provider,external])?;
                         if !unsupported {
-                            tx.execute("UPDATE runs SET failures=failures+1 WHERE id=?", [run])?;
+                            tx.execute("UPDATE runs SET failures=failures+1 WHERE id=?", [run_id])?;
                         }
                         tx.commit()?;
-                    }
+                        Ok(())
+                    }).await?;
                     self.event_http(
                         Some(id),
                         run,

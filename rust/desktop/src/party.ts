@@ -309,11 +309,12 @@ async function findTitle(title: PartyTitle) {
   try {
     const ids = await invoke<string[]>("party_titles", { mediaType: title.mediaType, name: title.name });
     if (!activeContainer() || !same(room?.content, title)) return;
-    if (!ids.length) {
+    const items = ids.length ? await invoke<CatalogItem[]>("library_summaries", {ids}) : [];
+    if (!activeContainer() || !same(room?.content, title)) return;
+    if (!items.length) {
       setStatus(ui("Este título todavía no está en tu biblioteca. Importá su catálogo y volvé a abrirlo."));
       return;
     }
-    const items = await Promise.all(ids.map((id) => invoke<CatalogItem>("library_item", { id })));
     const cur = activeContainer();
     if (!cur || !same(room?.content, title)) return;
     const open = (item: CatalogItem) => {
@@ -581,9 +582,9 @@ export function attachPartyPlayer(
   const control = button(ui("Sala de reproducción"), openOverlay, "quiet-btn");
   control.disabled = true;
   header.insertBefore(control, header.lastElementChild);
-  void invoke<CatalogItem>("library_item", { id: target.itemId })
-    .then((item) => {
-      if (abort.signal.aborted) return;
+  void invoke<CatalogItem[]>("library_summaries", { ids: [target.itemId] })
+    .then(([item]) => {
+      if (!item || abort.signal.aborted) return;
       attached = {
         media,
         close: () => header.closest("dialog")?.close(),

@@ -47,6 +47,15 @@ pub fn valid_slug(s: &str) -> bool {
 }
 
 impl Edition {
+    pub fn sync_id(&self) -> Uuid {
+        let prefix = if self.joint {
+            JOINT_PREFIX
+        } else {
+            EDITION_PREFIX
+        };
+        Uuid::from_u128(prefix | u128::from(self.id))
+    }
+
     pub fn read(value: &Value) -> Option<Self> {
         let joint_id = value["id"].as_str().and_then(|s| s.strip_prefix("joint-"));
         let (id, slug) = if let Some(n) = joint_id {
@@ -77,17 +86,10 @@ pub fn available_manga(row: &Value) -> bool {
         .any(|k| row[k].as_bool() == Some(true))
         && row["isPublic"].as_bool() != Some(false)
         && ![&row["workType"], &row["manga"]["bookType"]["code"]]
-            .iter()
-            .any(|v| {
-                matches!(
-                    v.as_str()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "novel" | "light-novel" | "book" | "short-story"
-                )
-            })
+            .into_iter()
+            .filter_map(Value::as_str)
+            .filter_map(crate::provider_book_subtype)
+            .any(|kind| !matches!(kind, "manga" | "comic"))
 }
 
 pub fn image_url(v: &Value) -> Option<String> {
@@ -210,12 +212,7 @@ pub fn detail(edition: &Edition, row: &Value) -> Result<CatalogItem, String> {
         .flatten()
         .filter_map(|v| v["name"].as_str())
         .collect();
-    let prefix = if edition.joint {
-        JOINT_PREFIX
-    } else {
-        EDITION_PREFIX
-    };
-    let id = Uuid::from_u128(prefix | u128::from(edition.id));
+    let id = edition.sync_id();
     let item: CatalogItem = serde_json::from_value(json!({
             "syncId":id,"name":row["title"],"mediaType":"book","subtype":"manga","units":units,
             "description":row["description"].as_str().or_else(|| row["manga"]["description"].as_str()),
@@ -227,6 +224,19 @@ pub fn detail(edition: &Edition, row: &Value) -> Result<CatalogItem, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn illustrated_listing_does_not_accept_prose_even_with_a_manga_label() {
+        for label in ["novel", "novela ligera", "web_novel", "BOOK", "short-story"] {
+            assert!(!available_manga(&json!({
+                "workType":"manga","manga":{"bookType":{"code":label}}
+            })));
+        }
+        assert!(available_manga(&json!({"workType":"manhwa"})));
+        assert!(available_manga(
+            &json!({"manga":{"bookType":{"code":"Cómic"}}})
+        ));
+    }
 
     #[test]
     fn joint_detail_verifies_organization_slug_when_present() {

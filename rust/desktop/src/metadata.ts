@@ -61,7 +61,11 @@ export function setupMetadataSettings() {
         tmdb: clear ? "" : save && tmdb.value ? tmdb.value : null, mal: clear ? "" : save && mal.value ? mal.value : null
       });
       if (save) await writeProfilePref("metadata-language", language.value);
-      language.value = result.language ?? getProfilePref(activeProfileId(),"metadata-language") ?? "";
+      const preferred = result.language ?? getProfilePref(activeProfileId(),"metadata-language") ?? "";
+      if (preferred && !Array.from(language.options).some(option => option.value === preferred)) {
+        language.add(new Option(preferred, preferred));
+      }
+      language.value = preferred;
       tmdb.value = mal.value = "";
       tmdb.placeholder = result.tmdb ? ui("Guardada") : ""; mal.placeholder = result.mal ? ui("Guardada") : "";
       feedback.textContent = save ? ui("Preferencias guardadas.") : "";

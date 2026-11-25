@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use umd_core::{capibara, catalog_metadata_only, CatalogDocument, CatalogItem, MAX_DOCUMENT_BYTES};
-use umd_providers::{Provider, Site};
+use umd_providers::{browser_http, Provider, Site};
 use url::Url;
 
 pub(super) const PROVIDERS: &[(&str, &str)] = &[
@@ -249,11 +249,15 @@ impl Source {
             };
             #[cfg(not(test))]
             let addresses = resolve().await?;
-            let client = reqwest::Client::builder()
-                .user_agent(concat!(
+            let builder = if id == "umd-json-api" {
+                reqwest::Client::builder().user_agent(concat!(
                     "UniversalMediaDistribution/",
                     env!("CARGO_PKG_VERSION")
                 ))
+            } else {
+                browser_http::client_builder()
+            };
+            let client = builder
                 .cookie_store(true)
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -411,8 +415,10 @@ impl Source {
                             ("nsfw", "false".into()),
                         ])
                 };
-                let envelope: Value =
-                    serde_json::from_slice(&fetch(request).await?).map_err(|_| invalid())?;
+                let envelope: Value = serde_json::from_slice(
+                    &fetch(request.header(reqwest::header::ACCEPT, "application/json")).await?,
+                )
+                .map_err(|_| invalid())?;
                 if envelope["status"] != true {
                     return Err(invalid());
                 }

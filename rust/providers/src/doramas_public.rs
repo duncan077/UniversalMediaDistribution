@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 // URLs are read from the same public sitemaps the website advertises in robots.txt.
 // Associate an episode only when the complete series slug and both coordinates match.
-pub(super) type Episodes = BTreeMap<String, BTreeMap<u32, BTreeMap<String, String>>>;
+pub(super) type Episodes = BTreeMap<String, BTreeMap<u32, BTreeMap<String, Option<Box<str>>>>>;
 
 const MAX_EPISODE_SITEMAPS: usize = 16;
 const MAX_SITEMAP_BYTES: usize = 8 << 20;
@@ -188,12 +188,13 @@ impl Provider {
                     if count > 500000 {
                         return Err(invalid());
                     }
+                    let custom_route = (route != format!("{slug}-{s}x{n}")).then(|| route.into());
                     series
                         .entry(slug.into())
                         .or_default()
                         .entry(s)
                         .or_default()
-                        .insert(n, route.into());
+                        .insert(n, custom_route);
                 }
             }
             if series.is_empty() {
@@ -247,7 +248,9 @@ impl Provider {
             .and_then(|s| s.get(&season))
             .and_then(|e| e.get(&key))
             .ok_or_else(invalid)?
-            .clone();
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{slug}-{season}x{key}"));
         self.public_video(&format!("episodios/{route}")).await
     }
 }

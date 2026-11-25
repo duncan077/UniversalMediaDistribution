@@ -14,16 +14,40 @@ use uuid::Uuid;
 )]
 pub enum FriendAction {
     State,
-    Send { username: String },
-    Accept { id: Uuid },
-    Dismiss { id: Uuid },
-    Remove { id: Uuid },
-    Sharing { id: Uuid, enabled: bool },
-    SetGlobal { enabled: bool },
-    SetDiscovery { enabled: bool },
-    Hide { key: String, hidden: bool },
-    Compare { id: Uuid },
-    Activity { media_type: String, title: String },
+    Send {
+        username: String,
+    },
+    Accept {
+        id: Uuid,
+    },
+    Dismiss {
+        id: Uuid,
+    },
+    Remove {
+        id: Uuid,
+    },
+    Sharing {
+        id: Uuid,
+        enabled: bool,
+    },
+    SetGlobal {
+        enabled: bool,
+    },
+    SetDiscovery {
+        enabled: bool,
+    },
+    Hide {
+        key: String,
+        hidden: bool,
+    },
+    Compare {
+        id: Uuid,
+    },
+    Activity {
+        media_type: String,
+        title: String,
+        subtype: Option<String>,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,19 +131,39 @@ pub async fn friend_action(
         FriendAction::Compare { id } => {
             request(s, Method::GET, &format!("/{id}/comparison"), None).await
         }
-        FriendAction::Activity { media_type, title } => {
+        FriendAction::Activity {
+            media_type,
+            title,
+            subtype,
+        } => {
             let key = umd_core::friend_item_key(&media_type, &title);
+            let scoped = umd_core::friend_scoped_item_key(&media_type, &title, subtype.as_deref());
+            let keys = if scoped == key {
+                vec![key.clone()]
+            } else {
+                vec![key.clone(), scoped.clone()]
+            };
             let (activity, settings) = tokio::try_join!(
                 request(
                     s,
                     Method::POST,
                     "/activity/lookup",
-                    Some(json!({"itemKeys":[key]}))
+                    Some(json!({"itemKeys":keys}))
                 ),
                 visibility(s)
             )?;
+            let matches: Vec<_> = activity["matches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| {
+                    scoped == key
+                        || m["itemKey"] == scoped
+                        || (m["itemKey"] == key && m["subtype"].is_null())
+                })
+                .collect();
             Ok(
-                json!({"key":key,"matches":activity["matches"],"hidden":settings.hidden_item_keys.contains(&key)}),
+                json!({"key":key,"matches":matches,"hidden":settings.hidden_item_keys.contains(&key) || settings.hidden_item_keys.contains(&scoped)}),
             )
         }
         change => {

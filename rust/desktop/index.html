@@ -127,7 +127,7 @@
             <label>Categoría<datalist id="category-choices"></datalist><input list="category-choices" id="category" maxlength="100"></label>
             <label>Distribuidor<datalist id="distributor-choices"></datalist><input list="distributor-choices" id="distributor" maxlength="100"></label>
             <label>Estado<select id="publication"><option value="">Todos</option><option value="announced">Anunciado</option><option value="ongoing">En curso</option><option value="completed">Finalizado</option><option value="paused">En pausa</option><option value="cancelled">Cancelado</option></select></label>
-            <label>Cine y series<select id="subtype-group"><option value="">Todos</option><option value="anime">Anime</option><option value="liveAction">Acción real</option></select></label>
+            <label>Tipo de obra<select id="subtype-group"><option value="">Todos</option><option value="anime">Anime</option><option value="liveAction">Acción real</option><option value="manga">Manga y manhwa</option><option value="prose">Libros y novelas</option><option value="comic">Cómics</option></select></label>
             <label id="list-filter-wrap" hidden>Lista<select id="list-filter"><option value="">Todas las listas</option></select></label>
             <label class="toggle-row filter-toggle"><input type="checkbox" id="favorites-only"><span>Solo títulos favoritos</span></label>
             <button type="button" id="filters-clear">Limpiar filtros</button>
@@ -165,7 +165,7 @@
           </header>
           <div class="surface-panel">
             <form id="streams-form" class="streams-form-grid">
-              <label class="field">Fuente<select id="streams-kind"><option value="all">Todas las fuentes</option><option value="playlist">Lista de canales M3U</option><option value="cablevision">CableVisionHD</option><option value="tv-internet">TV por Internet HD</option><option value="futbol">TV Libre Fútbol</option><option value="video">Enlace de video</option></select></label>
+              <label class="field">Fuente<select id="streams-kind"><option value="all">Todas las fuentes</option><option value="playlist">Lista de canales M3U</option><option value="ip-tv-app">IP-TV App Argentina</option><option value="cablevision">CableVisionHD</option><option value="tv-internet">TV por Internet HD</option><option value="futbol">TV Libre Fútbol</option><option value="video">Enlace de video</option></select></label>
               <label class="field">Dirección<input type="url" id="streams-address" required maxlength="4096" /></label>
               <div class="streams-form-actions">
                 <button class="primary" id="streams-submit">Cargar canales</button>
@@ -199,6 +199,7 @@
             <form id="provider-form">
               <label class="field">Proveedor<select id="provider-site"><option value="all">Biblioteca, servidor y proveedores</option><option value="local">Biblioteca</option><option value="server">Servidor</option><option value="capibaratraductor">CapibaraTraductor</option><option value="olympusxyz">OlympusXYZ</option><option value="animetmo">AnimeTMO</option><option value="animeav1">AnimeAV1</option><option value="leercapitulo">LeerCapitulo</option><option value="zonatmo">ZonaTMO</option><option value="uchuujinmangas">Uchuujin Mangas</option><option value="manhwaweb">ManhwaWeb</option><option value="jkanime">JKAnime</option><option value="doramasflix">DoramasFlix</option><option value="framextv">FramexTV</option><option value="pelisplus">PelisPlus</option><option value="pelisplus-to">PelisPlus.to</option><option value="pelisflix-hd">Pelisflix HD</option><option value="poseidon-hd2">Poseidon HD2</option><option value="seriesflix">Seriesflix</option></select></label>
               <label class="field">Título<input id="provider-query" type="search" placeholder="Nombre del anime, película, serie o manga…" maxlength="200" required /></label>
+              <label class="field">Tipo de obra<select id="provider-type"><option value="">Todos</option><option value="anime">Anime</option><option value="liveAction">Acción real</option><option value="manga">Manga y manhwa</option><option value="prose">Libros y novelas</option><option value="comic">Cómics</option><option value="audio">Audio</option></select></label>
               <button type="submit" class="primary">Buscar</button>
             </form>
             <details class="provider-prefs-box"><summary>Preferencias de búsqueda y filtro +18</summary>
@@ -313,6 +314,10 @@
           <output id="torrent-settings-status" class="settings-output"></output>
         </section>
         <form id="source-settings" class="settings-group"><h3>Proveedores de contenido</h3>
+          <details class="settings-details">
+            <summary>Habilitar o deshabilitar proveedores</summary>
+            <ul id="settings-provider-preferences" class="settings-list"></ul>
+          </details>
           <label class="field">Proveedor<select id="source-settings-site"></select></label>
           <label class="field">Nombre<input id="source-settings-name" required maxlength="100"></label>
           <label class="field">Dirección base<input id="source-settings-base" type="url" required placeholder="https://ejemplo.org/api/v1/catalog/"></label>
@@ -336,6 +341,15 @@
         <section class="settings-group"><h3>Cuenta y aplicación</h3>
           <button type="button" id="account" data-icon="profile">Cuenta y respaldo</button>
           <button type="button" id="updates-open" data-icon="downloads" hidden>Actualizaciones</button>
+          <details class="settings-details">
+            <summary>Apoyá el proyecto</summary>
+            <p>Podés contribuir con USDT o USDC.</p>
+            <img src="/donation-qr.png" width="140" height="140" loading="lazy" alt="Código QR de la billetera de donaciones">
+            <label class="field">Dirección de la billetera<input id="donation-address" value="0x333f33497816cf4Cb6b4e13cfE5C9Bb11508B6b5" readonly spellcheck="false"></label>
+            <button type="button" id="donation-copy" class="quiet-btn">Copiar dirección</button>
+            <p id="donation-status" role="status"></p>
+            <small>Confirmá la red con el responsable del proyecto antes de enviar. Las transferencias son irreversibles.</small>
+          </details>
         </section>
       </div>
     </dialog>
@@ -353,7 +367,7 @@
         <div class="button-row"><button type="button" id="profile-delete">Eliminar perfil</button><button type="button" id="profile-keep">Conservar</button></div>
       </div>
       <details><summary>Respaldo de la biblioteca</summary>
-        <p>Podés restaurar una copia de UMD (.umddb) o del cliente .NET (.umdbackup). De .NET se importan el catálogo y los datos personales de cada perfil. La conversión excluye las sesiones, los ajustes de la aplicación, el historial de títulos eliminados y las descargas.</p>
+        <p>Podés restaurar una copia de UMD (.umddb) o del cliente .NET (.umdbackup). La conversión incorpora el catálogo, los perfiles, los títulos eliminados y los ajustes compatibles. También recupera las sesiones vigentes y las credenciales de metadatos en el almacenamiento privado de cada perfil.</p>
         <div class="button-row"><button type="button" id="copy-library">Guardar copia completa…</button><button type="button" id="restore-library">Restaurar copia…</button></div>
         <p id="database-result" role="status"></p>
       </details>

@@ -14,7 +14,8 @@
       try { if (frame.contentDocument && documents.length < 24) documents.push(frame.contentDocument); } catch {}
     }
   }
-  if (!best || best.readyState < 1) return null;
+  const frameSample = () => self === top ? self[Symbol.for("umd:provider-media:v1")]?.() ?? null : null;
+  if (!best || best.readyState < 1) return action === "public-source" ? frameSample() : null;
   function publicCandidates() {
     if (!best.currentSrc || best.mediaKeys) return [];
     const owner = best.ownerDocument.defaultView;
@@ -39,16 +40,21 @@
         .filter(url => {
           if (!url) return false;
           const path = new URL(url).pathname;
-          return /\.m3u8$/i.test(path) && !/(?:^|[/_-])(?:audio|subtitles?|captions?)(?:[/_.-]|$)/i.test(path);
+          return /\.(?:m3u8|mpd)$/i.test(path) && !/(?:^|[/_-])(?:audio|subtitles?|captions?)(?:[/_.-]|$)/i.test(path);
         });
       const rank = url => /(?:^|[/_-])(?:master|manifest|index)(?:[/_.-]|$)/i.test(new URL(url).pathname) ? 0 : 1;
       return [...new Set(manifests)].sort((a, b) => rank(a) - rank(b)).slice(0, 4);
     } catch { return []; }
   }
-  if (action === "public-source") {
-    const page = best.ownerDocument.URL;
-    return typeof page === "string" && page.length <= 16_384
-      ? { page, addresses: publicCandidates() } : null;
+  if (action === "public-source" || action === "frame-source") {
+    if (action === "frame-source" && (best.paused || best.ended || best.readyState < 2)) return null;
+    const page = new URL(best.ownerDocument.URL);
+    page.hash = page.search = "";
+    const addresses = publicCandidates();
+    if (addresses.length && page.href.length <= 16_384) {
+      return { page: page.href, addresses, position: best.currentTime, paused: best.paused };
+    }
+    return action === "public-source" && !best.mediaKeys ? frameSample() : null;
   }
   const key = Symbol.for("umd.provider.transport.v1");
   if (!best[key]) {
@@ -63,6 +69,5 @@
   else if (action === "pause") best.pause();
   return { position: best.currentTime, duration: Number.isFinite(best.duration) ? best.duration : null,
     paused: best.paused, ended: best.ended, ready: best.readyState, seeking: best.seeking,
-    plays:best[key].play, pauses:best[key].pause, seeks:best[key].seeked, seekable: best.seekable.length > 0,
-    publicSource: publicCandidates().length > 0 };
+    plays:best[key].play, pauses:best[key].pause, seeks:best[key].seeked, seekable: best.seekable.length > 0 };
 })

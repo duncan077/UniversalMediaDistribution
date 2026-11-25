@@ -1,11 +1,13 @@
 import {ui, displayTitle, setupLanguage, localizeDiagnostic} from "./locale";
 import {metadataControls, setupMetadataSettings} from "./metadata";
-import {activeProfileId, invokeProfile, windowProfile, writeProfilePref, getProfilePref} from "./profile-context";
+import {activeProfileId, invokeProfile, windowProfile, writeProfilePref, getProfilePref, providerEnabled} from "./profile-context";
 import {invoke} from "./bridge";
 import "@fontsource-variable/archivo/wdth.css";
 import "./style.css";
-import {contentControls, flushProgress, formatTime, playDownload} from "./player";
+import {contentControls, flushProgress, formatTime, playDownload, type EntryListView} from "./player";
 import {remoteUrl, safeEpubImage, safeMediaClass} from "./safety";
+import {attachArtworkImage} from "./artwork";
+import {virtualCatalog} from "./catalog-grid";
 import {setupDownloads} from "./downloads";
 import {setupAccount} from "./account";
 import {setupProvider, hiddenTitle} from "./provider";
@@ -17,6 +19,7 @@ import {setupParty, type ContentUnit} from "./party";
 import {setupProfiles} from "./profiles";
 import {setupUpdates} from "./updates";
 import {activePage, goBack, isPageActive, navigateTo, onPageLeave, setCatalogNavId} from "./router";
+import {groupMedia} from "./catalog-types";
 
 export interface CatalogItem {
   syncId: string;
@@ -66,6 +69,11 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, clas
 }
 
 const catalog = element("catalog");
+const android = /Android/i.test(navigator.userAgent);
+const localGrid = android ? virtualCatalog<CatalogItem>(catalog, item => item.syncId,
+  item => titleCard(item, () => void showDetails(item), true)) : null;
+const onlineGrid = android ? virtualCatalog<CatalogItem>(element("online-cards"), item => item.syncId,
+  item => titleCard(item, () => void openOnline(item), false)) : null;
 const search = element<HTMLInputElement>("search");
 const media = element<HTMLSelectElement>("media-type");
 const listFilter = element<HTMLSelectElement>("list-filter");
@@ -98,9 +106,12 @@ let featuredUnit: ContentUnit | undefined;
 // Abort controller & active context for Detail page async work
 let detailAbort: AbortController | null = null;
 let detailSequence = 0;
-let currentDetail: { id: string; unit?: ContentUnit; onlineServer?: string } | null = null;
+let currentDetail: { item: CatalogItem; unit?: ContentUnit; onlineServer?: string; entryView: EntryListView } | null = null;
 const itemRefreshTimes = new Map<string, number>();
-const artworkProxyCache = new Map<string, Promise<string | null>>();
+
+function detailProviderActive() {
+  return !!document.querySelector(".player-dialog[open], #detail [data-provider-busy], #detail .entry-servers:not([hidden])");
+}
 
 onPageLeave("detail", () => {
   detailAbort?.abort();
@@ -327,23 +338,32 @@ async function action(task: () => Promise<void>) {
 
 async function refreshListFilterOptions() {
   try {
-    const lists = await invokeProfile<MediaList[]>("personal_lists");
-    const prev = listFilter.value;
-    listFilter.replaceChildren(new Option(ui("Todas las listas"), ""));
-    for (const l of lists) {
-      listFilter.add(new Option(`${l.name} (${l.items.length})`, l.id));
-    }
-    if (lists.some(l => l.id === prev)) listFilter.value = prev;
-    element("list-filter-wrap").hidden = lists.length === 0;
+    applyListFilterOptions(await invokeProfile<MediaList[]>("personal_lists"));
   } catch {
     element("list-filter-wrap").hidden = true;
   }
 }
 
+function applyListFilterOptions(lists: MediaList[]) {
+  const prev = listFilter.value;
+  listFilter.replaceChildren(new Option(ui("Todas las listas"), ""));
+  for (const {id, name, items} of lists) listFilter.add(new Option(`${name} (${items.length})`, id));
+  if (lists.some(l => l.id === prev)) listFilter.value = prev;
+  element("list-filter-wrap").hidden = lists.length === 0;
+}
+
 let recentRows: {added:CatalogItem[];updated:CatalogItem[]} = {added:[],updated:[]};
+interface HomeBootstrap {
+  page: LibraryPage;
+  recent: typeof recentRows;
+  continuing: Resume[];
+  lists: MediaList[];
+  serverAddress: string;
+}
 let recentRevision = -1;
 let catalogWaiting = false;
 let catalogLoad: Promise<void> | undefined;
+let startupApplied = false;
 
 function showCatalogLoading(loading: boolean) {
   catalogWaiting = loading;
@@ -352,6 +372,7 @@ function showCatalogLoading(loading: boolean) {
   if (!loading) return;
   items = [];
   cursor = null;
+  localGrid?.disable();
   catalog.replaceChildren();
   catalog.hidden = false;
   for (const id of ["feature", "shortcuts", "home-livetv-card", "home-shelves", "continue-shelf", "online-shelf", "empty", "more", "shelves-toggle"]) {
@@ -366,25 +387,24 @@ function showCatalogLoading(loading: boolean) {
   syncFilterCount();
 }
 
-function load(append = false, transition = false) {
-  const pending = loadPage(append, transition);
+function load(append = false, transition = false, bootstrap = false) {
+  const pending = loadPage(append, transition, bootstrap);
   if (!append) catalogLoad = pending;
   return pending;
 }
 
-async function loadPage(append: boolean, transition: boolean) {
+async function loadPage(append: boolean, transition: boolean, bootstrap: boolean) {
   const request = ++generation;
   if (transition) {
     showCatalogLoading(true);
     await afterPaint();
     if (request !== generation) return;
   }
-  if (!append) refreshOnline();
+  if (!append && !bootstrap) refreshOnline();
   const more = element<HTMLButtonElement>("more");
   more.disabled = true;
   try {
-    const page = await invokeProfile<LibraryPage>("library", {
-      query: {
+    const query = {
         ...filters(),
         q: search.value.trim(),
         mediaType: media.value || null,
@@ -393,9 +413,19 @@ async function loadPage(append: boolean, transition: boolean) {
         cursor: append ? cursor : null,
         limit: 50,
         summary: true,
-      },
-    });
+    };
+    const initialResume = resumeRequest;
+    const initial = bootstrap ? await invokeProfile<HomeBootstrap>("home_bootstrap", {query}) : null;
+    const page = initial?.page ?? await invokeProfile<LibraryPage>("library", {query});
     if (request !== generation) return;
+    if (initial) {
+      startupApplied = true;
+      recentRows = initial.recent;
+      recentRevision = page.revision;
+      if (resumeRequest === initialResume) continueList = initial.continuing;
+      applyListFilterOptions(initial.lists);
+      if (!serverAddress) serverAddress = initial.serverAddress;
+    }
     const shown = append ? items.length : 0;
     items = append ? [...items, ...page.document.items] : page.document.items;
     favorites = new Set(page.favoriteIds);
@@ -441,40 +471,6 @@ function safeImage(value: unknown): string | null {
     }
   }
   return null;
-}
-
-function loadProxiedArtwork(url: string, providers: string[]): Promise<string | null> {
-  const key = `${url}\n${providers.slice().sort().join(",")}`;
-  const cached = artworkProxyCache.get(key);
-  if (cached) return cached;
-  const pending = invoke<string>("fetch_artwork", { url, providers })
-    .then(dataUrl => safeEpubImage(dataUrl))
-    .catch(() => null);
-  artworkProxyCache.set(key, pending);
-  if (artworkProxyCache.size > 256) {
-    const first = artworkProxyCache.keys().next().value;
-    if (first !== undefined) artworkProxyCache.delete(first);
-  }
-  return pending;
-}
-
-function attachArtworkImage(img: HTMLImageElement, url: string, providers: string[], onExhausted: () => void) {
-  img.decoding = "async";
-  img.referrerPolicy = "no-referrer";
-  if (url.startsWith("data:")) {
-    img.addEventListener("error", onExhausted, { once: true });
-    img.src = url;
-    return;
-  }
-  img.addEventListener("error", () => {
-    void loadProxiedArtwork(url, providers).then(proxied => {
-      if (!img.isConnected) return;
-      if (!proxied) { onExhausted(); return; }
-      img.addEventListener("error", onExhausted, { once: true });
-      img.src = proxied;
-    });
-  }, { once: true });
-  img.src = url;
 }
 
 function tone(item: CatalogItem) {
@@ -635,7 +631,11 @@ function redrawOnline() {
   const localIds = new Set(items.map(item => item.syncId));
   const cards = element("online-cards");
   const visible = onlineItems.filter(item => (home() || !localIds.has(item.syncId)) && !hiddenTitle(item));
-  cards.replaceChildren(...visible.map(item => titleCard(item, () => void openOnline(item), false)));
+  if (onlineGrid && !home()) onlineGrid.set(visible);
+  else {
+    onlineGrid?.disable();
+    cards.replaceChildren(...visible.map(item => titleCard(item, () => void openOnline(item), false)));
+  }
   if (!onlineBusy && !onlineFailed) {
     element("online-status").textContent = visible.length ? "" : ui("Sin títulos adicionales del servidor.");
   }
@@ -822,14 +822,20 @@ function renderHomeShelves(visible: CatalogItem[]) {
 
 function render(from = 0) {
   if (catalogWaiting) return;
-  if (!from) catalog.replaceChildren();
   const visible = items.filter(item => !hiddenTitle(item));
-  const cards = document.createDocumentFragment();
-  for (const item of items.slice(from)) {
-    if (hiddenTitle(item)) continue;
-    cards.append(titleCard(item, () => void showDetails(item), true));
+  if (localGrid) {
+    if (home() && shelfMode && visible.length >= 6) localGrid.disable();
+    else localGrid.set(visible);
   }
-  catalog.append(cards);
+  else {
+    if (!from) catalog.replaceChildren();
+    const cards = document.createDocumentFragment();
+    for (const item of items.slice(from)) {
+      if (hiddenTitle(item)) continue;
+      cards.append(titleCard(item, () => void showDetails(item), true));
+    }
+    catalog.append(cards);
+  }
   renderFeature();
   renderContinueShelf();
   renderHomeShelves(visible);
@@ -874,8 +880,12 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   if (seq !== detailSequence || signal.aborted || !isPageActive(origin)) return;
 
   const content = element("detail");
+  const sameDetail = isPageActive("detail") && currentDetail?.item.syncId === item.syncId && currentDetail.onlineServer === onlineServer;
+  const entryView = sameDetail && currentDetail ? currentDetail.entryView : {};
+  const scrollY = sameDetail ? window.scrollY : 0;
+  const newHighlight = !!unit && unit !== currentDetail?.unit;
   content.dataset.tone = tone(item);
-  currentDetail = { id: item.syncId, unit, onlineServer };
+  currentDetail = { item, unit, onlineServer, entryView };
 
   // Top Back bar (Avalonia DetailsBackButton + Refresh)
   const topBar = node("div", undefined, "detail-topbar");
@@ -905,7 +915,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
       feedback.classList.remove("error");
       feedback.textContent = ui("Actualizando ficha…");
       try {
-        const res = await invoke<RefreshItemResult>("refresh_item", {
+        const res = await invokeProfile<RefreshItemResult>("refresh_item", {
           id: item.syncId,
           hideAdult: hideAdult(),
           discover: true,
@@ -954,7 +964,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
     backdrop.setAttribute("aria-hidden", "true");
     const bgImg = node("img");
     bgImg.alt = "";
-    attachArtworkImage(bgImg, backdropUrl, Object.keys(item.onlineProviders ?? {}), () => backdrop.remove());
+    attachArtworkImage(bgImg, backdropUrl, Object.keys(item.onlineProviders ?? {}), () => backdrop.remove(), "backdrop");
     backdrop.append(bgImg);
     hero.append(backdrop);
   }
@@ -973,7 +983,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   badgesRow.append(node("span", mediaLabel(item), "chip accent"));
   const pubStatus = statusLabel(item.publicationStatus);
   if (pubStatus) badgesRow.append(node("span", pubStatus, "chip amber"));
-  const providerNames = Object.keys(item.onlineProviders ?? {});
+  const providerNames = Object.keys(item.onlineProviders ?? {}).filter(id => providerEnabled(activeProfileId(), id));
   if (providerNames.length) {
     badgesRow.append(node("span", providerNames.join(" · "), "chip mint"));
   } else if (onlineServer) {
@@ -1099,6 +1109,8 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
       unit,
       {
         signal,
+        view: entryView,
+        scrollToHighlight: !sameDetail || newHighlight,
         onContinueReady: (cta) => {
           ctaHost.replaceChildren();
           if (!cta) return;
@@ -1171,7 +1183,8 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
 
   content.replaceChildren(topBar, hero, body);
   const alreadyOnDetail = isPageActive("detail");
-  navigateTo("detail", { push: !alreadyOnDetail, scrollTop: true });
+  navigateTo("detail", { push: !alreadyOnDetail, scrollTop: !sameDetail });
+  if (sameDetail && !newHighlight) window.scrollTo(0, scrollY);
 
   requestAnimationFrame(() => {
     more.hidden = description.scrollHeight <= description.clientHeight + 1;
@@ -1180,11 +1193,11 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   // Quietly refresh chapters, metadata, and artwork in the background (throttled per item)
   if (!onlineServer) {
     const lastRefresh = itemRefreshTimes.get(item.syncId) ?? 0;
-    const hasProviders = Object.keys(item.onlineProviders ?? {}).length > 0;
+    const hasProviders = providerNames.length > 0;
     const needsArtwork = !safeImage(item.thumbnailRef);
     if (Date.now() - lastRefresh > 5 * 60_000 && (serverAddress || hasProviders || needsArtwork)) {
       itemRefreshTimes.set(item.syncId, Date.now());
-      void invoke<RefreshItemResult>("refresh_item", {
+      void invokeProfile<RefreshItemResult>("refresh_item", {
         id: item.syncId,
         hideAdult: hideAdult(),
         discover: !hasProviders && needsArtwork,
@@ -1192,7 +1205,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
         if (!res.changed) return;
         await load();
         void refreshContinue().catch(() => {});
-        if (seq === detailSequence && !signal.aborted && isPageActive("detail")) {
+        if (seq === detailSequence && !signal.aborted && isPageActive("detail") && !detailProviderActive()) {
           void showDetails(res.item, unit);
         }
       }).catch(() => {});
@@ -1291,6 +1304,17 @@ rail.addEventListener("click", event => {
 
 setupMetadataSettings();
 const settings = element<HTMLDialogElement>("settings-dialog");
+element("donation-copy").onclick = async () => {
+  const address = element<HTMLInputElement>("donation-address");
+  const output = element("donation-status");
+  try {
+    await navigator.clipboard.writeText(address.value);
+    output.textContent = ui("Dirección copiada");
+  } catch {
+    address.select();
+    output.textContent = ui("Seleccioná y copiá la dirección.");
+  }
+};
 const onlineToggle = element<HTMLInputElement>("online-enabled");
 onlineToggle.onchange = async () => {
   await writeProfilePref("online-catalog", onlineToggle.checked ? "on" : "off");
@@ -1318,8 +1342,15 @@ search.addEventListener("input", () => {
   element("online-shelf").hidden = true;
   timer = setTimeout(() => load(), 180);
 });
+function filteredSection(): Section {
+  const group = element<HTMLSelectElement>("subtype-group").value;
+  return (Object.keys(sections) as Section[]).find(id =>
+    id !== "favorites" && sections[id].type === media.value && sections[id].group === group
+  ) ?? (media.value === "book" ? "books" : "all");
+}
 media.addEventListener("change", () => {
-  if (media.value !== "movie") element<HTMLSelectElement>("subtype-group").value = "";
+  const group = element<HTMLSelectElement>("subtype-group");
+  if (media.value !== groupMedia(group.value)) group.value = "";
 });
 element("advanced").addEventListener("change", (event) => {
   const year = element<HTMLInputElement>("year");
@@ -1327,12 +1358,12 @@ element("advanced").addEventListener("change", (event) => {
   const favBox = element<HTMLInputElement>("favorites-only");
   favoritesOnly = favBox.checked;
   const group = element<HTMLSelectElement>("subtype-group");
-  if (event.target === group && group.value) media.value = "movie";
+  if (event.target === group && group.value) media.value = groupMedia(group.value);
   if (section === "favorites" && !favoritesOnly) {
-    section = (Object.keys(sections) as Section[]).find(id => id !== "favorites" && sections[id].type === media.value && sections[id].group === group.value) ?? "all";
+    section = filteredSection();
     syncSection();
   } else if (!favoritesOnly) {
-    section = (Object.keys(sections) as Section[]).find(id => id !== "favorites" && sections[id].type === media.value && sections[id].group === group.value) ?? "all";
+    section = filteredSection();
     syncSection();
   }
   void load();
@@ -1371,10 +1402,10 @@ const startAccount = setupAccount(async () => {
   await load();
   void refreshContinue().catch(() => {});
   if (isPageActive("detail") && currentDetail && !currentDetail.onlineServer) {
-    const { id, unit } = currentDetail;
+    const { item: { syncId: id }, unit } = currentDetail;
     try {
       const fresh = await invoke<CatalogItem>("library_item", { id });
-      if (isPageActive("detail") && currentDetail?.id === id) {
+      if (isPageActive("detail") && currentDetail?.item.syncId === id && !detailProviderActive()) {
         void showDetails(fresh, unit);
       }
     } catch { /* Item may have been removed by sync */ }
@@ -1387,7 +1418,7 @@ const openProviderSearch = setupProvider(async (item, openDetails) => {
   if (openDetails) void showDetails(item);
   await load();
 });
-setupFriends((query) => openProviderSearch(query));
+setupFriends(openProviderSearch);
 setupParty((item, unit) => void showDetails(item, unit));
 setupStreams(status);
 setupDownloads((name, mediaItem, target) => playDownload(name, mediaItem, target, status));
@@ -1397,18 +1428,19 @@ const openListsPage = setupLists(
   () => load(),
 );
 void (async () => {
-  await load(false, true);
+  await load(false, true, true);
+  if (!startupApplied) {
+    await Promise.allSettled([
+      refreshContinue(),
+      refreshListFilterOptions(),
+      invoke<string>("server_url").then(address => {
+        if (!serverAddress) serverAddress = address;
+      }),
+    ]);
+  }
   await Promise.allSettled([
     initialProfile,
-    refreshContinue(),
-    refreshListFilterOptions(),
-    invoke<string>("server_url").then(async address => {
-      if (address && !serverAddress) {
-        serverAddress = address;
-        if (!items.length) render();
-      }
-      await refreshOnline();
-    }),
+    refreshOnline(),
     invoke<string | null>("library_notice").then(message => {
       if (message) status(localizeDiagnostic(message), false, true);
     }),
@@ -1437,6 +1469,12 @@ for (const [id, restore] of [["copy-library", false], ["restore-library", true]]
 }
 
 window.addEventListener("umd-catalog-changed", () => { void load(); void refreshContinue().catch(() => {}); });
+window.addEventListener("umd-provider-availability-changed", () => {
+  if (isPageActive("detail") && currentDetail) {
+    const { item, unit, onlineServer } = currentDetail;
+    void showDetails(item, unit, onlineServer);
+  }
+});
 window.addEventListener("umd-lists-changed", async () => {
   const filteringByList = !!listFilter.value;
   await refreshListFilterOptions();

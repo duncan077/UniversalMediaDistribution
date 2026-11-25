@@ -13,9 +13,10 @@ export function continuousReader(
   viewport: HTMLElement,
   count: number,
   initialPage: number,
-  draw: (page: number, target: HTMLElement) => Promise<void>,
+  draw: (page: number, target: HTMLElement, signal: AbortSignal) => Promise<void>,
   onPage: (page: number) => void,
   onEvict?: (page: number) => void,
+  keepPerSide = 3,
 ) {
   const list = document.createElement("div");
   list.className = "continuous-pages";
@@ -26,28 +27,49 @@ export function continuousReader(
     list.append(page);
     return page;
   });
-  const observer = new IntersectionObserver(entries => {
-    for (const entry of entries) {
-      const page = entry.target as HTMLElement;
-      const pageNumber = Number(page.dataset.page);
-      if (!entry.isIntersecting) {
-        if (page.firstChild) {
-          page.style.minHeight = Math.max(120, page.offsetHeight) + "px";
-          onEvict?.(pageNumber);
-          releasePageDom(page);
-        }
-        continue;
-      }
-      if (page.firstChild) continue;
-      const content = document.createElement("div");
-      page.append(content);
-      void draw(pageNumber, content).then(() => {
-        if (content.isConnected) page.style.minHeight = Math.max(60, content.offsetHeight) + "px";
-      }).catch(e => { if (content.isConnected) content.textContent = String(e); });
-    }
-  }, {root: viewport, rootMargin: "100% 0px"});
+  const retained = new Map<number, AbortController>();
+  let running = 0;
+  let closed = false;
   let frame = 0;
   let current = initialPage;
+
+  function evict(num: number) {
+    retained.get(num)?.abort();
+    retained.delete(num);
+    const page = pages[num - 1];
+    page.style.minHeight = Math.max(60, page.offsetHeight) + "px";
+    onEvict?.(num);
+    releasePageDom(page);
+  }
+
+  function reconcile() {
+    if (closed) return;
+    const first = Math.max(1, current - keepPerSide);
+    const last = Math.min(count, current + keepPerSide);
+    for (const num of retained.keys()) {
+      if (num < first || num > last) evict(num);
+    }
+    const nearest = Array.from({length: last - first + 1}, (_, i) => first + i)
+      .sort((a, b) => Math.abs(a - current) - Math.abs(b - current));
+    for (const num of nearest) {
+      if (running >= 2) break;
+      if (retained.has(num)) continue;
+      const controller = new AbortController();
+      retained.set(num, controller);
+      running++;
+      const page = pages[num - 1];
+      const content = document.createElement("div");
+      page.append(content);
+      void draw(num, content, controller.signal).then(() => {
+        if (!controller.signal.aborted) page.style.minHeight = Math.max(60, content.offsetHeight) + "px";
+      }).catch(e => {
+        if (!controller.signal.aborted) content.textContent = String(e);
+      }).finally(() => {
+        running--;
+        reconcile();
+      });
+    }
+  }
   const update = () => {
     frame = 0;
     const rect = viewport.getBoundingClientRect();
@@ -59,27 +81,21 @@ export function continuousReader(
       else high = mid;
     }
     const page = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2 ? count : low + 1;
-    if (page !== current) { current = page; onPage(page); }
+    if (page !== current) { current = page; onPage(page); reconcile(); }
   };
   const scroll = () => { if (!frame) frame = requestAnimationFrame(update); };
   const go = (page: number) => {
     pages[page - 1].scrollIntoView({block: "start"});
-    current = page; onPage(page);
+    current = page; onPage(page); reconcile();
   };
   viewport.replaceChildren(list);
-  pages.forEach(page => observer.observe(page));
   viewport.addEventListener("scroll", scroll, {passive: true});
   go(initialPage);
   return {go, close() {
-    observer.disconnect();
+    closed = true;
     viewport.removeEventListener("scroll", scroll);
     cancelAnimationFrame(frame);
-    for (const page of pages) {
-      if (page.firstChild) {
-        onEvict?.(Number(page.dataset.page));
-        releasePageDom(page);
-      }
-    }
+    for (const num of retained.keys()) evict(num);
     list.remove();
   }};
 }

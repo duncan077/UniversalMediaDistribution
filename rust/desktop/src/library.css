@@ -646,6 +646,13 @@ h1 {
   gap: 26px 18px;
   margin-top: 22px;
 }
+.virtual-catalog {
+  position: relative;
+  overflow-anchor: none;
+}
+.virtual-catalog > .card {
+  position: absolute;
+}
 .card {
   position: relative;
   min-width: 0;
@@ -1262,7 +1269,17 @@ dialog .field select {
   color: #fff;
 }
 .television .open-title:focus-visible .cover {
-  box-shadow: 0 0 0 4px var(--mint-bright);
+  outline: 4px solid var(--mint-bright);
+}
+.television .entry-card,
+.television .channel-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 74px;
+}
+.television .cover,
+.television .favorite,
+.television .nav-item {
+  transition: none;
 }
 .television .open-title:focus-visible {
   outline: 0;
@@ -1288,7 +1305,14 @@ dialog .field select {
     animation: drawer-in 0.18s ease-out;
   }
   #activity {
-    background: linear-gradient(90deg, transparent, var(--mint), transparent) 0 0 / 38% 100% no-repeat;
+    background: transparent;
+  }
+  #activity::after {
+    content: "";
+    display: block;
+    width: 38%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, var(--mint), transparent);
     animation: sweep 1.05s linear infinite;
   }
 }
@@ -1311,10 +1335,10 @@ dialog .field select {
 }
 @keyframes sweep {
   from {
-    background-position: -60% 0;
+    transform: translateX(-100%);
   }
   to {
-    background-position: 160% 0;
+    transform: translateX(265%);
   }
 }
 

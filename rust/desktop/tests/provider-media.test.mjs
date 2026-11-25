@@ -27,15 +27,24 @@ test("a same-origin video reports transport changes between samples and clamps s
 });
 
 test("public handoff only offers ordinary HTTPS media", () => {
-  const video = {readyState: 4, paused: false, getBoundingClientRect: () => ({width:640,height:360})};
-  const doc = {querySelectorAll: selector => selector === "iframe" ? [] : [video]};
-  const sample = runInNewContext(script, {document:doc, URL});
+  const video = {readyState: 4, paused: false, currentTime: 12, getBoundingClientRect: () => ({width:640,height:360})};
+  const doc = {
+    URL: "https://player.example.org/embed?tracking=example",
+    defaultView: {location: new URL("https://player.example.org/embed"), performance: {getEntriesByType: () => []}},
+    querySelectorAll: selector => selector === "iframe" ? [] : [video],
+  };
+  video.ownerDocument = doc;
+  const window = {};
+  const sample = runInNewContext(script, {document:doc, URL, self:window, top:window});
   video.currentSrc = "https://media.example.org/movie.mp4";
-  assert.equal(sample("public-source"),video.currentSrc);
+  const source = sample("public-source");
+  assert.deepEqual([...source.addresses], [video.currentSrc]);
+  assert.equal(source.page, "https://player.example.org/embed");
+  assert.equal(source.position, 12);
   video.mediaKeys = {};
   assert.equal(sample("public-source"),null);
   video.mediaKeys = null;
-  for (const url of ["blob:https://example.org/id","https://example.org/movie.mp4?ticket=example","https://u:p@example.org/movie.mp4"]) {
+  for (const url of ["blob:https://example.org/id","http://example.org/movie.mp4","https://u:p@example.org/movie.mp4"]) {
     video.currentSrc = url;
     assert.equal(sample("public-source"),null);
   }

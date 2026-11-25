@@ -9,6 +9,40 @@ static ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["'](https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[a-zA-Z0-9/_-]*)?)["']"#).unwrap()
 });
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_format_survives_a_detail_response_without_tipo() {
+        let base = Url::parse("https://manhwa.example/").unwrap();
+        let entry = map_item(
+            &base,
+            &json!({"name_esp":"Obra","_tipo":"Novela web"}),
+            "obra",
+            None,
+        )
+        .unwrap();
+        let detail = map_item(
+            &base,
+            &json!({"name_esp":"Obra"}),
+            "obra",
+            entry.preview["subtype"].as_str(),
+        )
+        .unwrap();
+        assert_eq!(detail.preview["subtype"], "web_novel");
+        assert_eq!(detail.preview["categories"], json!([]));
+        let comic = map_item(
+            &base,
+            &json!({"name_esp":"Obra","_tipo":"Cómic"}),
+            "obra-2",
+            None,
+        )
+        .unwrap();
+        assert_eq!(comic.preview["subtype"], "comic");
+    }
+}
+
 fn identifier(s: &str) -> bool {
     s.len() <= 500
         && s.chars().next().is_some_and(char::is_alphanumeric)
@@ -50,7 +84,7 @@ fn is_adult_item(v: &Value) -> bool {
         .any(|k| is_erotic_flag(&v[*k]))
 }
 
-pub(super) fn map_item(base: &Url, v: &Value, id: &str) -> Option<Entry> {
+pub(super) fn map_item(base: &Url, v: &Value, id: &str, fallback: Option<&str>) -> Option<Entry> {
     if !identifier(id) {
         return None;
     }
@@ -60,13 +94,8 @@ pub(super) fn map_item(base: &Url, v: &Value, id: &str) -> Option<Entry> {
         .collect();
     let name = names.first()?;
     let kind = string(&v["_tipo"]).unwrap_or_default();
-    let sub = match umd_core::normalize(&kind).replace(['_', '-'], " ").as_str() {
-        "comic" => "comic",
-        "novel" | "novela" => "novel",
-        "light novel" | "novela ligera" => "light_novel",
-        "web novel" | "novela web" => "web_novel",
-        _ => "manga",
-    };
+    let sub = umd_core::provider_book_subtype(&kind)
+        .or_else(|| fallback.and_then(umd_core::provider_book_subtype));
     let mut seen = HashSet::from([umd_core::normalize(name)]);
     let aliases: Vec<_> = names
         .iter()
@@ -96,11 +125,10 @@ pub(super) fn map_item(base: &Url, v: &Value, id: &str) -> Option<Entry> {
             categories.push(trimmed.to_string());
         }
     };
-    if kind.is_empty() {
+    if sub == Some("manga") {
         push_cat("Manga".into());
-    } else {
-        push_cat(kind);
     }
+    push_cat(kind);
     for demo_key in ["_demografi", "demografia"] {
         if let Some(demo) = label(&v[demo_key]) {
             push_cat(demo);
@@ -246,7 +274,7 @@ impl Provider {
             let client = if url.origin() == self.base.origin() {
                 self.client.clone()
             } else {
-                pinned(&url).await?
+                pinned(&url, self.cookies.as_ref()).await?
             };
             self.api = Some((url, client))
         }
@@ -268,7 +296,7 @@ impl Provider {
         let items = dedup(
             rows(&v["data"])?
                 .iter()
-                .filter_map(|v| map_item(&self.base, v, v["_id"].as_str()?)),
+                .filter_map(|v| map_item(&self.base, v, v["_id"].as_str()?, None)),
         );
         let next =
             (v["next"] == true).then(|| (page + if q.is_some() { 2 } else { 1 }).to_string());
@@ -297,6 +325,7 @@ impl Provider {
                         "_demografi": v["_demografi"]
                     }),
                     &id,
+                    None,
                 )
             }))
             .into_iter()
@@ -316,7 +345,8 @@ impl Provider {
     }
     pub(super) async fn manhwa_detail(&mut self, e: &Entry) -> Result<Value> {
         let v = self.manhwa_title(&e.external_id).await?;
-        let mut item = map_item(&self.base, &v, &e.external_id)
+        let fallback = e.preview["subtype"].as_str().unwrap_or("manga");
+        let mut item = map_item(&self.base, &v, &e.external_id, Some(fallback))
             .ok_or_else(invalid)?
             .preview;
         let mut chapters: Vec<_> = chapter_routes(&self.base, &v)?
@@ -348,6 +378,13 @@ impl Provider {
             return Err(invalid());
         }
         let v = self.manhwa_title(id).await?;
+        if v["_tipo"]
+            .as_str()
+            .and_then(umd_core::provider_book_subtype)
+            .is_some_and(|subtype| !matches!(subtype, "manga" | "comic"))
+        {
+            return Err(Failure::new("unsupported"));
+        }
         let (_, _, route) = chapter_routes(&self.base, &v)?
             .remove(&target)
             .ok_or_else(invalid)?;

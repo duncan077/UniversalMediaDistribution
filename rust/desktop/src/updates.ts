@@ -1,4 +1,4 @@
-import {localizeDiagnostic, ui} from "./locale";
+import {ui} from "./locale";
 import { getVersion } from "@tauri-apps/api/app";
 import {invoke} from "./bridge";
 import {Channel} from "@tauri-apps/api/core";
@@ -10,7 +10,7 @@ interface Offer {
   sizeBytes: number;
   notes: string | null;
 }
-type Progress = { phase: "download"; bytes: number } | { phase: "verify" | "install" };
+type Progress = { phase: "download"; bytes: number } | { phase: "verify" | "extract" | "install" };
 
 export function setupUpdates() {
   const android = /Android/i.test(navigator.userAgent);
@@ -20,7 +20,7 @@ export function setupUpdates() {
   const dialog = byId<HTMLDialogElement>("updates-dialog");
   const search = byId<HTMLButtonElement>("updates-check");
   const install = byId<HTMLButtonElement>("updates-install");
-  if (!android) install.textContent = ui("Descargar ZIP");
+  if (!android) install.textContent = ui("Actualizar y reiniciar");
   const bar = byId<HTMLProgressElement>("updates-progress");
   const status = byId("updates-status");
   const notes = byId("updates-notes");
@@ -76,13 +76,20 @@ export function setupUpdates() {
     progress.onmessage = event => {
       if (event.phase === "download") { bar.value = event.bytes; return; }
       bar.hidden = true;
-      status.textContent = event.phase === "verify"
-        ? ui(android ? "Verificando el instalador…" : "Verificando el ZIP…")
-        : ui("Seguí los pasos del instalador de Android.");
+      if (event.phase === "verify") status.textContent = ui(android ? "Verificando el instalador…" : "Verificando el ZIP…");
+      if (event.phase === "extract") status.textContent = ui("Descomprimiendo la actualización…");
+      if (event.phase === "install") status.textContent = ui("Seguí los pasos del instalador de Android.");
     };
     try {
-      await flushProgress();
-      status.textContent = localizeDiagnostic(await invoke<string>("install_update", {id: offer.id, progress}));
+      const id = offer.id;
+      if (android) await flushProgress();
+      const message = await invoke<string>("install_update", {id, progress});
+      if (android) status.textContent = ui(message);
+      else {
+        status.textContent = ui("Reiniciando UMD para aplicar la actualización…");
+        await flushProgress();
+        await invoke("restart_update", {id});
+      }
       offer = null;
     } catch (error) { status.textContent = String(error); }
     finally { bar.hidden = true; setBusy(false); }
@@ -94,6 +101,9 @@ export function setupUpdates() {
     void getVersion().then(v => { byId("updates-current").textContent = ui("Versión instalada: {0}", v); });
     if (!busy) void check();
   };
+  if (android) window.addEventListener("umd-update-install-cancelled", () => {
+    status.textContent = ui("Android no completó la instalación. Podés volver a buscar la actualización.");
+  });
   install.onclick = () => void apply();
   search.onclick = () => void check();
   return (address: string) => {

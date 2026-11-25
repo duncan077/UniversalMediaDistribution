@@ -1,4 +1,5 @@
 mod maintenance;
+use axum::serve::ListenerExt;
 use std::{env, path::PathBuf};
 use umd_core::CatalogStore;
 use umd_server::{router, AccountStore, ReleaseStore, ServerState, DEFAULT_MAX_PACKAGE_BYTES};
@@ -56,7 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None,
     )?;
     axum::serve(
-        listener,
+        listener.tap_io(|socket| {
+            let _ = socket.set_nodelay(true);
+        }),
         router(ServerState {
             admin: admin.clone(),
             catalog,

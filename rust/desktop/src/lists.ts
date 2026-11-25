@@ -257,21 +257,14 @@ export function setupLists(
     const grid = el("section", undefined, "catalog");
     content.append(grid);
 
-    const loaded = await Promise.all(
-      activeList.items.map(async (entry) => {
-        if (!entry.itemId) return { entry, item: null as CatalogItem | null };
-        try {
-          const item = await invoke<CatalogItem>("library_item", { id: entry.itemId });
-          return { entry, item };
-        } catch {
-          return { entry, item: null as CatalogItem | null };
-        }
-      }),
-    );
+    const ids = activeList.items.flatMap(entry => entry.itemId ? [entry.itemId] : []);
+    const summaries = ids.length ? await invoke<CatalogItem[]>("library_summaries", {ids}).catch(() => []) : [];
+    const byId = new Map(summaries.map(item => [item.syncId, item]));
     if (!isPageActive("lists") || request !== generation) return;
 
     const frag = document.createDocumentFragment();
-    for (const { entry, item } of loaded) {
+    for (const entry of activeList.items) {
+      const item = entry.itemId ? byId.get(entry.itemId) : undefined;
       if (item) {
         const card = renderCard(item, () => showDetails(item), true);
         const removeFromList = el("button", "×", "list-card-remove");

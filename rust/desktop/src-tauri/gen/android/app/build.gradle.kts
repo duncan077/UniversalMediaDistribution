@@ -38,6 +38,7 @@ android {
             optimization {
                enable = true
             }
+            isShrinkResources = true
             proguardFiles(
                 *fileTree(".") {
                   include("**/*.pro")

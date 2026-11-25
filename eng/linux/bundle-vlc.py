@@ -83,7 +83,7 @@ for source in plugins:
     relative = source.relative_to(next(p for p in source.parents if p.name == "plugins"))
     copy_native(source, library_dir / "plugins" / relative, "$ORIGIN/../..")
 
-# .NET's default P/Invoke search finds libvlc.so next to the executable. Its
+# UMD loads libvlc.so next to the executable. Its
 # dependencies are resolved inside libvlc/ by RUNPATH before the host search.
 copy_native(roots[0], destination / "libvlc.so", "$ORIGIN/libvlc")
 notices = destination / "licenses" / "libvlc"
@@ -106,6 +106,6 @@ shutil.copytree("/usr/share/common-licenses", notices / "common-licenses", symli
     "Corresponding Debian source packages: https://sources.debian.org/\n"
     "Historical source versions: https://snapshot.debian.org/\n"
     "ELF RUNPATHs were changed with patchelf; sources were not modified.\n"
-    "Build recipe: eng/linux/Dockerfile and eng/linux/bundle-vlc.py in UMD.\n"
+    "Build recipe: eng/linux/bundle-vlc.py in UMD.\n"
 )
 print(f"Bundled {len(libraries)} libraries and {len(plugins)} VLC plugins")

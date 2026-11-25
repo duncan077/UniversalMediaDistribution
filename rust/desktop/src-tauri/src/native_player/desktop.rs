@@ -26,8 +26,8 @@ struct Player {
     release: unsafe extern "C" fn(Handle),
     close: unsafe extern "C" fn(Handle),
 }
-// LibVLC's public player functions are callable from worker threads. The mutex
-// serializes commands and drop, and the library outlives all three handles.
+// Commands borrow the active player under the mutex. Removed players own their
+// handles and can stop outside the lock, including while a new source starts.
 unsafe impl Send for Player {}
 static PLAYER: Mutex<Option<Player>> = Mutex::new(None);
 impl Drop for Player {
@@ -293,9 +293,8 @@ pub(super) fn command(
     #[cfg(windows)] viewport: Option<super::viewport::Viewport>,
 ) -> CommandResult<Value> {
     let id = args["id"].as_str().unwrap_or_default();
-    let mut slot = PLAYER.lock().map_err(|e| e.to_string())?;
     if op == "start" {
-        *slot = Some(unsafe {
+        let mut next = unsafe {
             Player::start(
                 id,
                 args["source"].as_str().ok_or("Falta la fuente.")?,
@@ -303,13 +302,20 @@ pub(super) fn command(
                 #[cfg(windows)]
                 viewport.ok_or("Falta la superficie de video.")?,
             )?
-        });
+        };
+        let initial = unsafe { next.state(op, args) };
+        let previous = PLAYER.lock().map_err(|e| e.to_string())?.replace(next);
+        drop(previous);
+        return initial;
     }
+    let mut slot = PLAYER.lock().map_err(|e| e.to_string())?;
     let Some(p) = slot.as_mut().filter(|p| p.id == id) else {
         return Ok(json!({"closed":true}));
     };
     if op == "close" {
-        *slot = None;
+        let previous = slot.take();
+        drop(slot);
+        drop(previous);
         return Ok(json!({"closed":true}));
     }
     unsafe { p.state(op, args) }

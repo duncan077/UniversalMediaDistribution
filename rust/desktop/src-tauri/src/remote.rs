@@ -16,7 +16,7 @@ struct Session {
     client: reqwest::Client,
     token: String,
     revision: Option<i64>,
-    pending: Option<Value>,
+    pending: Option<PendingSnapshot>,
     automatic: bool,
     incremental: bool,
     gzip: bool,
@@ -24,6 +24,44 @@ struct Session {
     party_socket: Option<party::Connection>,
     etag: Option<(i64, reqwest::header::HeaderValue)>,
     last_sync: Option<(i64, (u64, i64))>,
+}
+
+#[derive(PartialEq)]
+struct PendingSnapshot {
+    revision: i64,
+    summary: Value,
+    document: Option<std::sync::Arc<[u8]>>,
+    exported_at: Value,
+    device_id: Value,
+}
+
+impl PendingSnapshot {
+    fn encode(snapshot: &Value) -> CommandResult<Self> {
+        let revision = snapshot["revision"]
+            .as_i64()
+            .filter(|r| *r >= 0)
+            .ok_or("Revisión inválida.")?;
+        let document = &snapshot["document"];
+        let compressed = if document.is_null() {
+            None
+        } else {
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            serde_json::to_writer(&mut gzip, document).map_err(|e| e.to_string())?;
+            Some(gzip.finish().map_err(|e| e.to_string())?.into())
+        };
+        Ok(Self {
+            revision,
+            summary: summary(snapshot),
+            document: compressed,
+            exported_at: document["exportedAt"].clone(),
+            device_id: document["deviceId"].clone(),
+        })
+    }
+
+    fn decode(document: &[u8]) -> CommandResult<Value> {
+        let gzip = flate2::read::GzDecoder::new(document);
+        serde_json::from_reader(std::io::BufReader::new(gzip)).map_err(|e| e.to_string())
+    }
 }
 /// Serialises a sync body off the async runtime and gzips it for servers that
 /// advertise `gzipSyncRequests`. A snapshot shrinks roughly tenfold.
@@ -33,16 +71,11 @@ pub(crate) async fn sync_body(
     body: Value,
 ) -> CommandResult<reqwest::RequestBuilder> {
     let bytes = work(move || {
-        let plain = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         if !gzip {
-            return Ok(plain);
+            return serde_json::to_vec(&body).map_err(|e| e.to_string());
         }
-        use std::io::Write;
-        let mut encoder = flate2::write::GzEncoder::new(
-            Vec::with_capacity(plain.len() / 6),
-            flate2::Compression::fast(),
-        );
-        encoder.write_all(&plain).map_err(|e| e.to_string())?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        serde_json::to_writer(&mut encoder, &body).map_err(|e| e.to_string())?;
         encoder.finish().map_err(|e| e.to_string())
     })
     .await?;
@@ -73,7 +106,8 @@ pub(crate) async fn json_response(mut response: reqwest::Response) -> CommandRes
         }
         serde_json::from_slice(&bytes)
             .map_err(|_| format!("Respuesta inválida del servidor ({status})."))
-    }).await
+    })
+    .await
 }
 pub(crate) fn private_url(value: &str) -> CommandResult<reqwest::Url> {
     let mut base = reqwest::Url::parse(value.trim()).map_err(|e| e.to_string())?;
@@ -217,7 +251,7 @@ async fn fetch(session: &mut Session) -> CommandResult<Value> {
         .get(session.base.join("api/v1/sync/snapshot").unwrap())
         .bearer_auth(&session.token);
     if let (Some((revision, tag)), Some(snapshot)) = (&session.etag, &session.pending) {
-        if snapshot["revision"].as_i64() == Some(*revision) {
+        if snapshot.revision == *revision {
             request = request.header(reqwest::header::IF_NONE_MATCH, tag);
         }
     }
@@ -226,7 +260,7 @@ async fn fetch(session: &mut Session) -> CommandResult<Value> {
         return session
             .pending
             .as_ref()
-            .map(summary)
+            .map(|pending| pending.summary.clone())
             .ok_or("Se recibió una revisión sin respaldo local.".into());
     }
     let tag = response.headers().get(reqwest::header::ETAG).cloned();
@@ -238,24 +272,25 @@ async fn fetch(session: &mut Session) -> CommandResult<Value> {
     if snapshot.get("document").is_none() {
         return Err("El servidor devolvió un respaldo incompleto.".into());
     }
-    let revision = snapshot["revision"]
-        .as_i64()
-        .filter(|v| *v >= 0)
-        .ok_or("Revisión inválida.")?;
-    if !snapshot["document"].is_null() {
-        umd_core::validate_account_backup(&snapshot["document"], MAX_DOCUMENT_BYTES)
-            .map_err(|e| e.to_string())?;
-    }
-    session.delta_base = (!snapshot["document"].is_null()).then_some(revision);
+    let snapshot = work(move || {
+        if !snapshot["document"].is_null() {
+            umd_core::validate_account_backup(&snapshot["document"], MAX_DOCUMENT_BYTES)
+                .map_err(|e| e.to_string())?;
+        }
+        PendingSnapshot::encode(&snapshot)
+    })
+    .await?;
+    let revision = snapshot.revision;
+    session.delta_base = snapshot.document.is_some().then_some(revision);
     session.etag = tag.map(|tag| (revision, tag));
     // A nonempty remote backup must be restored before it may be replaced.
-    if snapshot["document"].is_null() {
+    if snapshot.document.is_none() {
         session.revision = Some(revision);
     }
     if session.pending.as_ref().is_some_and(|old| old != &snapshot) {
         session.last_sync = None;
     }
-    let info = summary(&snapshot);
+    let info = snapshot.summary.clone();
     session.pending = Some(snapshot);
     Ok(info)
 }
@@ -312,11 +347,11 @@ pub async fn account_restore(
         .pending
         .as_ref()
         .ok_or("Revisá el respaldo antes de restaurarlo.")?;
-    if snapshot["document"].is_null() {
-        return Err("La cuenta todavía no tiene un respaldo.".into());
-    }
-    let document = snapshot["document"].clone();
-    let revision = snapshot["revision"].as_i64().ok_or("Revisión inválida.")?;
+    let document = snapshot
+        .document
+        .clone()
+        .ok_or("La cuenta todavía no tiene un respaldo.")?;
+    let revision = snapshot.revision;
     if revision != reviewed_revision {
         return Err("El respaldo cambió. Revisalo antes de restaurar.".into());
     }
@@ -324,6 +359,7 @@ pub async fn account_restore(
     let base = session.base.to_string();
     let account = session.account;
     work(move || {
+        let document = PendingSnapshot::decode(&document)?;
         store
             .restore_account_backup(&document, &base, account, revision)
             .map_err(|e| e.to_string())
@@ -416,7 +452,11 @@ pub async fn account_current(
     Ok(guard.get(&profile_id).map(|session| {
         let mut user = session.user.clone();
         user["automatic"] = json!(session.automatic);
-        user["backup"] = session.pending.as_ref().map(summary).unwrap_or(Value::Null);
+        user["backup"] = session
+            .pending
+            .as_ref()
+            .map(|pending| pending.summary.clone())
+            .unwrap_or(Value::Null);
         user
     }))
 }
@@ -485,83 +525,87 @@ async fn synchronize(
         {
             return Ok(json!({"changed":changed,"backup":info}));
         }
-        // Lend the remote snapshot to the worker instead of copying it: it can
-        // be as large as the whole library. If the worker is lost, the next
-        // round fetches the snapshot again.
-        let snapshot = session.pending.take();
+        let snapshot = session
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.document.clone());
         let library = store.clone();
-        let (snapshot, merged) = work(move || {
-            let document = snapshot
-                .as_ref()
-                .and_then(|s| s.get("document"))
-                .filter(|v| !v.is_null());
-            let merged = library
-                .reconcile_account_profile(document, MAX_DOCUMENT_BYTES)
-                .map_err(|e| e.to_string());
-            Ok((snapshot, merged))
+        let incremental = session.incremental && session.delta_base == Some(expected);
+        let (updated, upload, patch, preserve_server_titles) = work(move || {
+            let base = snapshot
+                .as_deref()
+                .map(PendingSnapshot::decode)
+                .transpose()?;
+            let (updated, upload) = library
+                .reconcile_account_profile(base.as_ref(), MAX_DOCUMENT_BYTES)
+                .map_err(|e| e.to_string())?;
+            let mut preserve = false;
+            let mut patch = None;
+            if let (Some(base), Some(document)) = (&base, &upload) {
+                preserve = omits_server_titles(base, document);
+                if !needs_full_upload && (preserve || incremental) {
+                    patch = umd_core::account_backup_patch(base, document)
+                        .or_else(|| preserve.then(|| document.clone()));
+                }
+            }
+            Ok((updated, upload, patch, preserve))
         })
         .await?;
-        session.pending = snapshot;
-        let (updated, upload) = merged?;
         changed |= updated;
         let Some(document) = upload else {
             acknowledge_sync(session, store, expected)?;
             session.last_sync = Some((expected, marker));
             return Ok(json!({"changed":changed,"backup":info}));
         };
-        let base = session.pending.as_ref().map(|v| &v["document"]);
-        let preserve_server_titles = base.is_some_and(|base| omits_server_titles(base, &document));
-        if !needs_full_upload
-            && (preserve_server_titles || (session.incremental && session.delta_base == Some(expected)))
-        {
-            let patch = base.and_then(|base| umd_core::account_backup_patch(base, &document));
-            if let Some(patch) = patch.or_else(|| preserve_server_titles.then(|| document.clone())) {
-                if umd_core::backup_patch_empty(&patch) {
-                    acknowledge_sync(session, store, expected)?;
-                    session.last_sync = Some((expected, marker));
-                    return Ok(json!({"changed":changed,"backup":info}));
-                }
-                match incremental::send_patch(session, expected, patch).await? {
-                    incremental::Write::Saved(written) => {
-                        // Read back the merged rows even when another device wrote
-                        // between our download and this PATCH.
-                        let info = incremental::fetch_latest(session).await?;
-                        let revision = info["revision"].as_i64().ok_or("Revisión inválida.")?;
-                        if revision < written {
-                            session.delta_base = None;
-                            session.last_sync = None;
-                            continue;
-                        }
-                        let confirmed = session
-                            .pending
-                            .as_ref()
-                            .map(|v| v["document"].clone())
-                            .filter(|v| !v.is_null());
-                        let Some(confirmed) = confirmed else {
-                            continue;
-                        };
-                        let library = store.clone();
-                        let (received, remaining) = work(move || {
-                            library
-                                .reconcile_account_profile(Some(&confirmed), MAX_DOCUMENT_BYTES)
-                                .map_err(|e| e.to_string())
-                        })
-                        .await?;
-                        acknowledge_sync(session, store, revision)?;
-                        // This marker predates our write. A concurrent local edit
-                        // must still be considered on the next sync.
-                        session.last_sync = remaining.is_none().then_some((revision, marker));
-                        return Ok(json!({"changed":changed||received,"backup":info}));
-                    }
-                    incremental::Write::Full if preserve_server_titles => {
-                        return Err("El servidor rechazó la actualización incremental del respaldo personal.".into());
-                    }
-                    incremental::Write::Full => {
-                        needs_full_upload = true;
+        if let Some(patch) = patch {
+            if umd_core::backup_patch_empty(&patch) {
+                acknowledge_sync(session, store, expected)?;
+                session.last_sync = Some((expected, marker));
+                return Ok(json!({"changed":changed,"backup":info}));
+            }
+            match incremental::send_patch(session, expected, patch).await? {
+                incremental::Write::Saved(written) => {
+                    // Read back the merged rows even when another device wrote
+                    // between our download and this PATCH.
+                    let info = incremental::fetch_latest(session).await?;
+                    let revision = info["revision"].as_i64().ok_or("Revisión inválida.")?;
+                    if revision < written {
                         session.delta_base = None;
                         session.last_sync = None;
                         continue;
                     }
+                    let confirmed = session
+                        .pending
+                        .as_ref()
+                        .and_then(|pending| pending.document.clone());
+                    let Some(confirmed) = confirmed else {
+                        continue;
+                    };
+                    let library = store.clone();
+                    let (received, remaining) = work(move || {
+                        let confirmed = PendingSnapshot::decode(&confirmed)?;
+                        library
+                            .reconcile_account_profile(Some(&confirmed), MAX_DOCUMENT_BYTES)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await?;
+                    acknowledge_sync(session, store, revision)?;
+                    // This marker predates our write. A concurrent local edit
+                    // must still be considered on the next sync.
+                    session.last_sync = remaining.is_none().then_some((revision, marker));
+                    return Ok(json!({"changed":changed||received,"backup":info}));
+                }
+                incremental::Write::Full if preserve_server_titles => {
+                    return Err(
+                        "El servidor rechazó la actualización incremental del respaldo personal."
+                            .into(),
+                    );
+                }
+                incremental::Write::Full => {
+                    needs_full_upload = true;
+                    session.delta_base = None;
+                    session.last_sync = None;
+                    continue;
                 }
             }
         }
@@ -593,7 +637,8 @@ async fn synchronize(
         }
         let snapshot =
             json!({"document":document,"revision":revision,"updatedAt":receipt["updatedAt"]});
-        let info = summary(&snapshot);
+        let snapshot = work(move || PendingSnapshot::encode(&snapshot)).await?;
+        let info = snapshot.summary.clone();
         session.pending = Some(snapshot);
         session.delta_base = None;
         acknowledge_sync(session, store, revision)?;
@@ -614,10 +659,18 @@ fn omits_server_titles(base: &Value, personal: &Value) -> bool {
         .as_array()
         .into_iter()
         .flatten()
-        .any(|item| item["syncId"].as_str().is_none_or(|id| !included.contains(id)))
+        .any(|item| {
+            item["syncId"]
+                .as_str()
+                .is_none_or(|id| !included.contains(id))
+        })
 }
 
-fn acknowledge_sync(session: &mut Session, store: &CatalogStore, revision: i64) -> CommandResult<()> {
+fn acknowledge_sync(
+    session: &mut Session,
+    store: &CatalogStore,
+    revision: i64,
+) -> CommandResult<()> {
     if session.revision != Some(revision) {
         store
             .remember_upload(session.base.as_str(), session.account, revision)
@@ -737,7 +790,10 @@ mod tests {
                 .len(),
             2
         );
-        assert_eq!(synchronize(&mut s, &local, false).await.unwrap()["changed"], false);
+        assert_eq!(
+            synchronize(&mut s, &local, false).await.unwrap()["changed"],
+            false
+        );
         assert_eq!(snapshot.lock().unwrap()["revision"], 2);
         *snapshot.lock().unwrap() = json!({"revision":0,"document":null});
         s.last_sync = None;

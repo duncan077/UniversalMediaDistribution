@@ -1,5 +1,5 @@
-use super::{fetch, json_response, summary, Session};
-use crate::CommandResult;
+use super::{fetch, json_response, PendingSnapshot, Session};
+use crate::{work, CommandResult};
 use reqwest::{Client, StatusCode, Url};
 use serde_json::{json, Value};
 
@@ -26,7 +26,7 @@ pub(super) async fn fetch_latest(session: &mut Session) -> CommandResult<Value> 
     let Some(base) = session
         .pending
         .as_ref()
-        .filter(|v| v["revision"] == since && v["document"].is_object())
+        .filter(|v| v.revision == since && v.document.is_some())
     else {
         return fetch(session).await;
     };
@@ -44,41 +44,53 @@ pub(super) async fn fetch_latest(session: &mut Session) -> CommandResult<Value> 
     ) {
         return fetch(session).await;
     }
-    let changes = json_response(response).await?;
+    let mut changes = json_response(response).await?;
     let Some(revision) = changes["toRevision"].as_i64().filter(|r| *r >= since) else {
         return fetch(session).await;
     };
-    let delta = &changes["document"];
+    let delta = changes["document"].take();
     if changes["fromRevision"] != since || !delta.is_object() {
         return fetch(session).await;
     }
-    let document = match changes["full"].as_bool() {
-        Some(true) => {
-            umd_core::validate_account_backup(delta, umd_core::MAX_DOCUMENT_BYTES)
+    let Some(full) = changes["full"].as_bool() else {
+        return fetch(session).await;
+    };
+    if !full && revision == since {
+        if !umd_core::backup_patch_empty(&delta)
+            || base.exported_at != delta["exportedAt"]
+            || base.device_id != delta["deviceId"]
+        {
+            return fetch(session).await;
+        }
+        return Ok(base.summary.clone());
+    }
+    let compressed = base.document.clone();
+    let snapshot = work(move || {
+        let document = if full {
+            umd_core::validate_account_backup(&delta, umd_core::MAX_DOCUMENT_BYTES)
                 .map_err(|e| e.to_string())?;
-            delta.clone()
-        }
-        Some(false) if revision == since => {
-            if !umd_core::backup_patch_empty(delta)
-                || base["document"]["exportedAt"] != delta["exportedAt"]
-                || base["document"]["deviceId"] != delta["deviceId"]
-            {
-                return fetch(session).await;
-            }
-            return Ok(summary(base));
-        }
-        Some(false) => {
-            let Ok(Some(merged)) = umd_core::apply_received_changes(&base["document"], delta)
-            else {
-                return fetch(session).await;
+            delta
+        } else {
+            let base =
+                PendingSnapshot::decode(compressed.as_deref().ok_or("Falta el respaldo base.")?)?;
+            let Ok(Some(merged)) = umd_core::apply_received_changes(&base, &delta) else {
+                return Ok(None);
             };
             merged
-        }
-        None => return fetch(session).await,
+        };
+        let stamp = changes
+            .get("updatedAt")
+            .unwrap_or(&document["exportedAt"])
+            .clone();
+        let mut snapshot = json!({"revision":revision,"updatedAt":stamp});
+        snapshot["document"] = document;
+        PendingSnapshot::encode(&snapshot).map(Some)
+    })
+    .await?;
+    let Some(snapshot) = snapshot else {
+        return fetch(session).await;
     };
-    let stamp = changes.get("updatedAt").unwrap_or(&document["exportedAt"]);
-    let snapshot = json!({"document":document,"revision":revision,"updatedAt":stamp,"updatedByDeviceId":document["deviceId"]});
-    let info = summary(&snapshot);
+    let info = snapshot.summary.clone();
     session.delta_base = Some(revision);
     session.pending = Some(snapshot);
     session.etag = None;
@@ -215,7 +227,9 @@ mod tests {
             client: Client::new(),
             token: "test".into(),
             revision: Some(1),
-            pending: Some(json!({"document":baseline,"revision":1})),
+            pending: Some(
+                PendingSnapshot::encode(&json!({"document":baseline,"revision":1})).unwrap(),
+            ),
             automatic: false,
             incremental: true,
             gzip: false,
@@ -238,7 +252,10 @@ mod tests {
         );
         assert_eq!(local.personal_lists().unwrap().len(), 2);
         assert!(local.item(unrelated).unwrap().is_none());
-        assert_eq!(state.lock().unwrap().1["catalog"]["items"][0]["syncId"], json!(unrelated));
+        assert_eq!(
+            state.lock().unwrap().1["catalog"]["items"][0]["syncId"],
+            json!(unrelated)
+        );
         super::super::synchronize(&mut session, &local, false)
             .await
             .unwrap();

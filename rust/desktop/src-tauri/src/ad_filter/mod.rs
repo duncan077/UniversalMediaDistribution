@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{Manager, State};
 use umd_core::CatalogStore;
@@ -61,10 +61,40 @@ const OTHER_LISTS: &[(&str, &str)] = &[
 ];
 const MAX_LIST: usize = 12 * 1024 * 1024;
 const WEEK: Duration = Duration::from_secs(7 * 24 * 3600);
-static BASIC: LazyLock<Engine> = LazyLock::new(|| compile(Vec::new()));
+static BASIC: LazyLock<Engine> = LazyLock::new(|| compile(Vec::new(), false));
 static STANDARD: RwLock<Option<Compiled>> = RwLock::new(None);
 static MODE: Mutex<Mode> = Mutex::new(Mode::Basic);
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+const FILTER_IDLE: Duration = Duration::from_secs(120);
+static LAST_PLAYER_USE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn player_in_use() {
+    let mut last = LAST_PLAYER_USE.lock().unwrap();
+    if last.replace(Instant::now()).is_some() {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        let mut delay = FILTER_IDLE;
+        loop {
+            tokio::time::sleep(delay).await;
+            let mut last = LAST_PLAYER_USE.lock().unwrap();
+            delay = last.map_or(Duration::ZERO, |time| {
+                FILTER_IDLE.saturating_sub(time.elapsed())
+            });
+            if !delay.is_zero() {
+                continue;
+            }
+            *last = None;
+            *STANDARD.write().unwrap() = None;
+            break;
+        }
+    });
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn trim() {
+    *STANDARD.write().unwrap() = None;
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,9 +132,37 @@ fn payload(url: &Url) -> String {
     )
 }
 
-fn compile(lists: Vec<String>) -> Engine {
+fn player_payload(url: &Url) -> String {
+    format!(
+        "{}\n;({})({});",
+        payload(url),
+        include_str!("../../player-assets/provider-frames.js"),
+        include_str!("../../player-assets/provider-media.js"),
+    )
+}
+
+fn full_regex(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_prefix("@@").unwrap_or(line);
+    line.starts_with('/')
+        && line.rsplit_once('/').is_some_and(|(pattern, tail)| {
+            pattern.len() > 1 && (tail.is_empty() || tail.starts_with('$'))
+        })
+}
+
+fn compile(lists: Vec<String>, skip_regex: bool) -> Engine {
     let mut set = FilterSet::new(false);
     for text in std::iter::once(SEED.to_owned()).chain(lists) {
+        let text = if skip_regex {
+            let mut filtered = String::with_capacity(text.len());
+            for line in text.lines().filter(|line| !full_regex(line)) {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+            filtered
+        } else {
+            text
+        };
         set.add_filter_list(
             text,
             ParseOptions {
@@ -120,11 +178,11 @@ fn compile(lists: Vec<String>) -> Engine {
 /// a television box and used to run on every launch before the first player
 /// could open. The compiled engine is kept next to the lists and reused while
 /// the list text is the same; any change in the lists rebuilds it.
-fn compile_cached(lists: Vec<String>, directory: &Path) -> Engine {
+fn compile_cached(lists: Vec<String>, directory: &Path, skip_regex: bool) -> Engine {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // The format belongs to this adblock release; bump the tag with the crate.
-    ("adblock-0.13", SEED).hash(&mut hasher);
+    ("adblock-0.13", SEED, skip_regex).hash(&mut hasher);
     for text in &lists {
         text.hash(&mut hasher);
     }
@@ -138,12 +196,17 @@ fn compile_cached(lists: Vec<String>, directory: &Path) -> Engine {
             }
         }
     }
-    let engine = compile(lists);
-    let mut bytes = key.to_vec();
-    bytes.extend(engine.serialize());
+    let engine = compile(lists, skip_regex);
     if let Ok(mut file) = tempfile::NamedTempFile::new_in(directory) {
-        use std::io::Write;
-        if file.write_all(&bytes).is_ok() {
+        use std::io::{BufWriter, Write};
+        let mut writer = BufWriter::new(file.as_file_mut());
+        let saved = writer
+            .write_all(&key)
+            .and_then(|()| writer.write_all(&engine.serialize()))
+            .and_then(|()| writer.flush())
+            .is_ok();
+        drop(writer);
+        if saved {
             let _ = file.persist(&path);
         }
     }
@@ -251,6 +314,10 @@ async fn updated(url: &str) -> Option<String> {
 fn online() -> bool {
     MODE.lock().unwrap().online()
 }
+
+fn player_recently_used() -> bool {
+    LAST_PLAYER_USE.lock().unwrap().is_some()
+}
 fn profile() -> FilterProfile {
     let low = device::current().constrained;
     FilterProfile {
@@ -269,7 +336,11 @@ async fn install(lists: Vec<String>, wanted: FilterProfile, directory: PathBuf) 
         let webkit = linux::network_rules(&lists);
         Compiled {
             cosmetics,
-            engine: compile_cached(lists, &directory),
+            engine: compile_cached(
+                lists,
+                &directory,
+                cfg!(target_os = "android") && wanted.constrained,
+            ),
             profile: wanted,
             #[cfg(target_os = "linux")]
             webkit,
@@ -277,7 +348,8 @@ async fn install(lists: Vec<String>, wanted: FilterProfile, directory: PathBuf) 
     })
     .await
     {
-        if online() && profile() == wanted {
+        let last = LAST_PLAYER_USE.lock().unwrap();
+        if last.is_some() && online() && profile() == wanted {
             *STANDARD.write().unwrap() = Some(compiled);
         }
     }
@@ -328,7 +400,9 @@ async fn refresh(directory: PathBuf, force: bool) -> (usize, usize) {
     }
     let wanted = profile();
     let subscriptions = subscriptions(wanted);
-    prepare(&directory, wanted).await;
+    if player_recently_used() {
+        prepare(&directory, wanted).await;
+    }
     let total = subscriptions.len();
     let mut count = 0;
     for (key, url) in &subscriptions {
@@ -359,7 +433,7 @@ async fn refresh(directory: PathBuf, force: bool) -> (usize, usize) {
             }
         }
     }
-    if count > 0 {
+    if count > 0 && player_recently_used() {
         let _guard = PREPARE.lock().await;
         let folder = directory.clone();
         let lists = tauri::async_runtime::spawn_blocking(move || {
@@ -377,6 +451,13 @@ async fn refresh(directory: PathBuf, force: bool) -> (usize, usize) {
 }
 
 pub struct Directory(PathBuf);
+
+pub(crate) async fn prepare_player(directory: &Directory) {
+    if online() {
+        player_in_use();
+        prepare(&directory.0, profile()).await;
+    }
+}
 pub fn setup(
     app: &tauri::AppHandle,
     root: &Path,
@@ -391,10 +472,7 @@ pub fn setup(
     };
     *MODE.lock().unwrap() = mode;
     let dir = root.join("ad-filter");
-    app.manage(Directory(dir.clone()));
-    if mode.online() {
-        tauri::async_runtime::spawn(refresh(dir, false));
-    }
+    app.manage(Directory(dir));
     #[cfg(windows)]
     if let Some(main) = app.get_webview_window("main") {
         windows::attach_main(&main)?;
@@ -427,14 +505,12 @@ pub async fn filter_status(
 pub async fn player_ad_filter(
     mode: Option<Mode>,
     store: State<'_, CatalogStore>,
-    directory: State<'_, Directory>,
 ) -> CommandResult<Mode> {
     let store = store.inner().clone();
-    let path = directory.0.clone();
-    crate::work(move || set_player_ad_filter(mode, &store, path)).await
+    crate::work(move || set_player_ad_filter(mode, &store)).await
 }
 
-fn set_player_ad_filter(mode: Option<Mode>, store: &CatalogStore, directory: PathBuf) -> CommandResult<Mode> {
+fn set_player_ad_filter(mode: Option<Mode>, store: &CatalogStore) -> CommandResult<Mode> {
     if let Some(mode) = mode {
         static SAVE_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _save = SAVE_MODE.lock().map_err(|_| "Configuración ocupada.")?;
@@ -451,9 +527,6 @@ fn set_player_ad_filter(mode: Option<Mode>, store: &CatalogStore, directory: Pat
         if !mode.online() {
             *STANDARD.write().unwrap() = None;
         }
-        if mode.online() {
-            tauri::async_runtime::spawn(refresh(directory, false));
-        }
     }
     Ok(*MODE.lock().unwrap())
 }
@@ -464,15 +537,29 @@ pub async fn open_filtered_player(
     address: String,
     language: Option<String>,
     interactive: Option<bool>,
+    bounds: Option<playback::Bounds>,
 ) -> CommandResult<uuid::Uuid> {
+    let bounds = if interactive == Some(true) {
+        None
+    } else {
+        Some(
+            bounds
+                .ok_or("Falta el espacio del reproductor.")?
+                .validate()?,
+        )
+    };
     let url = Url::parse(&address)
         .ok()
         .filter(|u| u.scheme() == "https" && umd_core::public_url::web_url(u))
         .ok_or("Ingresá una dirección pública HTTPS.")?;
-    let url = crate::streams::provider_web_address(url);
+    let url = if bounds.is_some() {
+        crate::streams::provider_web_address(url).await?
+    } else {
+        url
+    };
     if online() {
         let dir = app.state::<Directory>().0.clone();
-        prepare(&dir, profile()).await;
+        prepare_player(&app.state::<Directory>()).await;
         tauri::async_runtime::spawn(refresh(dir, false));
     }
     if blocked(url.as_str(), url.as_str(), "document", "GET") {
@@ -482,9 +569,13 @@ pub async fn open_filtered_player(
     let _ = (language, interactive);
     let session = uuid::Uuid::new_v4();
     #[cfg(target_os = "linux")]
-    return linux::open(app, url, session).await.map(|_| session);
+    return linux::open(app, url, session, bounds)
+        .await
+        .map(|_| session);
     #[cfg(windows)]
-    return windows::open(app, url, session).await.map(|_| session);
+    return windows::open(app, url, session, bounds)
+        .await
+        .map(|_| session);
     #[cfg(target_os = "android")]
     return android::open(
         app,
@@ -492,12 +583,13 @@ pub async fn open_filtered_player(
         session,
         language.as_deref() == Some("en"),
         interactive == Some(true),
+        bounds,
     )
     .await
     .map(|_| session);
     #[cfg(not(any(windows, target_os = "android", target_os = "linux")))]
     {
-        let _ = (app, session);
+        let _ = (app, session, bounds);
         Err("Esta plataforma no tiene un reproductor web protegido.".into())
     }
 }
@@ -510,6 +602,36 @@ pub(crate) async fn verified_read(
     url: &Url,
     limit: usize,
 ) -> CommandResult<Vec<u8>> {
+    let bytes = verified_bytes(app, id, origin, url, limit, None).await?;
+    let text = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+    Ok(String::from_utf8_lossy(text).into_owned().into_bytes())
+}
+
+pub(crate) async fn verified_image(
+    app: &tauri::AppHandle,
+    id: uuid::Uuid,
+    origin: &Url,
+    url: &Url,
+) -> CommandResult<Vec<u8>> {
+    verified_bytes(
+        app,
+        id,
+        origin,
+        url,
+        4 << 20,
+        Some("image/avif,image/webp,image/png,image/jpeg,image/*"),
+    )
+    .await
+}
+
+async fn verified_bytes(
+    app: &tauri::AppHandle,
+    id: uuid::Uuid,
+    origin: &Url,
+    url: &Url,
+    limit: usize,
+    accept: Option<&str>,
+) -> CommandResult<Vec<u8>> {
     if url.scheme() != "https"
         || origin.origin() != url.origin()
         || !umd_core::public_url::web_url(url)
@@ -519,13 +641,18 @@ pub(crate) async fn verified_read(
     let key = serde_json::json!(format!("umdCatalog{}", uuid::Uuid::new_v4().simple()));
     let url = serde_json::json!(url.as_str());
     let origin = serde_json::json!(origin.origin().ascii_serialization());
+    let headers = accept.map_or_else(
+        || serde_json::json!({}),
+        |accept| serde_json::json!({"Accept":accept}),
+    );
     let limit = limit.min(4 * 1024 * 1024);
     let start = format!(
         r#"(()=>{{if(location.origin!=={origin})return false;window[{key}]=null;
-    (async()=>{{try{{const r=await fetch({url},{{mode:"same-origin",redirect:"error",signal:AbortSignal.timeout(15000)}});if(!r.ok)throw Error();
-    const reader=r.body.getReader(),decoder=new TextDecoder();let bytes=0,body="";while(true){{const p=await reader.read();if(p.done)break;
-    bytes+=p.value.length;if(bytes>{limit}){{await reader.cancel();throw Error()}}body+=decoder.decode(p.value,{{stream:true}})}}
-    window[{key}]=new TextEncoder().encode(body+decoder.decode())}}catch{{window[{key}]=false}}}})();return true}})()"#
+    (async()=>{{try{{const r=await fetch({url},{{mode:"same-origin",redirect:"error",headers:{headers},signal:AbortSignal.timeout(15000)}});if(!r.ok||!r.body)throw Error();
+    const reader=r.body.getReader(),chunks=[];let len=0;while(true){{const p=await reader.read();if(p.done)break;
+    len+=p.value.length;if(len>{limit}){{await reader.cancel();throw Error()}}chunks.push(p.value)}}
+    const body=new Uint8Array(len);let offset=0;for(const chunk of chunks){{body.set(chunk,offset);offset+=chunk.length}}
+    window[{key}]=body}}catch{{window[{key}]=false}}}})();return true}})()"#
     );
     if eval_public(app, id, start).await? != "true" {
         return Err("Abrí el sitio del proveedor.".into());
@@ -566,19 +693,7 @@ async fn eval_public(
 ) -> CommandResult<String> {
     #[cfg(windows)]
     {
-        let window = app
-            .get_webview_window(&format!("provider-{id}"))
-            .ok_or("Se cerró el proveedor.")?;
-        let (send, mut recv) = tokio::sync::mpsc::channel(1);
-        window
-            .eval_with_callback(script, move |v| {
-                let _ = send.try_send(v);
-            })
-            .map_err(|e| e.to_string())?;
-        tokio::time::timeout(std::time::Duration::from_secs(4), recv.recv())
-            .await
-            .map_err(|_| "El proveedor no respondió.")?
-            .ok_or("Se cerró el proveedor.".into())
+        windows::command(app, id, script, false).await
     }
     #[cfg(target_os = "android")]
     {
@@ -600,9 +715,10 @@ mod tests {
     use super::*;
     #[test]
     fn blocks_ad_hosts_and_requests_but_preserves_video_and_exceptions() {
-        let engine = compile(vec![
-            "||commercial.example^\n@@||commercial.example/subs/".into()
-        ]);
+        let engine = compile(
+            vec!["||commercial.example^\n@@||commercial.example/subs/".into()],
+            false,
+        );
         let page = "https://watch.example/show";
         let deny = |url, kind| {
             engine
@@ -639,7 +755,7 @@ mod tests {
                 )
                 .should_block()
         };
-        let fresh = compile_cached(vec![first.clone()], dir.path());
+        let fresh = compile_cached(vec![first.clone()], dir.path(), false);
         assert!(deny(&fresh, "https://blocked-one.example/a.js"));
         assert!(!deny(&fresh, "https://blocked-two.example/a.js"));
 
@@ -647,20 +763,20 @@ mod tests {
         // back shows the next call loaded the file instead of compiling.
         let key = std::fs::read(&cache).unwrap()[..8].to_vec();
         let mut swapped = key.clone();
-        swapped.extend(compile(vec![second.clone()]).serialize());
+        swapped.extend(compile(vec![second.clone()], false).serialize());
         std::fs::write(&cache, swapped).unwrap();
-        let reused = compile_cached(vec![first.clone()], dir.path());
+        let reused = compile_cached(vec![first.clone()], dir.path(), false);
         assert!(deny(&reused, "https://blocked-two.example/a.js"));
         assert!(!deny(&reused, "https://blocked-one.example/a.js"));
 
         // Different lists have another key and replace the file.
-        let other = compile_cached(vec![second], dir.path());
+        let other = compile_cached(vec![second], dir.path(), false);
         assert!(deny(&other, "https://blocked-two.example/a.js"));
         assert_ne!(std::fs::read(&cache).unwrap()[..8], key[..]);
 
         // A damaged file is ignored and rebuilt.
         std::fs::write(&cache, [key.as_slice(), &[7; 64]].concat()).unwrap();
-        let rebuilt = compile_cached(vec![first], dir.path());
+        let rebuilt = compile_cached(vec![first], dir.path(), false);
         assert!(deny(&rebuilt, "https://blocked-one.example/a.js"));
         assert!(!deny(&rebuilt, "https://blocked-two.example/a.js"));
     }

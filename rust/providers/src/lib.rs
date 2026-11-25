@@ -1,4 +1,5 @@
 mod av1;
+pub mod browser_http;
 mod doramas;
 mod doramas_public;
 mod jk;
@@ -10,10 +11,10 @@ pub use cinema::Cinema;
 mod framex;
 mod indexed;
 use chrono::DateTime;
-use reqwest::{Client, Url};
+use reqwest::{cookie::Jar, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::time::{sleep_until, Instant};
 use umd_core::CatalogItem;
 
@@ -115,13 +116,24 @@ pub struct Provider {
     site: Site,
     base: Url,
     client: Client,
+    cookies: Option<Arc<Jar>>,
     interval: Duration,
-    next_request: Instant,
-    index: Option<Vec<Entry>>,
+    pacing: std::sync::Arc<tokio::sync::Mutex<Pacing>>,
+    batched: bool,
+    index: Option<Vec<indexed::CompactEntry>>,
     api: Option<(Url, Client)>,
     csrf: Option<String>,
     doramas_dirs: std::collections::BTreeMap<String, Vec<Entry>>,
     doramas_eps: Option<doramas_public::Episodes>,
+    doramas_batches: bool,
+    doramas_routes: Option<doramas::EpisodeRoutes>,
+    olympus_routes: Option<indexed::OlympusChapters>,
+    leer_decoder: Option<(Url, Instant, (String, String))>,
+}
+
+struct Pacing {
+    next: Instant,
+    cooldown: Option<(Instant, Option<u16>)>,
 }
 impl Provider {
     pub fn set_public_reader(&mut self, reader: PublicReader) {
@@ -133,23 +145,60 @@ impl Provider {
             site,
             base,
             client: pinned_client,
+            cookies: None,
             interval,
-            next_request: Instant::now(),
+            pacing: std::sync::Arc::new(tokio::sync::Mutex::new(Pacing {
+                next: Instant::now(),
+                cooldown: None,
+            })),
+            batched: false,
             index: None,
             api: None,
             csrf: None,
             doramas_dirs: Default::default(),
             doramas_eps: None,
+            doramas_batches: true,
+            doramas_routes: None,
+            olympus_routes: None,
+            leer_decoder: None,
         }
     }
     pub async fn open(site: Site) -> Result<Self> {
         Self::open_with_interval(site, Duration::from_millis(200)).await
     }
     pub async fn open_at(site: Site, base: Url) -> Result<Self> {
-        let client = pinned(&base).await?;
-        Ok(Self::new(site, base, client, Duration::from_millis(200)))
+        Self::open_base(site, base, Duration::from_millis(200), None).await
     }
     pub async fn open_with_interval(site: Site, interval: Duration) -> Result<Self> {
+        Self::open_default(site, interval, None).await
+    }
+    pub async fn open_with_cookies(
+        site: Site,
+        base: Option<Url>,
+        cookies: Arc<Jar>,
+    ) -> Result<Self> {
+        let interval = Duration::from_millis(200);
+        match base {
+            Some(base) => Self::open_base(site, base, interval, Some(cookies)).await,
+            None => Self::open_default(site, interval, Some(cookies)).await,
+        }
+    }
+    async fn open_base(
+        site: Site,
+        base: Url,
+        interval: Duration,
+        cookies: Option<Arc<Jar>>,
+    ) -> Result<Self> {
+        let client = pinned(&base, cookies.as_ref()).await?;
+        let mut provider = Self::new(site, base, client, interval);
+        provider.cookies = cookies;
+        Ok(provider)
+    }
+    async fn open_default(
+        site: Site,
+        interval: Duration,
+        cookies: Option<Arc<Jar>>,
+    ) -> Result<Self> {
         let urls: &[&str] = if site == Site::Framex {
             &[
                 "https://api.framextv.tech/",
@@ -161,14 +210,81 @@ impl Provider {
         };
         for raw in urls {
             let base = Url::parse(raw).map_err(|_| invalid())?;
-            if let Ok(client) = pinned(&base).await {
-                return Ok(Self::new(site, base, client, interval));
+            if let Ok(provider) = Self::open_base(site, base, interval, cookies.clone()).await {
+                return Ok(provider);
             }
         }
         Err(Failure::new("network"))
     }
     async fn bytes(&mut self, route: &str, accept: &str, limit: usize) -> Result<Vec<u8>> {
         Ok(self.bytes_with_url(route, accept, limit).await?.0)
+    }
+
+    async fn wait_request(&self) -> Result<()> {
+        loop {
+            let deadline = {
+                let mut slot = self.pacing.lock().await;
+                let now = Instant::now();
+                if let Some((until, status)) = slot.cooldown.take() {
+                    if until > now {
+                        slot.cooldown = Some((until, status));
+                        return Err(Failure {
+                            kind: "throttled",
+                            status,
+                            retry: (until - now).as_secs().max(1) as i64,
+                        });
+                    }
+                }
+                if slot.next <= now {
+                    slot.next = now + self.interval;
+                    return Ok(());
+                }
+                slot.next
+            };
+            sleep_until(deadline).await;
+        }
+    }
+
+    async fn report_backoff<T: Send>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            if self.batched && error.kind == "throttled" && error.retry > 0 {
+                let blocked = Instant::now() + Duration::from_secs(error.retry as u64);
+                let mut slot = self.pacing.lock().await;
+                if slot.cooldown.is_none_or(|(until, _)| until < blocked) {
+                    slot.cooldown = Some((blocked, error.status));
+                }
+            }
+        }
+        result
+    }
+
+    async fn request_batch<T, R, F, Fut>(&self, jobs: Vec<T>, request: F) -> Result<Vec<R>>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Fn(Provider, T) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<R>> + Send + 'static,
+    {
+        use futures_util::{stream, StreamExt, TryStreamExt};
+        stream::iter(jobs)
+            .map(|job| {
+                let mut connection = Self::new(
+                    self.site,
+                    self.base.clone(),
+                    self.client.clone(),
+                    self.interval,
+                );
+                connection.pacing = self.pacing.clone();
+                connection.cookies = self.cookies.clone();
+                connection.batched = true;
+                connection.interactive = self.interactive.clone();
+                connection.csrf = self.csrf.clone();
+                connection.api = self.api.clone();
+                request(connection, job)
+            })
+            .buffered(3)
+            .try_collect()
+            .await
     }
     async fn bytes_with_url(
         &mut self,
@@ -184,8 +300,7 @@ impl Provider {
         let mut active_client = self.client.clone();
         let mut response = None;
         for _ in 0..6 {
-            sleep_until(self.next_request).await;
-            self.next_request = Instant::now() + self.interval;
+            self.wait_request().await?;
             let same_origin = current.origin() == self.base.origin();
             let site_origin = if self.site == Site::Framex
                 && self
@@ -224,7 +339,7 @@ impl Provider {
                 })
                 .ok_or_else(invalid)?;
             if current.origin() != next.origin() {
-                let next_client = pinned(&next).await?;
+                let next_client = pinned(&next, self.cookies.as_ref()).await?;
                 if is_permanent_domain_move(status, &current, &next, &self.base) {
                     self.client = next_client.clone();
                     self.csrf = None;
@@ -244,15 +359,17 @@ impl Provider {
                 }
             }
         }
-        Ok((bounded(response, limit).await?, final_url))
+        Ok((
+            self.report_backoff(bounded(response, limit).await).await?,
+            final_url,
+        ))
     }
     async fn send_json(&mut self, req: reqwest::RequestBuilder, limit: usize) -> Result<Value> {
         let is_get = req
             .try_clone()
             .and_then(|r| r.build().ok())
             .is_some_and(|r| r.method() == reqwest::Method::GET);
-        sleep_until(self.next_request).await;
-        self.next_request = Instant::now() + self.interval;
+        self.wait_request().await?;
         let res = req
             .header("accept", "application/json")
             .send()
@@ -265,17 +382,20 @@ impl Provider {
                 }
             }
         }
-        serde_json::from_slice(&bounded(res, limit).await?).map_err(|_| invalid())
+        serde_json::from_slice(&self.report_backoff(bounded(res, limit).await).await?)
+            .map_err(|_| invalid())
     }
     async fn json(&mut self, route: &str, mb: usize) -> Result<Value> {
         serde_json::from_slice(&self.bytes(route, "application/json", mb << 20).await?)
             .map_err(|_| invalid())
     }
     async fn html(&mut self, route: &str) -> Result<String> {
-        String::from_utf8(self.bytes(route, "text/html", 8 << 20).await?).map_err(|_| invalid())
+        Ok(self.html_with_url(route).await?.0)
     }
     async fn html_with_url(&mut self, route: &str) -> Result<(String, Url)> {
-        let (bytes, url) = self.bytes_with_url(route, "text/html", 8 << 20).await?;
+        let (bytes, url) = self
+            .bytes_with_url(route, browser_http::PAGE_ACCEPT, 8 << 20)
+            .await?;
         let text = String::from_utf8(bytes).map_err(|_| invalid())?;
         Ok((text, url))
     }
@@ -312,7 +432,13 @@ impl Provider {
             Site::Cinema(site) => self.cinema_updates(site).await,
             Site::Framex => self.framex_updates().await,
             Site::Olympus => self.olympus_updates().await,
-            Site::AnimeTmo => Ok(self.index().await?.iter().take(24).cloned().collect()),
+            Site::AnimeTmo => Ok(self
+                .index()
+                .await?
+                .iter()
+                .take(24)
+                .map(indexed::CompactEntry::entry)
+                .collect()),
         }
     }
     pub async fn detail(&mut self, e: &Entry) -> Result<CatalogItem> {
@@ -359,11 +485,13 @@ impl Provider {
             .index()
             .await?
             .iter()
-            .filter(|e| {
-                umd_core::normalize(e.preview["name"].as_str().unwrap_or_default()).contains(&q)
-            })
+            .filter(|e| e.normalized.contains(&q))
             .skip((page as usize - 1) * 50);
-        let items = hits.by_ref().take(50).cloned().collect();
+        let items = hits
+            .by_ref()
+            .take(50)
+            .map(indexed::CompactEntry::entry)
+            .collect();
         Ok(Page {
             items,
             next: hits.next().map(|_| (page + 1).to_string()),
@@ -390,7 +518,7 @@ fn pinned_host_port(root: &Url) -> Result<(&str, u16)> {
     let port = root.port_or_known_default().ok_or_else(invalid)?;
     Ok((host, port))
 }
-async fn pinned(root: &Url) -> Result<Client> {
+async fn pinned(root: &Url, cookies: Option<&Arc<Jar>>) -> Result<Client> {
     let (host, port) = pinned_host_port(root)?;
     let addrs: Vec<_> = tokio::net::lookup_host((host, port))
         .await
@@ -403,12 +531,12 @@ async fn pinned(root: &Url) -> Result<Client> {
     {
         return Err(Failure::new("network"));
     }
-    Client::builder()
-        .user_agent(concat!(
-            "UniversalMediaDistribution/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .cookie_store(true)
+    let builder = browser_http::client_builder();
+    let builder = match cookies {
+        Some(cookies) => builder.cookie_provider(cookies.clone()),
+        None => builder.cookie_store(true),
+    };
+    builder
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(90))
@@ -978,6 +1106,7 @@ mod tests {
                 "_imagen": "https://cdn.example/cover.jpg"
             }),
             "ejemplo_1",
+            None,
         )
         .unwrap();
         assert_eq!(

@@ -2,6 +2,27 @@ import { exit, onBackButtonPress } from "@tauri-apps/api/app";
 import { flushProgress } from "./player";
 import { canGoBack, goBack } from "./router";
 
+function uniformNeighbor(current: HTMLElement, key: string, interactive: string) {
+  const card = current.closest<HTMLElement>(".entry-card, .shelf-row > .card, [data-virtual-index]");
+  if (!card?.parentElement) return;
+  let next: Element | null = null;
+  if (card.dataset.virtualIndex !== undefined && (key === "ArrowUp" || key === "ArrowDown")) {
+    const columns = Number(card.parentElement.dataset.virtualColumns);
+    const index = Number(card.dataset.virtualIndex) + (key === "ArrowUp" ? -columns : columns);
+    next = card.parentElement.querySelector(`[data-virtual-index="${index}"]`);
+  } else if (card.matches(".entry-card") && (key === "ArrowUp" || key === "ArrowDown")) {
+    next = key === "ArrowUp" ? card.previousElementSibling : card.nextElementSibling;
+    if (!next?.matches(".entry-card")) return;
+  } else if (card.matches(".shelf-row > .card") && (key === "ArrowLeft" || key === "ArrowRight")) {
+    next = key === "ArrowLeft" ? card.previousElementSibling : card.nextElementSibling;
+  }
+  if (next) {
+    const action = Array.from(card.querySelectorAll(interactive)).indexOf(current);
+    const controls = next.querySelectorAll<HTMLElement>(interactive);
+    return controls[action] ?? controls[0];
+  }
+}
+
 function topDialog() {
   return document.activeElement?.closest<HTMLDialogElement>("dialog[open]") ??
     Array.from(document.querySelectorAll<HTMLDialogElement>("dialog[open]")).at(-1);
@@ -42,11 +63,15 @@ export function setupNavigation() {
   const interactive = "button:enabled, input:enabled, select:enabled, summary, a[href], video[controls], audio[controls], [tabindex='0']";
   document.addEventListener("keydown", event => {
     if (event.defaultPrevented || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
-    const root = topDialog() ?? document;
+    const dialog = topDialog();
+    const page = document.querySelector<HTMLElement>("[data-page]:not([hidden])");
+    const roots = dialog ? [dialog] : [page, document.querySelector("main > .toolbar"), document.getElementById("rail"), document.getElementById("app-notice-stack")];
+    const candidates = () => roots.flatMap(root => root ? Array.from(root.querySelectorAll<HTMLElement>(interactive)) : []);
     const current = document.activeElement;
-    const insideRoot = current instanceof HTMLElement && current !== document.body && current !== document.documentElement && current.isConnected && (root === document || root.contains(current));
+    const insideRoot = current instanceof HTMLElement && current !== document.body && current !== document.documentElement && current.isConnected
+      && (dialog ? dialog.contains(current) : !current.closest("[data-page][hidden]"));
     if (!insideRoot) {
-      const first = Array.from(root.querySelectorAll<HTMLElement>(interactive)).find(el => el.getClientRects().length > 0 && !el.closest("[inert]"));
+      const first = candidates().find(el => el.getClientRects().length > 0 && !el.closest("[inert]"));
       if (first) {
         event.preventDefault();
         first.focus();
@@ -65,11 +90,18 @@ export function setupNavigation() {
       }
     }
     if (horizontal && current.matches("input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]), textarea") || !horizontal && current.matches("select")) return;
+    const neighbor = uniformNeighbor(current, event.key, interactive);
+    if (neighbor && !neighbor.closest("[inert]") && neighbor.getClientRects().length) {
+      event.preventDefault();
+      neighbor.focus({preventScroll: true});
+      neighbor.scrollIntoView({block: "nearest", inline: "nearest"});
+      return;
+    }
     const from = current.getBoundingClientRect();
     const sign = event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 1;
     let best: HTMLElement | undefined;
     let bestScore = Infinity;
-    for (const target of root.querySelectorAll<HTMLElement>(interactive)) {
+    for (const target of candidates()) {
       if (target === current || !target.getClientRects().length || target.closest("[inert]")) continue;
       const to = target.getBoundingClientRect();
       const dx = (to.left + to.right - from.left - from.right) / 2;

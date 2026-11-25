@@ -14,8 +14,12 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 mod activity;
 pub(super) use activity::refresh;
+pub(super) use activity::rebuild_legacy_books;
 
 pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS account_activity_state(owner TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS account_activity(owner TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            item_key TEXT NOT NULL, entry TEXT, favorite INTEGER NOT NULL, PRIMARY KEY(owner,item_key));")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS friend_pairs(
         a TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
         b TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -38,22 +42,24 @@ async fn account(
     task: impl FnOnce(&Connection, &str) -> TaskResult + Send + 'static,
 ) -> ApiResult {
     let token = bearer(&headers)?;
-    state
-        .accounts
-        .work(move |guard| {
-            let mut db = guard.lock()?;
-            let mode = if write {
-                TransactionBehavior::Immediate
-            } else {
-                TransactionBehavior::Deferred
-            };
-            let tx = db.transaction_with_behavior(mode)?;
-            let me = authenticated(&tx, &token)?;
-            let result = task(&tx, &me)?;
-            tx.commit()?;
-            Ok(result)
-        })
-        .await
+    let task = move |guard: super::ConnectionGuard| {
+        let mut db = guard.lock()?;
+        let mode = if write {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
+        let tx = db.transaction_with_behavior(mode)?;
+        let me = authenticated(&tx, &token)?;
+        let result = task(&tx, &me)?;
+        tx.commit()?;
+        Ok(result)
+    };
+    if write {
+        state.accounts.work(task).await
+    } else {
+        state.accounts.read(task).await
+    }
 }
 fn missing() -> ApiError {
     ApiError(

@@ -91,8 +91,23 @@ pub struct CatalogItem {
 }
 
 pub(crate) fn is_adult_tag(value: &str) -> bool {
+    let mut ascii = [0; 24];
+    let trimmed = value.trim();
+    let normalized;
+    let label = if trimmed.is_ascii() {
+        if trimmed.len() > ascii.len() {
+            return false;
+        }
+        let lower = &mut ascii[..trimmed.len()];
+        lower.copy_from_slice(trimmed.as_bytes());
+        lower.make_ascii_lowercase();
+        std::str::from_utf8(lower).unwrap_or_default()
+    } else {
+        normalized = normalize(trimmed);
+        &normalized
+    };
     matches!(
-        normalize(value).as_str(),
+        label,
         "adult"
             | "adulto"
             | "adultos"
@@ -262,7 +277,19 @@ impl CatalogItem {
         format!("{media}:{subtype}:{}", identity_name(&self.name))
     }
 
+    pub fn matches_subtype_group(&self, group: &str) -> bool {
+        crate::filters::matches_subtype_group(&self.media_type, &self.subtype, group)
+    }
+
     pub fn id(&self) -> Result<Uuid> {
+        if let Some(id) = self.sync_id {
+            if (self.media_type.is_ascii() && !self.media_type.eq_ignore_ascii_case("book"))
+                || self.subtype.eq_ignore_ascii_case("manga")
+                || self.subtype.eq_ignore_ascii_case("book.manga")
+            {
+                return Ok(id);
+            }
+        }
         let media = self.media_type.to_lowercase();
         let base = dotnet_id(&format!("{media}:{}", identity_name(&self.name)));
         let id = self.sync_id.unwrap_or(base);
@@ -298,13 +325,26 @@ impl CatalogItem {
 }
 
 pub fn normalize(text: &str) -> String {
-    text.nfkd()
-        .filter(|c| !is_combining_mark(*c))
-        .collect::<String>()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    if text.is_ascii() {
+        return collapse_ascii(text, u8::to_ascii_lowercase);
+    }
+    let decomposed: String = text.nfkd().filter(|c| !is_combining_mark(*c)).collect();
+    collapse_whitespace(&decomposed.to_lowercase())
+}
+
+/// Maps an explicit type label published by a reading provider to a catalog subtype.
+pub fn provider_book_subtype(label: &str) -> Option<&'static str> {
+    let label = normalize(&label.replace(['-', '_'], " "));
+    let label = label.strip_prefix("book.").unwrap_or(&label);
+    Some(match label {
+        "manga" | "manhwa" | "manhua" | "doujinshi" => "manga",
+        "comic" | "historieta" => "comic",
+        "novel" | "novela" => "novel",
+        "light novel" | "lightnovel" | "novela ligera" => "light_novel",
+        "web novel" | "webnovel" | "novela web" => "web_novel",
+        "book" | "libro" | "short story" | "relato" => "book",
+        _ => return None,
+    })
 }
 
 pub fn friend_item_key(media_type: &str, name: &str) -> String {
@@ -315,8 +355,26 @@ pub fn friend_item_key(media_type: &str, name: &str) -> String {
     )
 }
 
+pub fn friend_scoped_item_key(media_type: &str, name: &str, subtype: Option<&str>) -> String {
+    if media_type.eq_ignore_ascii_case("book") {
+        if let Some(code) = subtype.map(|s| crate::user_state::canonical_subtype("book", s)) {
+            if matches!(
+                code.as_str(),
+                "manga" | "comic" | "book" | "novel" | "light_novel" | "web_novel"
+            ) {
+                return friend_item_key(&format!("book.{code}"), name);
+            }
+        }
+    }
+    friend_item_key(media_type, name)
+}
+
 fn identity_name(text: &str) -> String {
-    text.nfc()
+    if text.is_ascii() {
+        return collapse_ascii(text, u8::to_ascii_uppercase);
+    }
+    let upper: String = text
+        .nfc()
         .map(|character| {
             let mut uppercase = character.to_uppercase();
             let first = uppercase.next().unwrap_or(character);
@@ -327,10 +385,35 @@ fn identity_name(text: &str) -> String {
                 first
             }
         })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+    collapse_whitespace(&upper)
+}
+
+fn collapse_ascii(text: &str, case: fn(&u8) -> u8) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut space = false;
+    for byte in text.as_bytes() {
+        if matches!(byte, b'\t'..=b'\r' | b' ') {
+            space = !out.is_empty();
+        } else {
+            if std::mem::take(&mut space) {
+                out.push(' ');
+            }
+            out.push(char::from(case(byte)));
+        }
+    }
+    out
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 fn dotnet_id(value: &str) -> Uuid {
@@ -400,9 +483,10 @@ impl CatalogQuery {
                 ]
                 .contains(&s.to_lowercase().as_str())
             })
-            || f.subtype_group
-                .as_ref()
-                .is_some_and(|s| !["anime", "liveaction"].contains(&s.to_lowercase().as_str()))
+            || f.subtype_group.as_ref().is_some_and(|s| {
+                !["anime", "liveaction", "manga", "prose", "comic"]
+                    .contains(&s.to_ascii_lowercase().as_str())
+            })
         {
             return Err(Error::Invalid("Filtro de catálogo inválido.".into()));
         }

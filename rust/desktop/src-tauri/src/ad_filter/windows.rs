@@ -1,13 +1,24 @@
+use super::playback::Bounds;
 use super::{blocked, CommandResult};
 use reqwest::Url;
+use std::{cell::RefCell, collections::HashMap};
 use tauri::{
-    webview::NewWindowResponse, AppHandle, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    webview::NewWindowResponse, AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
+use uuid::Uuid;
 use webview2_com::{
     take_pwstr, Microsoft::Web::WebView2::Win32::*, PermissionRequestedEventHandler,
     WebResourceRequestedEventHandler,
 };
 use windows_core::{w, Interface, PWSTR};
+use wry::{
+    dpi::{LogicalPosition, LogicalSize},
+    WebView, WebViewBuilder, WebViewExtWindows,
+};
+
+thread_local! {
+    static PLAYERS: RefCell<HashMap<Uuid, WebView>> = RefCell::new(HashMap::new());
+}
 
 fn resource_type(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> &'static str {
     match context {
@@ -28,12 +39,12 @@ fn resource_type(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> &'static str {
 }
 
 fn attach(
-    view: tauri::webview::PlatformWebview,
+    core: ICoreWebView2,
+    environment: ICoreWebView2Environment,
     provider: Option<Url>,
 ) -> windows_core::Result<()> {
     // The controller and its event handlers are used on WebView2's UI thread.
     unsafe {
-        let core = view.controller().CoreWebView2()?;
         unsafe extern "C" {
             fn umd_audio_attach(pid: u32);
         }
@@ -41,7 +52,6 @@ fn attach(
         if core.BrowserProcessId(&mut pid).is_ok() {
             umd_audio_attach(pid);
         }
-        let environment = view.environment();
         if provider.is_some() {
             core.cast::<ICoreWebView2_18>()?
                 .add_LaunchingExternalUriScheme(
@@ -125,16 +135,72 @@ fn attach(
 pub fn attach_main(main: &WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
     let (send, recv) = std::sync::mpsc::channel();
     main.with_webview(move |view| {
-        let _ = send.send(attach(view, None));
+        let _ = send.send(
+            unsafe { view.controller().CoreWebView2() }
+                .and_then(|core| attach(core, view.environment(), None)),
+        );
     })?;
     recv.recv()??;
     Ok(())
 }
 
-pub async fn open(app: AppHandle, url: Url, session: uuid::Uuid) -> CommandResult<()> {
+fn rect(bounds: Bounds) -> wry::Rect {
+    wry::Rect {
+        position: LogicalPosition::new(bounds.x, bounds.y).into(),
+        size: LogicalSize::new(bounds.width, bounds.height).into(),
+    }
+}
+
+pub async fn open(
+    app: AppHandle,
+    url: Url,
+    session: Uuid,
+    bounds: Option<Bounds>,
+) -> CommandResult<()> {
     let origin = url.origin();
     let label = format!("provider-{session}");
     let blank = Url::parse("about:blank").unwrap();
+    if let Some(bounds) = bounds {
+        let main = app
+            .get_webview_window("main")
+            .ok_or("Falta la ventana principal.")?;
+        let cache = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join("provider-webview");
+        let (send, recv) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let result = (|| {
+                // This child has no Tauri protocols, IPC handler or app capabilities.
+                let mut context = wry::WebContext::new(Some(cache));
+                let child = WebViewBuilder::new_with_web_context(&mut context)
+                    .with_url(blank.as_str())
+                    .with_incognito(true)
+                    .with_focused(false)
+                    .with_devtools(false)
+                    .with_bounds(rect(bounds))
+                    .with_navigation_handler(move |next| {
+                        next == "about:blank"
+                            || Url::parse(&next)
+                                .is_ok_and(|u| u.origin() == origin && u.scheme() == "https")
+                    })
+                    .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
+                    .with_download_started_handler(|_, _| false)
+                    .with_initialization_script_for_main_only(super::player_payload(&url), false)
+                    .build_as_child(&main)
+                    .map_err(|e| e.to_string())?;
+                attach(child.webview(), child.environment(), Some(url.clone()))
+                    .map_err(|e| e.to_string())?;
+                child.load_url(url.as_str()).map_err(|e| e.to_string())?;
+                PLAYERS.with(|players| players.borrow_mut().insert(session, child));
+                Ok(())
+            })();
+            let _ = send.send(result);
+        })
+        .map_err(|e| e.to_string())?;
+        return recv.await.map_err(|e| e.to_string())?;
+    }
     let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(blank))
         .title(format!("UMD · {}", url.host_str().unwrap_or_default()))
         .inner_size(1000.0, 680.0)
@@ -154,7 +220,10 @@ pub async fn open(app: AppHandle, url: Url, session: uuid::Uuid) -> CommandResul
     let result = async {
         window
             .with_webview(move |view| {
-                let _ = send.send(attach(view, Some(source)));
+                let _ = send.send(
+                    unsafe { view.controller().CoreWebView2() }
+                        .and_then(|core| attach(core, view.environment(), Some(source))),
+                );
             })
             .map_err(|e| e.to_string())?;
         recv.await
@@ -169,4 +238,70 @@ pub async fn open(app: AppHandle, url: Url, session: uuid::Uuid) -> CommandResul
         let _ = window.destroy();
     }
     result
+}
+
+pub(super) fn layout(
+    app: &AppHandle,
+    session: Uuid,
+    bounds: Bounds,
+    focus: bool,
+) -> CommandResult<()> {
+    app.run_on_main_thread(move || {
+        PLAYERS.with(|players| {
+            if let Some(child) = players.borrow().get(&session) {
+                let _ = child.set_bounds(rect(bounds));
+                if focus {
+                    let _ = child.focus();
+                }
+            }
+        })
+    })
+    .map_err(|e| e.to_string())
+}
+
+pub(super) async fn command(
+    app: &AppHandle,
+    session: Uuid,
+    script: String,
+    close: bool,
+) -> CommandResult<String> {
+    if let Some(window) = app.get_webview_window(&format!("provider-{session}")) {
+        if close {
+            window.destroy().map_err(|e| e.to_string())?;
+            return Ok("false".into());
+        }
+        let (send, mut recv) = tokio::sync::mpsc::channel(1);
+        window
+            .eval_with_callback(script, move |value| {
+                let _ = send.try_send(value);
+            })
+            .map_err(|e| e.to_string())?;
+        return tokio::time::timeout(std::time::Duration::from_secs(4), recv.recv())
+            .await
+            .map_err(|_| "El reproductor no respondió.")?
+            .ok_or("Se cerró el reproductor.".into());
+    }
+    let (send, mut recv) = tokio::sync::mpsc::channel(1);
+    app.run_on_main_thread(move || {
+        PLAYERS.with(|players| {
+            if close {
+                players.borrow_mut().remove(&session);
+                let _ = send.try_send(Ok("false".into()));
+            } else if let Some(child) = players.borrow().get(&session) {
+                let notify = send.clone();
+                if let Err(e) = child.evaluate_script_with_callback(&script, move |value| {
+                    let _ = notify.try_send(Ok(value));
+                }) {
+                    let _ = send.try_send(Err(e.to_string()));
+                }
+            } else {
+                let _ = send.try_send(Ok("false".into()));
+            }
+        })
+    })
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(4), recv.recv())
+        .await
+        .map_err(|_| "El reproductor no respondió.")?
+        .ok_or("Se cerró el reproductor.")?
 }

@@ -125,7 +125,7 @@ fn validate_backup_inner(
     Ok(catalog)
 }
 
-fn validate_envelope(document: &Value, max: usize) -> Result<()> {
+pub(crate) fn validate_envelope(document: &Value, max: usize) -> Result<()> {
     let mut size = ByteCount(0);
     serde_json::to_writer(&mut size, document)?;
     if size.0 > max {
@@ -256,14 +256,23 @@ fn validate_personal_inner(
         let media = item.media_type.to_ascii_lowercase();
         let name = normalize(&item.name);
         let sub = canonical_subtype(&media, &item.subtype);
-        by_name.entry((media.clone(), name.clone(), None)).or_insert(item);
+        by_name
+            .entry((media.clone(), name.clone(), None))
+            .or_insert(item);
         by_name.insert((media.clone(), name, Some(sub.clone())), item);
         for alias in item_aliases(item) {
-            by_alias.entry((media.clone(), alias.clone(), None)).or_insert(item);
-            by_alias.entry((media.clone(), alias, Some(sub.clone()))).or_insert(item);
+            by_alias
+                .entry((media.clone(), alias.clone(), None))
+                .or_insert(item);
+            by_alias
+                .entry((media.clone(), alias, Some(sub.clone())))
+                .or_insert(item);
         }
     }
-    let lookup_by_name = |media: &str, title: &str, subtype: Option<&str>| -> Option<&CatalogItem> {
+    let lookup_by_name = |media: &str,
+                          title: &str,
+                          subtype: Option<&str>|
+     -> Option<&CatalogItem> {
         let name = normalize(title);
         let sub = subtype
             .map(|s| canonical_subtype(media, s))
@@ -637,7 +646,7 @@ pub(crate) fn migrate_legacy_targets(db: &Connection) -> Result<()> {
         .flatten()
         .any(|r| r["content"]["item"]["itemId"].is_null());
     if legacy {
-        bind_legacy_targets(&mut doc, &CatalogStore::export_from(db)?)?;
+        bind_legacy_targets(&mut doc, &CatalogStore::summaries_from(db)?)?;
         db.execute(
             "UPDATE rust_settings SET value=?1 WHERE key='user_document'",
             [serde_json::to_string(&doc)?],
@@ -704,7 +713,14 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
 
 fn repair_profile_favorites(db: &Connection) -> Result<()> {
     let profiles: Vec<(String, String)> = {
-        let mut stmt = db.prepare("SELECT id, document FROM rust_profiles WHERE document IS NOT NULL")?;
+        let mut stmt = db.prepare(
+            "SELECT id,json_object(
+             'catalogRedirects',json(coalesce(document->'$.catalogRedirects','[]')),
+             'favoriteItemStates',json((SELECT json_group_array(json(f.value))
+               FROM json_each(p.document,'$.favoriteItemStates') f
+               WHERE f.type='object' AND f.value->'$.isFavorite'='true')))
+             FROM rust_profiles p WHERE json_valid(p.document)",
+        )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -718,15 +734,13 @@ fn repair_profile_favorites(db: &Connection) -> Result<()> {
         let Some(rows) = doc["favoriteItemStates"].as_array() else {
             continue;
         };
-        let active: Vec<&Value> = rows
-            .iter()
-            .filter(|r| r["isFavorite"] == true)
-            .collect();
+        let active: Vec<&Value> = rows.iter().filter(|r| r["isFavorite"] == true).collect();
         if active.is_empty() {
             continue;
         }
         let existing: HashSet<String> = {
-            let mut stmt = db.prepare_cached("SELECT id FROM rust_favorites WHERE profile_id=?1")?;
+            let mut stmt =
+                db.prepare_cached("SELECT id FROM rust_favorites WHERE profile_id=?1")?;
             let ids = stmt
                 .query_map([&profile_id], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<HashSet<_>>>()?;
@@ -756,7 +770,7 @@ fn repair_profile_favorites(db: &Connection) -> Result<()> {
                 let catalog = match &catalog_cache {
                     Some(c) => c,
                     None => {
-                        catalog_cache = Some(CatalogStore::export_from(db)?);
+                        catalog_cache = Some(CatalogStore::summaries_from(db)?);
                         catalog_cache.as_ref().unwrap()
                     }
                 };
@@ -820,7 +834,7 @@ pub(crate) fn read_state(db: &Connection, profile: Uuid) -> Result<Value> {
     let device = Uuid::new_v4().to_string();
     let mut doc = json!({"format":USER_FORMAT,"version":4,"exportedAt":now(),"deviceId":device,"deviceName":"UMD Desktop","progress":[],"readerPreferences":[],"favoriteContributorKeys":[],"favoriteStates":[],"favoriteItemStates":[],"lists":[],"catalogRedirects":[]});
     let mut stmt = db.prepare(
-        "SELECT c.payload FROM rust_favorites f JOIN rust_catalog c ON c.id=f.id WHERE f.profile_id=?1 ORDER BY f.id",
+        "SELECT s.summary FROM rust_favorites f JOIN rust_catalog_summary s ON s.id=f.id WHERE f.profile_id=?1 ORDER BY f.id",
     )?;
     for payload in stmt.query_map([profile.to_string()], |r| r.get::<_, String>(0))? {
         let item: CatalogItem = serde_json::from_str(&payload?)?;
@@ -1263,6 +1277,18 @@ impl CatalogStore {
     }
     /// Latest non-special unit and whether it lies beyond this profile's furthest recorded unit.
     pub fn shelf_units(&self, ids: &[Uuid]) -> Result<HashMap<String, Value>> {
+        self.shelf_units_inner(ids, false)
+    }
+
+    pub fn shelf_updates(&self, ids: &[Uuid]) -> Result<HashMap<String, Value>> {
+        self.shelf_units_inner(ids, true)
+    }
+
+    fn shelf_units_inner(
+        &self,
+        ids: &[Uuid],
+        only_updates: bool,
+    ) -> Result<HashMap<String, Value>> {
         if ids.len() > 500 {
             return Err(invalid("Demasiados títulos."));
         }
@@ -1271,6 +1297,7 @@ impl CatalogStore {
         let state = read_state(&tx, self.1)?;
         let redirects = redirect_map(&state);
         let mut progress: HashMap<String, HashSet<(Option<i64>, String, String)>> = HashMap::new();
+        let mut has_legacy = false;
         for row in state["progress"].as_array().into_iter().flatten() {
             let c = &row["content"];
             let (Some(kind), Some(num)) = (c["unitKind"].as_str(), c["displayNumber"].as_str())
@@ -1284,6 +1311,7 @@ impl CatalogStore {
             {
                 crate::reconcile_catalog::destination(id, &redirects)?.to_string()
             } else {
+                has_legacy = true;
                 format!(
                     "{}:{}",
                     identity["mediaType"].as_str().unwrap_or("").to_lowercase(),
@@ -1296,6 +1324,30 @@ impl CatalogStore {
                 num.to_string(),
             ));
         }
+        let ids = if only_updates {
+            let mut retained = Vec::new();
+            for id in ids {
+                if progress.contains_key(&id.to_string()) {
+                    retained.push(*id);
+                } else if has_legacy
+                    && Self::summary_from(&tx, *id)?.is_some_and(|item| {
+                        progress.contains_key(&format!(
+                            "{}:{}",
+                            item.media_type.to_lowercase(),
+                            normalize(&item.name)
+                        ))
+                    })
+                {
+                    retained.push(*id);
+                }
+            }
+            retained
+        } else {
+            ids.to_vec()
+        };
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut stmt = tx.prepare("WITH chosen AS (
             SELECT id,media_type,payload FROM rust_catalog WHERE id IN (SELECT value FROM json_each(?1))
         ), units AS (
@@ -1306,7 +1358,7 @@ impl CatalogStore {
           WHERE coalesce(unit->>'isSpecial',0)=0 AND unit->>'displayNumber' IS NOT NULL
               AND unit->>'kind' IN ('episode','chapter','track','audioChapter','audio_chapter')
           ORDER BY id,coalesce(season,-1),coalesce(unit->>'sortOrder',idx),idx")?;
-        let mut rows = stmt.query([serde_json::to_string(ids)?])?;
+        let mut rows = stmt.query([serde_json::to_string(&ids)?])?;
         let mut result = HashMap::new();
         let mut seen = HashSet::new();
         while let Some(row) = rows.next()? {
@@ -1326,6 +1378,9 @@ impl CatalogStore {
             }
             let later = seen.contains(&id) && !matched;
             result.insert(id, json!({"kind":kind,"number":number,"later":later}));
+        }
+        if only_updates {
+            result.retain(|_, row| row["later"] == true);
         }
         Ok(result)
     }
@@ -1380,22 +1435,72 @@ impl CatalogStore {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut doc = read_state(&tx, self.1)?;
         let stamp = now();
+        let device = doc["deviceId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("Dispositivo inválido."))?
+            .to_owned();
+        let mut clock = max_clock(&doc).max(0);
+        let unit_key = |content: &Value| {
+            (
+                content["unitKind"].as_str().map(str::to_owned),
+                content["displayNumber"].as_str().map(str::to_owned),
+                content["seasonNumber"].as_i64(),
+            )
+        };
+        let legacy_key = |content: &Value, include_subtype: bool| {
+            (
+                content["item"]["mediaType"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                normalize(content["item"]["name"].as_str().unwrap_or_default()),
+                if include_subtype {
+                    content["item"]["subtype"]
+                        .as_str()
+                        .map(str::to_ascii_lowercase)
+                } else {
+                    None
+                },
+                unit_key(content),
+            )
+        };
+        let mut positions = HashMap::new();
+        let mut legacy = HashSet::new();
+        let mut updates: Vec<Option<Value>> = Vec::with_capacity(entries.len());
         for (target, position, kind, completed) in entries {
             let content = target.content(&tx)?;
-            let ver = next_version(&doc)?;
-            let rows = doc["progress"]
-                .as_array_mut()
-                .ok_or_else(|| invalid("Progreso inválido."))?;
-            rows.retain(|r| !same_content(&r["content"], &content));
-            rows.push(json!({
+            clock = clock.min(i64::MAX - 2) + 1;
+            let key = (target.item_id, unit_key(&content));
+            if let Some(index) = positions.insert(key, updates.len()) {
+                updates[index] = None;
+            }
+            legacy.insert(legacy_key(&content, true));
+            legacy.insert(legacy_key(&content, false));
+            updates.push(Some(json!({
                 "content": content,
                 "position": position,
                 "positionKind": kind,
                 "isCompleted": completed,
                 "updatedAt": stamp,
-                "syncVersion": ver
-            }));
+                "syncVersion": version(&device, clock)
+            })));
         }
+        let rows = doc["progress"]
+            .as_array_mut()
+            .ok_or_else(|| invalid("Progreso inválido."))?;
+        rows.retain(|row| {
+            let content = &row["content"];
+            if let Some(id) = content["item"]["itemId"]
+                .as_str()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+            {
+                !positions.contains_key(&(id, unit_key(content)))
+            } else {
+                !legacy.contains(&legacy_key(content, content["item"]["subtype"].is_string()))
+            }
+        });
+        rows.extend(updates.into_iter().flatten());
         save_state(&tx, self.1, &doc)?;
         tx.commit()?;
         Ok(())
@@ -1434,7 +1539,7 @@ impl CatalogStore {
                 crate::reconcile_catalog::destination(id, &redirects)?
             } else {
                 if legacy.is_none() {
-                    legacy = Some(Self::export_from(&tx)?);
+                    legacy = Some(Self::summaries_from(&tx)?);
                 }
                 let Some(item) = legacy
                     .as_ref()
@@ -1450,7 +1555,7 @@ impl CatalogStore {
             {
                 continue;
             }
-            if let Some(item) = Self::item_from(&tx, id)? {
+            if let Some(item) = Self::summary_from(&tx, id)? {
                 if !hide_adult || !item.adult() {
                     results.push(json!({"item":item,"progress":row}));
                     if results.len() >= limit {
@@ -1524,9 +1629,9 @@ impl CatalogStore {
         // The catalog was just read as typed items, so it is checked as it is
         // instead of being converted to JSON and parsed back.
         catalog.validate()?;
-        document["catalog"] = serde_json::to_value(&catalog)?;
-        validate_envelope(&document, MAX_DOCUMENT_BYTES)?;
         validate_personal(&document, &catalog)?;
+        document["catalog"] = serde_json::to_value(catalog)?;
+        validate_envelope(&document, MAX_DOCUMENT_BYTES)?;
         if still_missing {
             tx.commit()?;
         }
@@ -1544,9 +1649,7 @@ impl CatalogStore {
         let shared: bool =
             tx.query_row("SELECT count(*)>1 FROM rust_profiles", [], |r| r.get(0))?;
         if shared {
-            let mut additions = catalog.clone();
-            additions.items.retain(|item| !item.deleted);
-            Self::import_into(&tx, &additions, false)?;
+            Self::import_rows(&tx, &catalog, false, false)?;
         } else {
             Self::import_into(&tx, &catalog, true)?;
         }
@@ -1554,14 +1657,19 @@ impl CatalogStore {
             "DELETE FROM rust_favorites WHERE profile_id=?1",
             [self.1.to_string()],
         )?;
-        let mut doc = document.clone();
+        let mut doc = Value::Object(
+            document
+                .as_object()
+                .ok_or_else(|| invalid("Datos del respaldo inválidos."))?
+                .iter()
+                .filter(|(key, _)| key.as_str() != "catalog")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
         bind_legacy_targets(&mut doc, &catalog)?;
         // A restore brings the data, not the originating device's identity.
         doc["deviceId"] = local["deviceId"].clone();
         doc["deviceName"] = local["deviceName"].clone();
-        doc.as_object_mut()
-            .ok_or_else(|| invalid("Datos del respaldo inválidos."))?
-            .remove("catalog");
         for key in [
             "progress",
             "readerPreferences",
@@ -1577,7 +1685,11 @@ impl CatalogStore {
         }
         let redirects = redirect_map(&doc);
         let titles = Titles::new(&catalog);
-        for row in doc["favoriteItemStates"].as_array_mut().into_iter().flatten() {
+        for row in doc["favoriteItemStates"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
             if row["isFavorite"] == true {
                 if let Some(item) = titles.resolve(&redirects, &row["item"]) {
                     if !item.deleted {

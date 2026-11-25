@@ -17,6 +17,9 @@ use tokio::{io::AsyncWriteExt, sync::Mutex};
 use umd_core::CatalogStore;
 use uuid::Uuid;
 
+#[cfg(desktop)]
+pub(crate) mod desktop;
+
 const CHANNEL: &str = if cfg!(target_os = "android") {
     "tauri-stable"
 } else {
@@ -75,7 +78,14 @@ struct Candidate {
     digest: [u8; 32],
 }
 #[derive(Default)]
-pub struct Updates(Mutex<Option<Candidate>>);
+struct UpdateState {
+    candidate: Option<Candidate>,
+    #[cfg(desktop)]
+    prepared: Option<desktop::Prepared>,
+}
+
+#[derive(Default)]
+pub struct Updates(Mutex<UpdateState>);
 
 fn trusted_transport(url: &Url) -> bool {
     url.username().is_empty()
@@ -236,7 +246,7 @@ pub async fn check_update(
         .0
         .try_lock()
         .map_err(|_| "Ya hay una actualización en curso.")?;
-    *slot = None;
+    *slot = UpdateState::default();
     let found = discover(
         &client()?,
         &source(&store)?,
@@ -245,7 +255,7 @@ pub async fn check_update(
     )
     .await?;
     let offer = found.as_ref().map(|c| c.offer.clone());
-    *slot = found;
+    slot.candidate = found;
     Ok(offer)
 }
 
@@ -256,6 +266,8 @@ pub enum Progress {
         bytes: u64,
     },
     Verify,
+    #[cfg(desktop)]
+    Extract,
     #[cfg(target_os = "android")]
     Install,
 }
@@ -270,15 +282,8 @@ struct Staged {
 }
 
 #[cfg(desktop)]
-fn inspect(file: &File, version: &Version) -> CommandResult<()> {
+fn validate_identity(reader: impl io::Read, version: &Version) -> CommandResult<()> {
     use std::io::Read;
-    let mut archive = zip::ZipArchive::new(file).map_err(|_| "El ZIP de UMD no es válido.")?;
-    let info = archive
-        .by_name("umd-package.json")
-        .map_err(|_| "Falta la identidad del paquete.")?;
-    if info.size() > 4096 {
-        return Err("Identidad del paquete inválida.".into());
-    }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Identity {
@@ -286,14 +291,32 @@ fn inspect(file: &File, version: &Version) -> CommandResult<()> {
         version: Version,
         runtime_identifier: String,
     }
+    let mut bytes = Vec::new();
+    reader
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 4096 {
+        return Err("Identidad del paquete inválida.".into());
+    }
     let identity: Identity =
-        serde_json::from_reader(info.take(4097)).map_err(|_| "Identidad del paquete inválida.")?;
+        serde_json::from_slice(&bytes).map_err(|_| "Identidad del paquete inválida.")?;
     if identity.product != "org.universalmediadistribution.rust"
         || identity.version != *version
         || identity.runtime_identifier != target()?
     {
         return Err("El producto, la plataforma o la versión del ZIP no coinciden.".into());
     }
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn inspect(file: &File, version: &Version) -> CommandResult<()> {
+    let mut archive = zip::ZipArchive::new(file).map_err(|_| "El ZIP de UMD no es válido.")?;
+    let info = archive
+        .by_name("umd-package.json")
+        .map_err(|_| "Falta la identidad del paquete.")?;
+    validate_identity(info, version)?;
     let exe = if cfg!(windows) {
         "umd-desktop.exe"
     } else {
@@ -357,7 +380,7 @@ async fn stage(
     #[cfg(desktop)]
     let version = c.offer.version.clone();
     crate::work(move || {
-        // Keep the verified handle open until the ZIP has been saved.
+        // Use this same verified file handle for extraction.
         let mut options = File::options();
         options.read(true);
         #[cfg(windows)]
@@ -380,20 +403,9 @@ async fn stage(
     .await
 }
 
-#[cfg(desktop)]
-fn save_zip(mut staged: Staged, path: &std::path::Path) -> CommandResult<()> {
-    use std::io::Seek;
-    let parent = path.parent().ok_or("Carpeta de destino inválida.")?;
-    let mut out = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    staged.file.rewind().map_err(|e| e.to_string())?;
-    io::copy(&mut staged.file, &mut out).map_err(|e| e.to_string())?;
-    out.as_file().sync_all().map_err(|e| e.to_string())?;
-    out.persist(path).map_err(|e| e.to_string())?;
-    Ok(())
-}
 #[tauri::command]
 pub async fn install_update(
-    app: AppHandle,
+    _app: AppHandle,
     id: Uuid,
     store: State<'_, CatalogStore>,
     updates: State<'_, Updates>,
@@ -404,6 +416,7 @@ pub async fn install_update(
         .try_lock()
         .map_err(|_| "Ya hay una actualización en curso.")?;
     let c = slot
+        .candidate
         .as_ref()
         .filter(|c| c.offer.id == id)
         .ok_or("Volvé a buscar la actualización.")?;
@@ -413,37 +426,16 @@ pub async fn install_update(
     #[cfg(target_os = "android")]
     let root = {
         use tauri::Manager;
-        let d = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+        let d = _app.path().app_cache_dir().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
         Some(d)
     };
     #[cfg(desktop)]
-    let destination = {
-        use tauri_plugin_dialog::DialogExt;
-        let name = format!("UMD-{}-{}.zip", c.offer.version, target()?);
-        let selection = crate::work(move || {
-            Ok(app
-                .dialog()
-                .file()
-                .add_filter("ZIP", &["zip"])
-                .set_file_name(name)
-                .blocking_save_file())
-        })
-        .await?;
-        let Some(file) = selection else {
-            return Ok("Descarga cancelada.".into());
-        };
-        let path = file.into_path().map_err(|e| e.to_string())?;
-        if !path
-            .extension()
-            .is_some_and(|s| s.eq_ignore_ascii_case("zip"))
-        {
-            return Err("Elegí un archivo con extensión .zip.".into());
-        }
-        path
-    };
-    #[cfg(desktop)]
     let root: Option<PathBuf> = None;
+    #[cfg(desktop)]
+    if slot.prepared.is_some() {
+        return Ok("La actualización está lista para reiniciar.".into());
+    }
     let staged = stage(
         &client()?,
         c,
@@ -467,22 +459,49 @@ pub async fn install_update(
         tokio::fs::rename(&staged.path, &package)
             .await
             .map_err(|e| e.to_string())?;
-        if let Err(e) = handoff_android(&app, &package, &c.offer.version.to_string()).await {
+        if let Err(e) = handoff_android(&_app, &package, &c.offer.version.to_string()).await {
             let _ = tokio::fs::remove_file(package).await;
             return Err(e);
         }
-        *slot = None;
+        slot.candidate = None;
         Ok("Seguí los pasos del instalador de Android.".into())
     }
     #[cfg(desktop)]
     {
-        crate::work(move || save_zip(staged, &destination)).await?;
-        *slot = None;
-        Ok(
-            "ZIP guardado. Cerrá UMD, extraé el ZIP en una carpeta nueva y abrí la aplicación."
-                .into(),
-        )
+        let _ = progress.send(Progress::Extract);
+        slot.prepared = Some(crate::work(move || desktop::prepare(staged.file)).await?);
+        Ok("La actualización está lista para reiniciar.".into())
     }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn restart_update(
+    app: AppHandle,
+    id: Uuid,
+    store: State<'_, CatalogStore>,
+    updates: State<'_, Updates>,
+) -> CommandResult<()> {
+    let mut slot = updates
+        .0
+        .try_lock()
+        .map_err(|_| "Ya hay una actualización en curso.")?;
+    let candidate = slot
+        .candidate
+        .as_ref()
+        .filter(|c| c.offer.id == id)
+        .ok_or("Volvé a buscar la actualización.")?;
+    if source(&store)? != candidate.source {
+        return Err("Cambió el servidor. Volvé a buscar la actualización.".into());
+    }
+    let prepared = slot
+        .prepared
+        .take()
+        .ok_or("La actualización todavía no está lista.")?;
+    crate::work(move || prepared.handoff()).await?;
+    slot.candidate = None;
+    app.exit(0);
+    Ok(())
 }
 #[cfg(target_os = "android")]
 async fn handoff_android(
@@ -636,16 +655,13 @@ mod tests {
         result
     }
     #[tokio::test]
-    async fn only_matching_verified_archives_can_be_saved() {
+    async fn only_matching_verified_archives_can_be_staged() {
         let good = zip_fixture("org.universalmediadistribution.rust", "1.1.0");
         let staged = receive_fixture(&good, good.clone(), "1.1.0").await.unwrap();
         let path = staged.path.clone();
         #[cfg(windows)]
         assert!(File::options().write(true).open(&path).is_err());
-        let destination = tempfile::tempdir().unwrap();
-        let output = destination.path().join("umd.zip");
-        save_zip(staged, &output).unwrap();
-        assert_eq!(std::fs::read(output).unwrap(), good);
+        drop(staged);
         assert!(!path.exists());
         let mut corrupt = good.clone();
         corrupt[0] ^= 1;

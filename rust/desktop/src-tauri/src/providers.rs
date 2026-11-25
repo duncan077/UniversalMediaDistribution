@@ -1,5 +1,10 @@
 use crate::{work, CommandResult};
+use reqwest::cookie::Jar;
 use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+};
 use tauri::State;
 use umd_core::{CatalogItem, CatalogStore};
 use umd_providers::{Entry, Page, Provider, Site};
@@ -16,7 +21,7 @@ fn explain(err: umd_providers::Failure) -> String {
     }
 }
 /// A provider that is reused between commands. It keeps its connection,
-/// cookies, request pacing and, for the sites that publish one, the catalogue
+/// request pacing and, for the sites that publish one, the catalogue
 /// index: a search used to download that 4 to 16 MiB index again every time.
 struct Cached {
     provider: std::sync::Arc<tokio::sync::Mutex<Provider>>,
@@ -27,14 +32,29 @@ struct Cached {
 }
 /// Idle providers are dropped so an index does not stay in memory, and every
 /// provider is rebuilt now and then so its pinned addresses follow the site.
-const PROVIDER_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+fn provider_idle() -> std::time::Duration {
+    std::time::Duration::from_secs(if cfg!(target_os = "android") { 30 } else { 600 })
+}
 const PROVIDER_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-static PROVIDERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Cached>>> =
-    std::sync::LazyLock::new(Default::default);
+
+#[derive(Default)]
+struct ProviderCache {
+    clients: HashMap<String, Cached>,
+    // Cookies outlive cached connections and catalog indexes.
+    cookies: HashMap<String, Arc<Jar>>,
+}
+
+impl ProviderCache {
+    fn cookies(&mut self, id: &str) -> Arc<Jar> {
+        self.cookies.entry(id.to_owned()).or_default().clone()
+    }
+}
+
+static PROVIDERS: LazyLock<Mutex<ProviderCache>> = LazyLock::new(Default::default);
 
 impl Cached {
     fn live(&self) -> bool {
-        self.used.elapsed() < PROVIDER_IDLE && self.created.elapsed() < PROVIDER_LIFETIME
+        self.used.elapsed() < provider_idle() && self.created.elapsed() < PROVIDER_LIFETIME
     }
 }
 /// Frees idle providers even when no other provider command arrives: an index
@@ -43,16 +63,23 @@ impl Cached {
 static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 async fn sweep() {
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(provider_idle().min(std::time::Duration::from_secs(60))).await;
         let Ok(mut providers) = PROVIDERS.lock() else {
             SWEEPING.store(false, std::sync::atomic::Ordering::Release);
             return;
         };
-        providers.retain(|_, entry| entry.live());
-        if providers.is_empty() {
+        providers.clients.retain(|_, entry| entry.live());
+        if providers.clients.is_empty() {
             SWEEPING.store(false, std::sync::atomic::Ordering::Release);
             return;
         }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn trim() {
+    if let Ok(mut providers) = PROVIDERS.lock() {
+        providers.clients.clear();
     }
 }
 
@@ -141,15 +168,20 @@ fn update_provider_locations(
                 &serde_json::to_string(&next).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
+        let mut providers = PROVIDERS.lock().map_err(|_| "Proveedor ocupado.")?;
+        providers.clients.clear();
+        providers
+            .cookies
+            .retain(|id, _| source_location(&saved, id) == source_location(&next, id));
         *saved = next;
-        PROVIDERS.lock().map_err(|_| "Proveedor ocupado.")?.clear();
     }
     Ok(saved.clone())
 }
 fn location(id: &str) -> Option<reqwest::Url> {
-    CONFIG
-        .lock()
-        .ok()?
+    source_location(&CONFIG.lock().ok()?, id)
+}
+fn source_location(config: &[SourceConfig], id: &str) -> Option<reqwest::Url> {
+    config
         .iter()
         .find(|s| s.id == id)
         .and_then(|s| reqwest::Url::parse(&s.base).ok())
@@ -239,30 +271,31 @@ pub async fn json_provider_add(
     })
     .await
 }
-async fn open(id: &str) -> CommandResult<tokio::sync::OwnedMutexGuard<Provider>> {
+pub(crate) async fn open(id: &str) -> CommandResult<tokio::sync::OwnedMutexGuard<Provider>> {
     let site = Site::parse(id).ok_or("Proveedor desconocido.")?;
-    let base = location(id);
-    let verified = if base.is_some() { None } else { verified(id) };
-    let session = verified.as_ref().map(|(_, session, _)| *session);
-    let cached = {
+    let (base, verified, session, cached, cookies) = {
+        let config = CONFIG.lock().map_err(|_| "Configuración ocupada.")?;
+        let base = source_location(&config, id);
+        let verified = if base.is_some() { None } else { verified(id) };
+        let session = verified.as_ref().map(|(_, session, _)| *session);
         let mut providers = PROVIDERS.lock().map_err(|e| e.to_string())?;
-        providers.retain(|_, entry| entry.live());
-        providers
+        providers.clients.retain(|_, entry| entry.live());
+        let cached = providers
+            .clients
             .get_mut(id)
             .filter(|entry| entry.session == session)
             .map(|entry| {
                 entry.used = std::time::Instant::now();
                 entry.provider.clone()
-            })
+            });
+        (base, verified, session, cached, providers.cookies(id))
     };
     let provider = match cached {
         Some(provider) => provider,
         None => {
-            let mut provider = match base {
-                Some(url) => Provider::open_at(site, url).await,
-                None => Provider::open(site).await,
-            }
-            .map_err(explain)?;
+            let mut provider = Provider::open_with_cookies(site, base, cookies.clone())
+                .await
+                .map_err(explain)?;
             if let Some((app, session, origin)) = verified {
                 provider.set_public_reader(std::sync::Arc::new(move |url, limit| {
                     let app = app.clone();
@@ -277,7 +310,14 @@ async fn open(id: &str) -> CommandResult<tokio::sync::OwnedMutexGuard<Provider>>
             let provider = std::sync::Arc::new(tokio::sync::Mutex::new(provider));
             let now = std::time::Instant::now();
             let mut providers = PROVIDERS.lock().map_err(|e| e.to_string())?;
-            providers.insert(
+            if !providers
+                .cookies
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, &cookies))
+            {
+                return Err("Cambió la dirección del proveedor. Volvé a intentar.".into());
+            }
+            providers.clients.insert(
                 id.to_owned(),
                 Cached {
                     provider: provider.clone(),
@@ -286,6 +326,17 @@ async fn open(id: &str) -> CommandResult<tokio::sync::OwnedMutexGuard<Provider>>
                     used: now,
                 },
             );
+            if cfg!(target_os = "android") && providers.clients.len() > 2 {
+                if let Some(oldest) = providers
+                    .clients
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != id)
+                    .min_by_key(|(_, entry)| entry.used)
+                    .map(|(key, _)| key.clone())
+                {
+                    providers.clients.remove(&oldest);
+                }
+            }
             // The flag changes only under the cache lock, so an entry is never
             // left without a sweeper.
             if !SWEEPING.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -317,9 +368,14 @@ pub async fn provider_interactive(
         "framextv" => "https://framextv.xyz/",
         _ => Site::parse(&site).ok_or("Proveedor desconocido.")?.base(),
     };
-    let session =
-        crate::ad_filter::open_filtered_player(app.clone(), page.into(), language, Some(true))
-            .await?;
+    let session = crate::ad_filter::open_filtered_player(
+        app.clone(),
+        page.into(),
+        language,
+        Some(true),
+        None,
+    )
+    .await?;
     VERIFIED.lock().map_err(|e| e.to_string())?.insert(
         site,
         (
@@ -344,7 +400,11 @@ pub async fn provider_updates(
     site: String,
     store: State<'_, CatalogStore>,
 ) -> CommandResult<Vec<Entry>> {
-    let key = format!("daily-list-{site}");
+    daily_entries(&site, &store).await
+}
+
+async fn daily_entries(site: &str, store: &CatalogStore) -> CommandResult<Vec<Entry>> {
+    let key = format!("daily-list-v2-{site}");
     let now = chrono::Utc::now();
     if let Some((date, rows)) = store
         .setting(&key)
@@ -357,7 +417,7 @@ pub async fn provider_updates(
             return Ok(rows);
         }
     }
-    let mut provider = open(&site).await?;
+    let mut provider = open(site).await?;
     let mut rows = provider.updates().await.map_err(explain)?;
     rows.truncate(100);
     let encoded = serde_json::to_string(&(now, &rows)).map_err(|e| e.to_string())?;
@@ -366,6 +426,88 @@ pub async fn provider_updates(
         .map_err(|e| e.to_string())?;
     Ok(rows)
 }
+
+#[tauri::command]
+pub async fn import_daily_updates(
+    store: State<'_, CatalogStore>,
+    capibara: State<'_, crate::capibara::Capibara>,
+    sites: Vec<String>,
+    hide_adult: bool,
+) -> CommandResult<usize> {
+    use futures_util::{stream, StreamExt};
+    static IMPORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let Ok(_guard) = IMPORT.try_lock() else {
+        return Ok(0);
+    };
+    let mut unique = std::collections::HashSet::new();
+    let sites = sites
+        .into_iter()
+        .filter(|site| Site::parse(site).is_some() || site == "capibaratraductor")
+        .filter(|site| unique.insert(site.clone()))
+        .collect::<Vec<_>>();
+    let store = store.inner();
+    let capibara = capibara.inner();
+    let mut jobs = stream::iter(sites).map(|site| async move {
+        let key = format!("daily-import-{site}-{hide_adult}");
+        let now = chrono::Utc::now().timestamp();
+        let local = store.clone();
+        let stamp = key.clone();
+        let due = work(move || {
+            Ok(!local.setting(&stamp).map_err(|e| e.to_string())?
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|next| (now..=now+86400).contains(&next)))
+        }).await?;
+        if !due {
+            return Ok::<usize, String>(0);
+        }
+        let entries: Vec<(String, CatalogItem)> = if site == "capibaratraductor" {
+            capibara.daily().await?.items.into_iter().take(100).filter_map(|hit| {
+                let item: CatalogItem = serde_json::from_value(serde_json::json!({
+                    "syncId":hit.edition.sync_id(), "name":hit.title, "mediaType":"book", "subtype":"manga", "capibaraEdition":hit.edition
+                })).ok()?;
+                let external = if hit.edition.joint { format!("joint-{}", hit.edition.id) } else { hit.edition.id.to_string() };
+                Some((external, item))
+            }).collect()
+        } else {
+            let mut classified = Vec::new();
+            for entry in daily_entries(&site, store).await? {
+                let item = if entry.preview["mediaType"] == "book" && !entry.preview["subtype"].is_string() {
+                    let mut source = open(&site).await?;
+                    source.detail(&entry).await.map_err(explain).ok()
+                } else {
+                    serde_json::from_value(entry.preview).ok()
+                };
+                if let Some(item) = item {
+                    classified.push((entry.external_id, item));
+                }
+            }
+            classified
+        };
+        let local = store.clone();
+        work(move || {
+            let mut updated = 0;
+            let mut failed = false;
+            for (external, item) in entries {
+                if hide_adult && item.adult() {
+                    continue;
+                }
+                match local.merge_provider_update(&site, &external, item) {
+                    Ok(changed) => updated += usize::from(changed),
+                    Err(_) => failed = true,
+                }
+            }
+            let next = now + if failed { 3600 } else { 86400 };
+            local.set_setting(&key, &next.to_string()).map_err(|e| e.to_string())?;
+            Ok(updated)
+        }).await
+    }).buffer_unordered(2);
+    let mut imported = 0;
+    while let Some(result) = jobs.next().await {
+        imported += result.unwrap_or_default();
+    }
+    Ok(imported)
+}
+
 #[tauri::command]
 pub async fn refresh_saved_editions(
     store: State<'_, CatalogStore>,
@@ -378,93 +520,116 @@ pub async fn refresh_saved_editions(
     };
     let db = store.inner().clone();
     let editions = work(move || db.saved_editions().map_err(|e| e.to_string())).await?;
-    let mut updated = 0;
+    use futures_util::{stream, StreamExt, TryStreamExt};
+    let mut groups = std::collections::BTreeMap::new();
     for (id, name, site, external) in editions {
-        if !sites.contains(&site) {
-            continue;
+        if sites.contains(&site) {
+            groups
+                .entry(site)
+                .or_insert_with(Vec::new)
+                .push((id, name, external));
         }
-        let stamp = format!("edition-refresh-{site}-{id}");
-        let now = chrono::Utc::now().timestamp();
-        if store
-            .setting(&stamp)
-            .map_err(|e| e.to_string())?
-            .and_then(|s| s.parse::<i64>().ok())
-            .is_some_and(|next| next > now && next <= now + 86400)
-        {
-            continue;
-        }
-        let library = store.inner().clone();
-        let item = match work(move || library.item(id).map_err(|e| e.to_string()))
-            .await?
-            .and_then(|d| d.items.into_iter().next())
-        {
-            Some(i) => i,
-            None => continue,
-        };
-        let key = item.key();
-        let result: CommandResult<CatalogItem> = async {
-            if site == "capibaratraductor" {
-                let edition = if let Some(e) = item
-                    .metadata
-                    .get("capibaraEdition")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                {
-                    e
-                } else {
-                    let target = umd_core::capibara::edition_id(id)
-                        .or_else(|| external.parse().ok())
-                        .ok_or("Edición desconocida.")?;
-                    capibara
-                        .search(&name, 1)
-                        .await?
-                        .items
-                        .into_iter()
-                        .map(|h| h.edition)
-                        .find(|e| e.id == target)
-                        .ok_or("Edición desconocida.")?
-                };
-                let mut fresh = capibara.edition_detail(&edition).await?;
-                fresh.metadata.insert(
-                    "capibaraEdition".into(),
-                    serde_json::to_value(edition).map_err(|e| e.to_string())?,
-                );
-                Ok(fresh)
-            } else {
-                open(&site)
-                    .await?
-                    .detail(&Entry {
-                        external_id: external.clone(),
-                        preview: serde_json::json!({"name":name}),
-                    })
-                    .await
-                    .map_err(explain)
-            }
-        }
-        .await;
-        let success = match result {
-            Ok(new) => {
-                let library = store.inner().clone();
-                let (key, site, external) = (key.clone(), site.clone(), external.clone());
-                work(move || {
-                    Ok(library
-                        .link_provider_edition(id, &key, &site, &external, new)
-                        .is_ok())
-                })
-                .await
-                .unwrap_or(false)
-            }
-            Err(_) => false,
-        };
-        store
-            .set_setting(
-                &stamp,
-                &(now + if success { 86400 } else { 3600 }).to_string(),
-            )
-            .map_err(|e| e.to_string())?;
-        updated += usize::from(success);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    Ok(updated)
+    let store = store.inner();
+    let capibara = capibara.inner();
+    stream::iter(groups)
+        .map(|(site, rows)| async move {
+            let mut updated = 0;
+            for (id, name, external) in rows {
+                let stamp = format!("edition-refresh-{site}-{id}");
+                let now = chrono::Utc::now().timestamp();
+                let library = store.clone();
+                let stamp_key = stamp.clone();
+                let item = work(move || {
+                    let due = !library
+                        .setting(&stamp_key)
+                        .map_err(|e| e.to_string())?
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .is_some_and(|next| next > now && next <= now + 86400);
+                    if !due {
+                        return Ok(None);
+                    }
+                    library
+                        .item(id)
+                        .map(|doc| doc.and_then(|doc| doc.items.into_iter().next()))
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+                let Some(item) = item else {
+                    continue;
+                };
+                let key = item.key();
+                let result: CommandResult<CatalogItem> = async {
+                    if site == "capibaratraductor" {
+                        let edition = if let Some(e) = item
+                            .metadata
+                            .get("capibaraEdition")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        {
+                            e
+                        } else {
+                            let target = umd_core::capibara::edition_id(id)
+                                .or_else(|| external.parse().ok())
+                                .ok_or("Edición desconocida.")?;
+                            capibara
+                                .search(&name, 1)
+                                .await?
+                                .items
+                                .into_iter()
+                                .map(|h| h.edition)
+                                .find(|e| e.id == target)
+                                .ok_or("Edición desconocida.")?
+                        };
+                        let mut fresh = capibara.edition_detail(&edition).await?;
+                        fresh.metadata.insert(
+                            "capibaraEdition".into(),
+                            serde_json::to_value(edition).map_err(|e| e.to_string())?,
+                        );
+                        Ok(fresh)
+                    } else {
+                        open(&site)
+                            .await?
+                            .detail(&Entry {
+                                external_id: external.clone(),
+                                preview: serde_json::json!({"name":name, "subtype":item.subtype}),
+                            })
+                            .await
+                            .map_err(explain)
+                    }
+                }
+                .await;
+                let success = match result {
+                    Ok(new) => {
+                        let library = store.clone();
+                        let (key, site, external) = (key.clone(), site.clone(), external.clone());
+                        work(move || {
+                            Ok(library
+                                .link_provider_edition(id, &key, &site, &external, new)
+                                .is_ok())
+                        })
+                        .await
+                        .unwrap_or(false)
+                    }
+                    Err(_) => false,
+                };
+                let library = store.clone();
+                work(move || {
+                    library
+                        .set_setting(
+                            &stamp,
+                            &(now + if success { 86400 } else { 3600 }).to_string(),
+                        )
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+                updated += usize::from(success);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Ok(updated)
+        })
+        .buffer_unordered(2)
+        .try_fold(0, |total, count| async move { Ok(total + count) })
+        .await
 }
 
 #[derive(serde::Serialize)]
@@ -526,7 +691,7 @@ async fn fetch_linked_provider_detail(
             .await?
             .detail(&Entry {
                 external_id: external.to_owned(),
-                preview: serde_json::json!({"name": item.name}),
+                preview: serde_json::json!({"name": item.name, "subtype":item.subtype}),
             })
             .await
             .map_err(explain)
@@ -538,11 +703,13 @@ pub async fn refresh_item(
     id: Uuid,
     hide_adult: Option<bool>,
     discover: Option<bool>,
+    disabled_sites: Option<Vec<String>>,
     store: State<'_, CatalogStore>,
     capibara: State<'_, crate::capibara::Capibara>,
 ) -> CommandResult<RefreshItemResult> {
     let hide_adult = hide_adult.unwrap_or(false);
     let discover = discover.unwrap_or(false);
+    let disabled_sites = disabled_sites.unwrap_or_default();
     let db = store.inner().clone();
     let mut item = work(move || {
         db.item(id)
@@ -551,9 +718,10 @@ pub async fn refresh_item(
             .ok_or("El título ya no está en la biblioteca.".into())
     })
     .await?;
-    let initial_snapshot = serde_json::to_value(&item).map_err(|e| e.to_string())?;
+    let initial_snapshot = item.clone();
     let mut sources_checked = Vec::new();
     let mut errors = Vec::new();
+    let mut wrong_book_binding = false;
 
     // 1. Refresh from connected UMD server if configured.
     if store
@@ -566,8 +734,11 @@ pub async fn refresh_item(
             Ok(doc) => {
                 if let Some(incoming) = doc.items.into_iter().next() {
                     let db = store.inner().clone();
-                    match work(move || db.merge_remote_item(id, incoming).map_err(|e| e.to_string()))
-                        .await
+                    match work(move || {
+                        db.merge_remote_item(id, incoming)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await
                     {
                         Ok((merged, _)) => {
                             item = merged;
@@ -583,7 +754,11 @@ pub async fn refresh_item(
 
     // 2. Collect all linked providers (onlineProviders metadata + crawl bindings + capibara).
     let mut linked: Vec<(String, String)> = Vec::new();
-    if let Some(map) = item.metadata.get("onlineProviders").and_then(Value::as_object) {
+    if let Some(map) = item
+        .metadata
+        .get("onlineProviders")
+        .and_then(Value::as_object)
+    {
         for (site, ext) in map {
             if let Some(ext_str) = ext.as_str().filter(|s| !s.trim().is_empty()) {
                 linked.push((site.clone(), ext_str.to_owned()));
@@ -605,17 +780,23 @@ pub async fn refresh_item(
             linked.push(("capibaratraductor".into(), cap_id.to_string()));
         }
     }
+    linked.retain(|(site, _)| !disabled_sites.contains(site));
 
     // 3. Refresh each linked provider edition.
     for (site, external) in &linked {
-        if site != "capibaratraductor"
-            && !site.starts_with("json-")
-            && Site::parse(site).is_none()
+        if site != "capibaratraductor" && !site.starts_with("json-") && Site::parse(site).is_none()
         {
             continue;
         }
         match fetch_linked_provider_detail(id, &item, site, external, &capibara).await {
             Ok(fresh) => {
+                if item.media_type.eq_ignore_ascii_case("book")
+                    && !crate::chapter_lookup::same_edition(&item, &fresh)
+                {
+                    wrong_book_binding = true;
+                    errors.push(format!("{site}: La fuente corresponde a otra edición."));
+                    continue;
+                }
                 if hide_adult && fresh.adult() {
                     continue;
                 }
@@ -647,10 +828,13 @@ pub async fn refresh_item(
         .get("thumbnailRef")
         .and_then(Value::as_str)
         .is_none_or(|s| s.trim().is_empty());
-    if (discover && linked.is_empty()) || (discover && missing_artwork && sources_checked.is_empty())
+    if discover
+        && (linked.is_empty()
+            || wrong_book_binding
+            || missing_artwork && sources_checked.is_empty())
     {
         if let Some((site, external, fresh)) =
-            crate::chapter_lookup::discover_best_match(&item, &capibara).await
+            crate::chapter_lookup::discover_best_match(&item, &capibara, &disabled_sites).await
         {
             if !(hide_adult && fresh.adult()) {
                 let db = store.inner().clone();
@@ -673,10 +857,10 @@ pub async fn refresh_item(
         }
     }
 
-    let final_snapshot = serde_json::to_value(&item).map_err(|e| e.to_string())?;
+    let changed = item != initial_snapshot;
     Ok(RefreshItemResult {
         item,
-        changed: final_snapshot != initial_snapshot,
+        changed,
         sources_checked,
         errors,
     })
@@ -718,36 +902,51 @@ pub async fn provider_unit(
             .ok_or("Título desconocido.".into())
     })
     .await?;
+    if item.media_type.eq_ignore_ascii_case("book")
+        && !(item.matches_subtype_group("manga") || item.matches_subtype_group("comic"))
+    {
+        return Err("Esta edición no usa un lector de páginas ilustradas.".into());
+    }
     let external = item
         .metadata
         .get("onlineProviders")
         .and_then(|links| links.get(&site))
         .and_then(Value::as_str)
         .ok_or("Título sin vínculo con el proveedor.")?;
+    provider_content(&site, external, &item.name, &number, season).await
+}
+
+pub(crate) async fn provider_content(
+    site: &str,
+    external: &str,
+    name: &str,
+    number: &str,
+    season: Option<u32>,
+) -> CommandResult<Value> {
     let entry = Entry {
         external_id: external.into(),
-        preview: serde_json::json!({"name":item.name}),
+        preview: serde_json::json!({"name":name}),
     };
-    let mut provider = open(&site).await?;
-    match site.as_str() {
+    let mut provider = open(site).await?;
+    match site {
         "jkanime" if season.is_none() => Ok(Value::Array(
             provider
-                .jk_streams(external, &number)
+                .jk_streams(external, number)
                 .await
                 .map_err(explain)?,
         )),
         "doramasflix" => Ok(Value::Array(
             provider
-                .doramas_streams(external, season, &number)
+                .doramas_streams(external, season, number)
                 .await
                 .map_err(explain)?,
         )),
         "manhwaweb" if season.is_none() => Ok(serde_json::json!(provider
-            .manhwa_images(external, &number)
+            .manhwa_images(external, number)
             .await
             .map_err(explain)?)),
         "olympusxyz" if season.is_none() => Ok(serde_json::json!(provider
-            .reader_pages(&entry, &number)
+            .reader_pages(&entry, number)
             .await
             .map_err(explain)?)),
         "framextv" => Ok(Value::Array(
@@ -762,28 +961,28 @@ pub async fn provider_unit(
         )),
         "animetmo" if season.is_none() => Ok(Value::Array(
             provider
-                .anime_streams(external, &number)
+                .anime_streams(external, number)
                 .await
                 .map_err(explain)?,
         )),
-        _ if matches!(Site::parse(&site), Some(Site::Cinema(_))) => Ok(Value::Array(
+        _ if matches!(Site::parse(site), Some(Site::Cinema(_))) => Ok(Value::Array(
             provider
-                .cinema_streams(external, season, &number)
+                .cinema_streams(external, season, number)
                 .await
                 .map_err(explain)?,
         )),
         "animeav1" if season.is_none() => Ok(Value::Array(
             provider
-                .av1_streams(external, &number)
+                .av1_streams(external, number)
                 .await
                 .map_err(explain)?,
         )),
-        _ if season.is_none() && matches!(Site::parse(&site), Some(Site::Manga(_))) => {
-            let Some(Site::Manga(manga)) = Site::parse(&site) else {
+        _ if season.is_none() && matches!(Site::parse(site), Some(Site::Manga(_))) => {
+            let Some(Site::Manga(manga)) = Site::parse(site) else {
                 unreachable!()
             };
             Ok(serde_json::json!(provider
-                .manga_images(manga, external, &number)
+                .manga_images(manga, external, number)
                 .await
                 .map_err(explain)?))
         }
@@ -801,4 +1000,64 @@ pub fn open_provider_player(app: tauri::AppHandle, address: String) -> CommandRe
     app.opener()
         .open_url(url.as_str(), None::<String>)
         .map_err(|_| "No se pudo abrir el navegador.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        http::{header, HeaderMap},
+        routing::get,
+        Router,
+    };
+
+    #[tokio::test]
+    async fn cookies_survive_a_rebuilt_client_and_stay_with_their_provider() {
+        let app = Router::new()
+            .route(
+                "/start",
+                get(|| async { ([(header::SET_COOKIE, "session=fixture; Path=/")], "ok") }),
+            )
+            .route(
+                "/session",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get(header::COOKIE)
+                        .map(|value| value.to_str().unwrap().to_owned())
+                        .unwrap_or_default()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = format!("http://{address}");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cache = ProviderCache::default();
+        let client = |cache: &mut ProviderCache, id: &str| {
+            umd_providers::browser_http::client_builder()
+                .cookie_provider(cache.cookies(id))
+                .no_proxy()
+                .build()
+                .unwrap()
+        };
+
+        client(&mut cache, "jkanime")
+            .get(format!("{root}/start"))
+            .send()
+            .await
+            .unwrap();
+        cache.clients.clear();
+
+        for (id, expected) in [("jkanime", "session=fixture"), ("animeav1", "")] {
+            let sent_cookie = client(&mut cache, id)
+                .get(format!("{root}/session"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(sent_cookie, expected);
+        }
+        server.abort();
+    }
 }

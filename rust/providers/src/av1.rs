@@ -64,9 +64,10 @@ fn slug(s: &str) -> bool {
 }
 
 fn av1_artwork(id: Option<&str>, folder: &str, suffix: &str) -> Option<String> {
+    static CDN: std::sync::LazyLock<Url> =
+        std::sync::LazyLock::new(|| Url::parse("https://cdn.animeav1.com/").unwrap());
     let numeric_id = id?.trim().parse::<u64>().ok().filter(|n| *n > 0)?;
-    let cdn = Url::parse("https://cdn.animeav1.com/").ok()?;
-    artwork_url(&cdn, Some(&format!("{folder}/{numeric_id}{suffix}.jpg")))
+    artwork_url(&CDN, Some(&format!("{folder}/{numeric_id}{suffix}.jpg")))
 }
 
 fn map(base: &Url, media: Node<'_>) -> Result<Entry> {
