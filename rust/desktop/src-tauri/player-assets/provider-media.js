@@ -32,6 +32,16 @@
     const direct = secure(best.currentSrc);
     if (direct) return [direct];
     if (!best.currentSrc.startsWith("blob:")) return [];
+    let activeSource = null;
+    const player = best.closest?.(".jwplayer[id]");
+    if (player && typeof owner?.jwplayer === "function") {
+      try {
+        const item = owner.jwplayer(player.id).getPlaylistItem();
+        const source = item?.sources?.[0];
+        if (item?.drm || source?.drm) return [];
+        activeSource = secure(source?.file ?? item?.file);
+      } catch {}
+    }
     try {
       const entries = owner.performance.getEntriesByType("resource");
       const manifests = entries.slice(-160)
@@ -43,8 +53,10 @@
           return /\.(?:m3u8|mpd)$/i.test(path) && !/(?:^|[/_-])(?:audio|subtitles?|captions?)(?:[/_.-]|$)/i.test(path);
         });
       const rank = url => /(?:^|[/_-])(?:master|manifest|index)(?:[/_.-]|$)/i.test(new URL(url).pathname) ? 0 : 1;
-      return [...new Set(manifests)].sort((a, b) => rank(a) - rank(b)).slice(0, 4);
-    } catch { return []; }
+      manifests.sort((a, b) => rank(a) - rank(b));
+      if (activeSource) manifests.unshift(activeSource);
+      return [...new Set(manifests)].slice(0, 4);
+    } catch { return activeSource ? [activeSource] : []; }
   }
   if (action === "public-source" || action === "frame-source") {
     if (action === "frame-source" && (best.paused || best.ended || best.readyState < 2)) return null;

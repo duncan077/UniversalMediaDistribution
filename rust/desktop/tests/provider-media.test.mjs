@@ -49,3 +49,36 @@ test("public handoff only offers ordinary HTTPS media", () => {
     assert.equal(sample("public-source"),null);
   }
 });
+
+test("handoff recognizes the active JW Player HLS source without a file extension", () => {
+  const file = "https://media.example.org/?s=fixture";
+  const fallback = "https://media.example.org/master.m3u8";
+  const selected = {file, type: "hls"};
+  const owner = {
+    location: new URL("https://nupload.my/watch/fixture"),
+    jwplayer(id) {
+      assert.equal(id, "player");
+      return {getPlaylistItem: () => ({sources: [selected], file: fallback})};
+    },
+    performance: {getEntriesByType: () => [
+      {initiatorType: "xmlhttprequest", name: file},
+      {initiatorType: "xmlhttprequest", name: fallback},
+    ]},
+  };
+  const video = {
+    currentSrc: "blob:https://nupload.my/fixture", currentTime: 12, readyState: 4,
+    paused: false, closest: () => ({id: "player"}),
+    getBoundingClientRect: () => ({width: 640, height: 360}),
+  };
+  const doc = {
+    URL: owner.location.href, defaultView: owner,
+    querySelectorAll: selector => selector === "iframe" ? [] : [video],
+  };
+  video.ownerDocument = doc;
+  const window = {};
+  const sample = runInNewContext(script, {document: doc, URL, self: window, top: window});
+  assert.deepEqual([...sample("public-source").addresses], [file, fallback]);
+  assert.deepEqual([...sample("frame-source").addresses], [file, fallback]);
+  selected.drm = {widevine: {url: "https://license.example.org"}};
+  assert.equal(sample("public-source"), null);
+});
