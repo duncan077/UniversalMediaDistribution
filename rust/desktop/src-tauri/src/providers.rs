@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 use tauri::State;
-use umd_core::{CatalogItem, CatalogStore};
+use umd_core::{CatalogItem, CatalogQuery, CatalogStore};
 use umd_providers::{Entry, Page, Provider, Site};
 use uuid::Uuid;
 
@@ -211,6 +211,10 @@ pub async fn json_provider_search(
     if let Some(cursor) = cursor {
         url.query_pairs_mut().append_pair("cursor", &cursor);
     }
+    json_provider_page(url).await
+}
+
+async fn json_provider_page(url: reqwest::Url) -> CommandResult<(Vec<CatalogItem>, Option<String>, bool)> {
     let response = crate::streams::get_public(url, std::time::Duration::from_secs(20)).await?;
     let next = response
         .headers()
@@ -230,6 +234,80 @@ pub async fn json_provider_search(
         item.sync_id = Some(item.id().map_err(|e| e.to_string())?);
     }
     Ok((doc.items, next, summary))
+}
+
+#[derive(serde::Serialize)]
+pub struct FilteredProviderHit {
+    item: CatalogItem,
+    entry: Option<Entry>,
+}
+
+#[tauri::command]
+pub async fn filtered_provider_page(
+    site: String,
+    query: CatalogQuery,
+    hide_adult: bool,
+) -> CommandResult<(Vec<FilteredProviderHit>, Option<String>)> {
+    query.validate().map_err(|e| e.to_string())?;
+    let filters = &query.filters;
+    if query.favorites_only || filters.list_id.is_some() || filters.genre.is_none() && filters.year.is_none() {
+        return Ok((vec![], None));
+    }
+    if site.starts_with("json-") {
+        let mut url = location(&site).ok_or("Proveedor desconocido.")?
+            .join("search").map_err(|e| e.to_string())?;
+        url.query_pairs_mut()
+            .append_pair("browse", "true")
+            .append_pair("summary", "true")
+            .append_pair("limit", "25");
+        let year = filters.year.map(|year| year.to_string());
+        for (key, value) in [
+            ("q", Some(query.q.as_str())),
+            ("year", year.as_deref()),
+            ("genre", filters.genre.as_deref()),
+            ("mediaType", query.media_type.as_deref()),
+            ("subtypeGroup", filters.subtype_group.as_deref()),
+            ("category", filters.category.as_deref()),
+            ("status", filters.status.as_deref()),
+            ("provider", filters.provider.as_deref()),
+            ("cursor", query.cursor.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|text| !text.is_empty()) { url.query_pairs_mut().append_pair(key, value); }
+        }
+        let (items, next, _) = json_provider_page(url).await?;
+        let items = items.into_iter().filter(|item| !hide_adult || !item.adult())
+            .map(|item| FilteredProviderHit {item, entry: None}).collect();
+        return Ok((items, next));
+    }
+    if !Site::parse(&site).is_some_and(|site| {
+        let (media, group) = match site {
+            Site::Manhwa | Site::Manga(_) => ("book", None),
+            Site::AnimeTmo | Site::Jk => ("movie", Some("anime")),
+            _ => ("movie", Some("liveAction")),
+        };
+        site.supports_metadata_search(filters.year.is_some())
+            && query.media_type.as_deref().is_none_or(|wanted| media.eq_ignore_ascii_case(wanted))
+            && group.zip(filters.subtype_group.as_deref()).is_none_or(|(site, wanted)| site.eq_ignore_ascii_case(wanted))
+    })
+        || filters.status.is_some() || filters.category.is_some() || filters.provider.is_some() {
+        return Ok((vec![], None));
+    }
+    let page = open(&site).await?.search_metadata(
+        &query.q, filters.genre.as_deref(), filters.year.map(|year| year as u16), query.cursor.as_deref(),
+    ).await.map_err(explain)?;
+    let items = page.items.into_iter().filter_map(|entry| {
+        let mut item: CatalogItem = serde_json::from_value(entry.preview.clone()).ok()?;
+        if query.media_type.as_ref().is_some_and(|m| !item.media_type.eq_ignore_ascii_case(m))
+            || filters.subtype_group.as_ref().is_some_and(|g| !item.matches_subtype_group(g))
+            || hide_adult && item.adult() {
+            return None;
+        }
+        let id = format!("umd:preview:{site}:{}",entry.external_id);
+        item.sync_id = Some(Uuid::new_v5(&Uuid::NAMESPACE_URL,id.as_bytes()));
+        item.metadata.insert("onlineProviders".into(), serde_json::json!({(&site): &entry.external_id}));
+        Some(FilteredProviderHit { item, entry: Some(entry) })
+    }).collect();
+    Ok((items, page.next))
 }
 #[tauri::command]
 pub async fn json_provider_add(
@@ -656,8 +734,8 @@ async fn fetch_linked_provider_detail(
         {
             e
         } else {
-            let target = umd_core::capibara::edition_id(id)
-                .or_else(|| external.parse().ok())
+            let target = umd_core::capibara::edition_reference(external)
+                .or_else(|| umd_core::capibara::edition_id(id).map(|_| id))
                 .ok_or("Edición desconocida.")?;
             capibara
                 .search(&item.name, 1)
@@ -665,7 +743,7 @@ async fn fetch_linked_provider_detail(
                 .items
                 .into_iter()
                 .map(|h| h.edition)
-                .find(|e| e.id == target)
+                .find(|e| e.sync_id() == target)
                 .ok_or("Edición desconocida.")?
         };
         let mut fresh = capibara.edition_detail(&edition).await?;
@@ -703,6 +781,7 @@ pub async fn refresh_item(
     id: Uuid,
     hide_adult: Option<bool>,
     discover: Option<bool>,
+    refresh_server: Option<bool>,
     disabled_sites: Option<Vec<String>>,
     store: State<'_, CatalogStore>,
     capibara: State<'_, crate::capibara::Capibara>,
@@ -724,7 +803,7 @@ pub async fn refresh_item(
     let mut wrong_book_binding = false;
 
     // 1. Refresh from connected UMD server if configured.
-    if store
+    if refresh_server.unwrap_or(true) && store
         .setting("server_url")
         .ok()
         .flatten()
@@ -821,18 +900,7 @@ pub async fn refresh_item(
         }
     }
 
-    // 4. If manually requested (or still missing artwork with no linked providers),
-    //    try a strict high-confidence provider match to populate chapters and cover.
-    let missing_artwork = item
-        .metadata
-        .get("thumbnailRef")
-        .and_then(Value::as_str)
-        .is_none_or(|s| s.trim().is_empty());
-    if discover
-        && (linked.is_empty()
-            || wrong_book_binding
-            || missing_artwork && sources_checked.is_empty())
-    {
+    if discover && (wrong_book_binding || sources_checked.iter().all(|site| site == "server")) {
         if let Some((site, external, fresh)) =
             crate::chapter_lookup::discover_best_match(&item, &capibara, &disabled_sites).await
         {

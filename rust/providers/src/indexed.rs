@@ -150,6 +150,13 @@ struct AnimePreview {
 }
 
 impl CompactEntry {
+    pub(super) fn matches_metadata(&self, genre: Option<&str>, year: Option<u16>) -> bool {
+        self.anime.as_ref().is_some_and(|anime| {
+            year.is_none_or(|year| anime.year == Some(year))
+                && genre.is_none_or(|genre| super::filtered::matches_genre(&anime.genres, genre))
+        })
+    }
+
     pub(super) fn entry(&self) -> Entry {
         let Some(anime) = &self.anime else {
             return book(

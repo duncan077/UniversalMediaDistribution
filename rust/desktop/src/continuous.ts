@@ -14,7 +14,7 @@ export function continuousReader(
   count: number,
   initialPage: number,
   draw: (page: number, target: HTMLElement, signal: AbortSignal) => Promise<void>,
-  onPage: (page: number) => void,
+  onPage: (page: number, completed: boolean) => void,
   onEvict?: (page: number) => void,
   keepPerSide = 3,
 ) {
@@ -32,8 +32,12 @@ export function continuousReader(
   let closed = false;
   let frame = 0;
   let current = initialPage;
+  let lastReady = false;
+  let finished = false;
+  const atEnd = () => lastReady && viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2;
 
   function evict(num: number) {
+    if (num === count) lastReady = false;
     retained.get(num)?.abort();
     retained.delete(num);
     const page = pages[num - 1];
@@ -61,7 +65,10 @@ export function continuousReader(
       const content = document.createElement("div");
       page.append(content);
       void draw(num, content, controller.signal).then(() => {
-        if (!controller.signal.aborted) page.style.minHeight = Math.max(60, content.offsetHeight) + "px";
+        if (!controller.signal.aborted) {
+          page.style.minHeight = Math.max(60, content.offsetHeight) + "px";
+          if (num === count) { lastReady = true; scroll(); }
+        }
       }).catch(e => {
         if (!controller.signal.aborted) content.textContent = String(e);
       }).finally(() => {
@@ -80,18 +87,27 @@ export function continuousReader(
       if (pages[mid].getBoundingClientRect().bottom < anchor) low = mid + 1;
       else high = mid;
     }
-    const page = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2 ? count : low + 1;
-    if (page !== current) { current = page; onPage(page); reconcile(); }
+    const completed = atEnd();
+    const page = completed ? count : low + 1;
+    if (page !== current || completed !== finished) {
+      current = page;
+      finished = completed;
+      onPage(page, completed);
+      reconcile();
+    }
   };
   const scroll = () => { if (!frame) frame = requestAnimationFrame(update); };
   const go = (page: number) => {
     pages[page - 1].scrollIntoView({block: "start"});
-    current = page; onPage(page); reconcile();
+    current = page;
+    finished = atEnd();
+    onPage(page, finished);
+    reconcile();
   };
   viewport.replaceChildren(list);
   viewport.addEventListener("scroll", scroll, {passive: true});
   go(initialPage);
-  return {go, close() {
+  return {go, atEnd, close() {
     closed = true;
     viewport.removeEventListener("scroll", scroll);
     cancelAnimationFrame(frame);

@@ -12,6 +12,7 @@ import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {queueCatalogDownload} from "./downloads";
 import {continuousReader} from "./continuous";
 import {drawImageTiles} from "./reader-tiles";
+import {artworkSource} from "./artwork";
 import {attachPartyPlayer, samePartyUnit, type ContentUnit} from "./party";
 import {isPageActive} from "./router";
 import {catalogGroup} from "./catalog-types";
@@ -495,42 +496,56 @@ export function contentControls(
     return null;
   }
 
-  async function openEntryQuick(entry: Entry, cardEl?: HTMLElement): Promise<boolean> {
-    const nav = makeChapterNav(entry);
-    // 1. Reader provider (direct images -> opens right into Reader!)
+  type FoundSource = { site: string; title: string; edition: unknown };
+
+  async function openEntryQuick(entry: Entry, preferred?: string): Promise<boolean> {
+    const nav = makeChapterNav(entry, preferred);
     const prov = primaryProviderFor(entry);
-    if (prov && prov.reader && entry.target.displayNumber) {
+    const number = entry.target.displayNumber;
+    if (illustrated && entry.target.unitKind === "chapter" && number) {
+      const candidates = [...new Set([
+        preferred,
+        ...PROVIDERS.filter(([id]) => READER_PROVIDERS.has(id) && enabledLinks.has(id)).map(([id]) => id),
+        capibaraLinked ? "capibaratraductor" : undefined,
+      ])].filter((id): id is string => !!id && providerEnabled(profileId, id));
+      const args = {id: item.syncId, number, season: entry.target.seasonNumber};
+      const read = async (site: string, raw: string[]) => {
+        const urls = raw.map(remoteUrl).filter((url): url is string => url !== null);
+        if (!urls.length || !isAlive()) return false;
+        listStatus.textContent = "";
+        await play(entry, "images", urls, report, false, undefined, makeChapterNav(entry, preferred ?? site));
+        return true;
+      };
       listStatus.textContent = ui("Abriendo {0}…", entry.unitHeading);
       try {
-        const urls = (await invoke<string[]>("provider_unit", {
-          site: prov.id, id: item.syncId, number: entry.target.displayNumber, season: entry.target.seasonNumber,
-        })).map(remoteUrl).filter((u): u is string => u !== null);
-        if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
-        listStatus.textContent = "";
-        if (isAlive()) await play(entry, "images", urls, report, false, undefined, nav);
-        return true;
-      } catch (e) {
-        listStatus.textContent = "";
-        report(String(e), true);
-        return false;
-      }
-    }
-    // 2. CapibaraTraductor or chapter lookup for books
-    if (isBook && entry.target.unitKind === "chapter" && entry.target.seasonNumber === null && entry.target.displayNumber) {
-      if (capibaraLinked) {
-        listStatus.textContent = ui("Abriendo {0}…", entry.unitHeading);
-        try {
-          const rawUrls = await invoke<string[]>("capibara_pages", { id: item.syncId, chapter: entry.target.displayNumber });
-          const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
-          if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
-          listStatus.textContent = "";
-          if (isAlive()) await play(entry, "images", urls, report, false, undefined, nav);
-          return true;
-        } catch (e) {
-          listStatus.textContent = "";
-          report(String(e), true);
-          return false;
+        for (const site of candidates) {
+          if (!isAlive()) return false;
+          try {
+            const raw = site === "capibaratraductor"
+              ? await invoke<string[]>("capibara_pages", {id: item.syncId, chapter: number})
+              : await invoke<string[]>("provider_unit", {...args, site});
+            if (await read(site, raw)) return true;
+          } catch { /* The chapter may be absent in this edition. */ }
         }
+        if (preferred && canFindChapter && isAlive()) {
+          const found: FoundSource[] = [];
+          const matches = new Channel<FoundSource[]>();
+          matches.onmessage = batch => { if (isAlive()) found.push(...batch); };
+          const hideAdult = getProfilePref(profileId, "umd-hide-adult") === "true";
+          await invokeProfile("find_unit_sources", {...args, hideAdult, matches});
+          found.sort((a, b) => Number(b.site === preferred) - Number(a.site === preferred));
+          for (const choice of found.slice(0, 6)) {
+            if (!isAlive()) return false;
+            try {
+              const raw = await invoke<string[]>("select_unit_source", {...args, hideAdult, choice});
+              if (await read(choice.site, raw)) return true;
+            } catch { /* Continue with the remaining providers. */ }
+          }
+        }
+      } catch (error) {
+        if (isAlive()) report(String(error), true);
+      } finally {
+        listStatus.textContent = "";
       }
     }
     // 3. Direct catalog source URL
@@ -540,11 +555,12 @@ export function contentControls(
       await openCatalogSource(entry, source, url, nav);
       return true;
     }
+    if (preferred && illustrated && entry.target.unitKind === "chapter") return false;
     // 4. Video provider -> trigger inline picker on card or scroll card into view
     if (prov && !prov.reader || canFindChapter || canFindVideo) {
-      const targetCard = cardEl ?? listHost.querySelector<HTMLElement>(`[data-entry-index="${entry.index}"]`);
+      const targetCard = listHost.querySelector<HTMLElement>(`[data-entry-index="${entry.index}"]`);
       if (targetCard) {
-        if (!cardEl) targetCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        targetCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
         const trigger = targetCard.querySelector<HTMLButtonElement>("[data-provider-trigger], [data-source-discovery]");
         trigger?.click();
         return !!trigger;
@@ -594,7 +610,7 @@ export function contentControls(
     }
   }
 
-  function makeChapterNav(entry: Entry): ChapterNav | undefined {
+  function makeChapterNav(entry: Entry, preferred?: string): ChapterNav | undefined {
     if (available.length <= 1) return undefined;
     const prevEntry = entry.index > 0 ? available[entry.index - 1] : null;
     const nextEntry = entry.index + 1 < available.length ? available[entry.index + 1] : null;
@@ -603,8 +619,10 @@ export function contentControls(
       hasNext: !!nextEntry,
       prevLabel: prevEntry ? prevEntry.unitHeading : "",
       nextLabel: nextEntry ? nextEntry.unitHeading : "",
-      openPrev: () => { if (prevEntry) void openEntryQuick(prevEntry); },
-      openNext: () => { if (nextEntry) void openEntryQuick(nextEntry); },
+      openPrev: () => { if (prevEntry) void openEntryQuick(prevEntry, preferred); },
+      openNext: () => { if (nextEntry) void openEntryQuick(nextEntry, preferred).then(opened => {
+        if (!opened && isAlive()) report(ui("No se encontraron proveedores para esta unidad."), true);
+      }); },
     };
   }
 
@@ -841,7 +859,7 @@ export function contentControls(
               .map(remoteUrl)
               .filter((u): u is string => u !== null);
             if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
-            if (isAlive() && card.isConnected) await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry));
+            if (isAlive() && card.isConnected) await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, provider));
           } else {
             const sources = await invoke<VideoChoice[]>("provider_unit", args);
             showVideoSources(sources, provider, name);
@@ -876,7 +894,7 @@ export function contentControls(
             const urls = rawUrls.map(remoteUrl).filter((u): u is string => u !== null);
             if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
             reportProvider("");
-            if (isAlive() && card.isConnected) await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry));
+            if (isAlive() && card.isConnected) await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, "capibaratraductor"));
           } catch (e) {
             reportProvider(String(e), true);
           } finally {
@@ -919,8 +937,7 @@ export function contentControls(
           id: item.syncId, number, season: entry.target.seasonNumber,
           hideAdult: getProfilePref(profileId, "umd-hide-adult") === "true",
         };
-        type Found = { site: string; title: string; edition: unknown };
-        const matches = new Channel<Found[]>();
+        const matches = new Channel<FoundSource[]>();
         matches.onmessage = found => {
           if (!isCurrent()) return;
           for (const choice of found) {
@@ -938,7 +955,7 @@ export function contentControls(
                 if (findChapter) {
                   const urls = (result as string[]).map(remoteUrl).filter((u): u is string => u !== null);
                   if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
-                  await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry));
+                  await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, choice.site));
                 } else {
                   ++discovery;
                   delete card.dataset.providerBusy;
@@ -1421,8 +1438,11 @@ async function play(
     if (android) engines.add(new Option("Android", "android"));
     engines.add(new Option("VLC", "vlc"));
     const playback: PlaybackChoices = choices ?? {sources:[],index:0,attempted:new Set()};
-    engines.value = playback.engine || getProfilePref(profileId, "umd-video-engine") || (android ? "android" : "web");
-    if (!engines.value) engines.value = "web";
+    const windows = /Windows/i.test(navigator.userAgent);
+    const preferred = playback.engine || getProfilePref(profileId, "umd-video-engine");
+    const defaultEngine = android ? "android" : windows && stream?.live ? "vlc" : "web";
+    engines.value = preferred || defaultEngine;
+    if (!engines.value) engines.value = defaultEngine;
     const triedEngines = playback.triedEngines ?? new Set<string>();
     triedEngines.add(engines.value);
 
@@ -1497,7 +1517,7 @@ async function play(
       servers = select;
     }
     let wireless:HTMLButtonElement|undefined;
-    if (/Windows/i.test(navigator.userAgent)) {
+    if (windows) {
       wireless = node("button", ui("Pantalla inalámbrica"), "quiet-btn");
       wireless.type = "button";
       wireless.onclick = async () => {
@@ -1691,9 +1711,10 @@ async function play(
   let page = Math.max(1, Math.floor(saved?.positionKind === "page" ? saved.position : 1));
   let pages = safeUrls.length;
   let shownPage = 0;
-  let readingMode: "paged" | "continuous" = "paged";
-  let zoomPercent = Math.min(200, Math.max(50, Number(getProfilePref(activeProfileId(),"reader-zoom")) || 100));
-  let epubFontRem = Math.min(2,Math.max(.85,Number(getProfilePref(activeProfileId(),"epub-font")) || 1.12));
+  const defaultMode = getProfilePref(profileId, "reader-mode") === "continuous" ? "continuous" : "paged";
+  let readingMode: "paged" | "continuous" = defaultMode;
+  let zoomPercent = Math.min(200, Math.max(50, Number(getProfilePref(profileId,"reader-zoom")) || 100));
+  let epubFontRem = Math.min(2,Math.max(.85,Number(getProfilePref(profileId,"epub-font")) || 1.12));
 
   const toolbar = node("div", undefined, "reader-controls");
   viewport.tabIndex = 0;
@@ -1787,7 +1808,8 @@ async function play(
   }, { passive: true });
 
   dialog.classList.add("immersive-reader");
-  const motion = readerMotion(viewport, toolbar);
+  let readerEnd = () => {};
+  const motion = readerMotion(viewport, toolbar, () => readerEnd());
   dialog.addEventListener("close", () => motion.close(), { once: true });
 
   const pdfjs = kind === "pdf" ? await import("pdfjs-dist") : null;
@@ -1886,18 +1908,27 @@ async function play(
         container.append(image);
         const cancel = () => image.removeAttribute("src");
         signal.addEventListener("abort", cancel, {once: true});
-        try { await image.decode(); }
-        finally { signal.removeEventListener("abort", cancel); }
+        try {
+          await image.decode();
+        } catch (e) {
+          const host = new URL(pageUrl).hostname;
+          if (signal.aborted || !remoteUrl(pageUrl) || host === "localhost" || host.endsWith(".localhost")) throw e;
+          image.src = artworkSource(pageUrl);
+          await image.decode();
+        } finally {
+          signal.removeEventListener("abort", cancel);
+        }
       }
     };
 
-    const update = (value: number) => {
+    const atPageEnd = () => viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2;
+    const update = (value: number, completed = value === pages && atPageEnd()) => {
       page = shownPage = value;
       position.value = String(page);
       if (chapterSelect) chapterSelect.value = String(page);
       prev.disabled = page <= 1;
       next.disabled = page >= pages;
-      if (entry.target) persist(entry.target, page, "page", page === pages, error);
+      if (entry.target) persist(entry.target, page, "page", completed, error);
     };
 
     const render = async () => {
@@ -1932,6 +1963,53 @@ async function play(
       else void render();
     };
 
+    let changingChapter = false;
+    const nextChapter = () => {
+      if (closed || !dialog.open || changingChapter || !chapterNav?.hasNext) return false;
+      changingChapter = true;
+      if (entry.target) persist(entry.target, pages, "page", true, error);
+      dialog.addEventListener("close", () => chapterNav.openNext(), {once:true});
+      dialog.close();
+      return true;
+    };
+    let downwardUntil = 0;
+    const atBottom = () => continuous ? continuous.atEnd() : atPageEnd();
+    const turnDown = () => {
+      if (closed || rendering || (!continuous && shownPage !== page) || !atBottom()) return false;
+      if (continuous || page >= pages) return nextChapter();
+      go(page + 1);
+      return true;
+    };
+    readerEnd = () => { if (continuous) turnDown(); };
+    viewport.addEventListener("scroll", () => {
+      if (continuous && performance.now() <= downwardUntil && continuous.atEnd()) nextChapter();
+    }, {passive:true});
+    let lastWheel = -Infinity;
+    let wheelTurned = false;
+    viewport.addEventListener("wheel", event => {
+      if (event.deltaY < 0) downwardUntil = 0;
+      if (event.ctrlKey || event.deltaY <= 0 || Math.abs(event.deltaX) >= event.deltaY) return;
+      const now = performance.now();
+      if (now - lastWheel > 180) wheelTurned = false;
+      lastWheel = now;
+      downwardUntil = now + 450;
+      wheelTurned ||= turnDown();
+      if (wheelTurned) event.preventDefault();
+    }, {passive:false});
+    let touchStart: {x:number;y:number} | undefined;
+    viewport.addEventListener("touchstart", event => {
+      const point = event.touches.length === 1 ? event.touches[0] : null;
+      touchStart = point ? {x:point.clientX,y:point.clientY} : undefined;
+    }, {passive:true});
+    viewport.addEventListener("touchend", event => {
+      const start = touchStart, end = event.changedTouches[0];
+      touchStart = undefined;
+      if (!start || !end || start.y - end.clientY < Math.max(24, Math.abs(start.x - end.clientX))) return;
+      downwardUntil = performance.now() + 1200;
+      turnDown();
+    }, {passive:true});
+    viewport.addEventListener("touchcancel", () => { touchStart = undefined; }, {passive:true});
+
     prev.addEventListener("click", () => go(page - 1));
     next.addEventListener("click", () => go(page + 1));
     if(kind==="epub"){
@@ -1950,6 +2028,11 @@ async function play(
       const target = event.target as HTMLElement | null;
       if (target?.matches("input,select")) return;
       const isTv = document.documentElement.classList.contains("television");
+      if ((target === viewport || viewport.contains(target)) && (event.key === "ArrowDown" || event.key === "PageDown")) {
+        downwardUntil = performance.now() + 450;
+        if (turnDown()) event.preventDefault();
+        return;
+      }
       if (isTv && (continuous || target !== viewport)) return;
       if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
         event.preventDefault();
@@ -1989,10 +2072,11 @@ async function play(
 
     const switchMode = async (nextMode: "paged" | "continuous") => {
       if (readingMode === nextMode) return;
-      readingMode = nextMode;
       pagedBtn.disabled = contBtn.disabled = true;
       try {
-        if (entry.target) await invokeProfile("reader_mode", { id: entry.target.itemId, mode: readingMode });
+        await writeProfilePref("reader-mode", nextMode);
+        if (entry.target) await invokeProfile("reader_mode", { id: entry.target.itemId, mode: nextMode });
+        readingMode = nextMode;
         if (!closed) await applyMode();
       } catch (e) {
         error(e);
@@ -2005,7 +2089,7 @@ async function play(
     contBtn.onclick = () => void switchMode("continuous");
 
     if (entry.target) {
-      const savedMode = await invokeProfile<string>("reader_mode", { id: entry.target.itemId, mode: null });
+      const savedMode = await invokeProfile<string>("reader_mode", { id: entry.target.itemId, mode: null, fallback: defaultMode }).catch(() => defaultMode);
       readingMode = savedMode === "continuous" ? "continuous" : "paged";
     }
     if (closed) return;

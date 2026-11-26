@@ -1187,10 +1187,11 @@ fn grid_channels(base: &Url, html: &str) -> (Vec<Channel>, Option<Url>) {
 #[tauri::command]
 pub async fn live_channels(address: String, grid: Option<bool>) -> CommandResult<Vec<Channel>> {
     let url = Url::parse(address.trim()).map_err(|_| "Dirección M3U inválida.")?;
-    let _permit = REQUESTS
-        .try_acquire()
-        .map_err(|_| "Hay otras fuentes cargando.")?;
     timeout(Duration::from_secs(35), async {
+        let _permit = REQUESTS
+            .acquire()
+            .await
+            .map_err(|_| "Hay otras fuentes cargando.")?;
         let response = get_public(url, Duration::from_secs(20)).await?;
         let base = response.url().clone();
         let body = bounded_text(response, 8 * 1024 * 1024).await?;

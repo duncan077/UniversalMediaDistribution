@@ -230,7 +230,7 @@ fn chapter_routes(base: &Url, v: &Value) -> Result<BTreeMap<String, (String, i64
 }
 
 impl Provider {
-    async fn manhwa_api(&mut self, route: &str) -> Result<Value> {
+    pub(super) async fn prepare_manhwa_api(&mut self) -> Result<()> {
         if self.api.is_none() {
             let path = {
                 let doc = Document::from(self.html("").await?);
@@ -241,6 +241,7 @@ impl Provider {
                     .await?,
             )
             .map_err(|_| invalid())?;
+            self.filter_genres = Some(super::filtered::script_genres(&js));
             let mut choices = Vec::new();
             for m in ASSIGN.captures_iter(&js) {
                 let var = &m[1];
@@ -278,9 +279,13 @@ impl Provider {
             };
             self.api = Some((url, client))
         }
-        let (base, client) = self.api.as_ref().ok_or_else(invalid)?;
-        let target = base.join(route).map_err(|_| invalid())?;
-        if target.origin() != base.origin() {
+        Ok(())
+    }
+    async fn manhwa_api(&mut self, route: &str) -> Result<Value> {
+        self.prepare_manhwa_api().await?;
+        let (url, client) = self.api.as_ref().ok_or_else(invalid)?;
+        let target = url.join(route).map_err(|_| invalid())?;
+        if target.origin() != url.origin() {
             return Err(invalid());
         }
         let req = client
@@ -290,17 +295,21 @@ impl Provider {
         self.send_json(req, 8 << 20).await
     }
     pub(super) async fn manhwa_page(&mut self, page: u32, q: Option<&str>) -> Result<Page> {
+        self.manhwa_library(page, q, None).await
+    }
+    pub(super) async fn manhwa_library(&mut self, page: u32, q: Option<&str>, genre: Option<&str>) -> Result<Page> {
         let term: String =
             url::form_urlencoded::byte_serialize(q.unwrap_or("").as_bytes()).collect();
-        let v=self.manhwa_api(&format!("manhwa/library?buscar={term}&estado=&tipo=&erotico=&demografia=&order_item=alfabetico&order_dir=desc&page={page}&generes=")).await?;
+        let genre_token = genre.unwrap_or("");
+        let v=self.manhwa_api(&format!("manhwa/library?buscar={term}&estado=&tipo=&erotico=&demografia=&order_item=alfabetico&order_dir=desc&page={page}&generes={genre_token}")).await?;
         let items = dedup(
             rows(&v["data"])?
                 .iter()
                 .filter_map(|v| map_item(&self.base, v, v["_id"].as_str()?, None)),
         );
-        let next =
-            (v["next"] == true).then(|| (page + if q.is_some() { 2 } else { 1 }).to_string());
-        if q.is_some() {
+        let filtered = q.is_some() || genre.is_some();
+        let next = (v["next"] == true).then(|| (page + if filtered { 2 } else { 1 }).to_string());
+        if q.is_some() || genre.is_some() {
             Ok(Page { items, next })
         } else {
             Page::directory(items, next)

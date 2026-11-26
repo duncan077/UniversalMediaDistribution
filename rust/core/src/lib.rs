@@ -5,10 +5,11 @@ pub use dotnet_backup::{legacy_private_settings, prepare_library_restore, Legacy
 pub mod capibara;
 pub mod public_url;
 mod scraped;
-pub use scraped::catalog_metadata_only;
+pub use scraped::{catalog_metadata_only, provider_reference};
 mod catalog;
 mod delta;
 mod filters;
+pub use filters::genre as normalize_genre;
 mod profiles;
 mod reconcile;
 mod reconcile_catalog;

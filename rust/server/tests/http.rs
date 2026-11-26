@@ -54,10 +54,14 @@ async fn filtered_summary_preserves_id_and_full_detail() {
 }
 
 fn app() -> axum::Router {
+    app_with_catalog(CatalogStore::in_memory().unwrap())
+}
+
+fn app_with_catalog(catalog: CatalogStore) -> axum::Router {
     let directory = std::sync::Arc::new(tempfile::tempdir().unwrap());
     router(ServerState {
         admin: umd_server::Admin::open(directory.path()).unwrap(),
-        catalog: CatalogStore::in_memory().unwrap(),
+        catalog,
         releases: umd_server::ReleaseStore::new(
             std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
             umd_server::DEFAULT_MAX_PACKAGE_BYTES,
@@ -67,6 +71,26 @@ fn app() -> axum::Router {
         allow_registration: false,
     })
     .layer(axum::Extension(directory))
+}
+
+#[tokio::test]
+async fn title_detail_exposes_crawler_provider_references() {
+    let catalog = CatalogStore::in_memory().unwrap();
+    let id = uuid::Uuid::new_v4();
+    let item = serde_json::from_value(json!({
+        "name":"Serie","mediaType":"movie","subtype":"anime_series","syncId":id,
+        "units":[{"kind":"episode","displayNumber":"1"}]
+    })).unwrap();
+    catalog.merge_scraped("jkanime", "serie", item).unwrap();
+    let app = app_with_catalog(catalog);
+    let response = app.oneshot(
+        Request::get(format!("/api/v1/catalog/items/{id}"))
+            .body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 10000).await.unwrap()).unwrap();
+    assert_eq!(body["items"][0]["onlineProviders"], json!({"jkanime":"serie"}));
+    assert_eq!(body["items"][0]["units"][0]["displayNumber"], "1");
 }
 
 fn payload(name: &str) -> String {

@@ -138,6 +138,31 @@ impl Provider {
         }
     }
     pub(super) async fn doramas_page(&mut self, cursor: Option<&str>) -> Result<Page> {
+        self.doramas_directory(cursor, None, None).await
+    }
+    pub(super) async fn doramas_filtered(&mut self, genre: Option<&str>, year: Option<u16>, cursor: Option<&str>) -> Result<Page> {
+        let token = if let Some(genre) = genre {
+            if self.filter_genres.is_none() {
+                let values = self.graph("listGenres", "query listGenres { listGenres { _id name slug } }", json!({})).await?;
+                self.filter_genres = Some(rows(&values["listGenres"])?.iter().filter_map(|row| {
+                    let label = row["name"].as_str().or_else(|| row["slug"].as_str())?;
+                    let id = row["_id"].as_str().filter(|id| segment(id, 128))?;
+                    Some((umd_core::normalize_genre(label), id.to_owned()))
+                }).collect());
+            }
+            let Some(token) = self.filter_genres.as_ref().and_then(|genres| genres.get(genre)).cloned() else {
+                return Ok(Page {items: vec![], next: None});
+            };
+            Some(token)
+        } else { None };
+        let mut result = self.doramas_directory(cursor, token.as_deref(), year).await?;
+        for entry in &mut result.items {
+            if let Some(genre) = genre { entry.preview["genres"] = json!([genre]); }
+            if let Some(year) = year { entry.preview["releaseYear"] = json!(year); }
+        }
+        Ok(result)
+    }
+    async fn doramas_directory(&mut self, cursor: Option<&str>, genre: Option<&str>, year: Option<u16>) -> Result<Page> {
         let (section, n) = cursor
             .unwrap_or("series:1")
             .split_once(':')
@@ -151,9 +176,23 @@ impl Provider {
             "series" => ("listDoramas", "paginationDorama"),
             _ => return Err(invalid()),
         };
-        let query=format!("query {op}($page:Int,$perPage:Int){{ {field}(page:$page,perPage:$perPage,sort:UPDATEDAT_DESC,filter:{{}}){{items{{{FIELDS}}} pageInfo{{hasNextPage}}}}}}");
+        let mut parameters = String::new();
+        let mut filters = Vec::new();
+        let mut variables = json!({"page":page,"perPage":50});
+        if let Some(genre) = genre {
+            parameters.push_str(",$genre:MongoID");
+            filters.push("genreId:$genre");
+            variables["genre"] = json!(genre);
+        }
+        if let Some(year) = year {
+            parameters.push_str(",$year:String");
+            filters.push("year:$year");
+            variables["year"] = json!(year.to_string());
+        }
+        let filters = filters.join(",");
+        let query=format!("query {op}($page:Int,$perPage:Int{parameters}){{ {field}(page:$page,perPage:$perPage,sort:UPDATEDAT_DESC,filter:{{{filters}}}){{items{{{FIELDS}}} pageInfo{{hasNextPage}}}}}}");
         let v = self
-            .graph(op, &query, json!({"page":page,"perPage":50}))
+            .graph(op, &query, variables)
             .await?;
         let items = dedup(
             rows(&v[field]["items"])?
@@ -168,7 +207,7 @@ impl Provider {
         } else {
             (section == "series").then(|| "movies:1".into())
         };
-        Page::directory(items, next)
+        if genre.is_some() || year.is_some() { Ok(Page {items, next}) } else { Page::directory(items, next) }
     }
     pub(super) async fn doramas_search(&mut self, q: &str) -> Result<Page> {
         if self.public_doramas() {

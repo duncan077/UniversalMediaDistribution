@@ -412,7 +412,10 @@ pub(crate) fn jk_extract_streams(episode_url: &Url, html: &str) -> Result<Vec<Va
 
 impl Provider {
     pub(super) async fn jk_page(&mut self, page: u32) -> Result<Page> {
-        let html = self.html(&format!("directorio?p={page}")).await?;
+        self.jk_directory(&format!("directorio?p={page}"), page, false).await
+    }
+    pub(super) async fn jk_directory(&mut self, route: &str, page: u32, filtered: bool) -> Result<Page> {
+        let html = self.html(route).await?;
         let doc = Document::from(html.as_str());
         let listing = ASSIGN
             .find_iter(&html)
@@ -443,7 +446,8 @@ impl Provider {
                         && u.query_pairs()
                             .any(|(k, v)| k == "p" && v.parse::<u32>() == Ok(next))
                 });
-        Page::directory(items, more.then(|| next.to_string()))
+        let next = more.then(|| next.to_string());
+        if filtered { Ok(Page { items, next }) } else { Page::directory(items, next) }
     }
     pub(super) async fn jk_updates(&mut self) -> Result<Vec<Entry>> {
         let html = self.html("").await?;

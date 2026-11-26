@@ -129,6 +129,24 @@ impl Manga {
         }
     }
     fn titles(self, base: &Url, doc: &Document) -> Vec<Entry> {
+        if self == Self::Leer {
+            let cards = dedup(doc.select("article.lc-card").iter().filter_map(|card| {
+                let title = card.select("a.lc-card-name[href]").first();
+                let url = base.join(&title.attr("href")?).ok()?;
+                if url.origin() != base.origin() {
+                    return None;
+                }
+                let id = self.id(url.path())?;
+                let name = title.text();
+                let thumb = artwork_url(base, first_img_attr(&card).as_deref());
+                let label = card.select(".lc-card-badge").first().text();
+                (!name.trim().is_empty())
+                    .then(|| self.entry(id, name.trim(), thumb, Some(label.trim())))
+            }));
+            if !cards.is_empty() {
+                return cards;
+            }
+        }
         dedup(doc.select("a[href]").iter().filter_map(|a| {
             let url = base.join(&a.attr("href")?).ok()?;
             if url.origin() != base.origin() {
@@ -829,7 +847,22 @@ impl Provider {
         let q: String =
             url::form_urlencoded::byte_serialize(query.unwrap_or("").as_bytes()).collect();
         let route = match (site, query) {
-            (Manga::Leer, Some(_)) => {
+            (Manga::Leer, Some(_)) => format!("manga/?page={page}&q={q}"),
+            (Manga::Leer, None) => format!("manga/?page={page}"),
+            (Manga::Zona, Some(_)) => format!("biblioteca?filter_by=title&title={q}&page={page}"),
+            (Manga::Zona, None) => {
+                format!("biblioteca?order_item=creation&order_dir=desc&page={page}")
+            }
+            (Manga::Uchuujin, Some(_)) => format!("?s={q}&paged={page}"),
+            (Manga::Uchuujin, None) => format!("manga/?order=update&page={page}"),
+        };
+        match self.manga_directory(site, &route, page, query.is_some()).await {
+            Err(error)
+                if site == Manga::Leer
+                    && query.is_some()
+                    && page == 1
+                    && error.status == Some(404) =>
+            {
                 let v = self
                     .json(&format!("search-autocomplete?term={q}"), 4)
                     .await?;
@@ -849,17 +882,13 @@ impl Provider {
                         None,
                     ))
                 }));
-                return Ok(Page { items, next: None });
+                Ok(Page { items, next: None })
             }
-            (Manga::Leer, None) => format!("manga/?page={page}"),
-            (Manga::Zona, Some(_)) => format!("biblioteca?filter_by=title&title={q}&page={page}"),
-            (Manga::Zona, None) => {
-                format!("biblioteca?order_item=creation&order_dir=desc&page={page}")
-            }
-            (Manga::Uchuujin, Some(_)) => format!("?s={q}&paged={page}"),
-            (Manga::Uchuujin, None) => format!("manga/?order=update&page={page}"),
-        };
-        let doc = Document::from(self.html(&route).await?);
+            result => result,
+        }
+    }
+    pub(super) async fn manga_directory(&mut self, site: Manga, route: &str, page: u32, filtered: bool) -> Result<Page> {
+        let doc = Document::from(self.html(route).await?);
         let items = site.titles(&self.base, &doc);
         let next = doc
             .select("a[href]")
@@ -882,10 +911,10 @@ impl Provider {
                     })
             })
             .then(|| (page + 1).to_string());
-        if query.is_none() {
-            Page::directory(items, next)
-        } else {
+        if filtered {
             Ok(Page { items, next })
+        } else {
+            Page::directory(items, next)
         }
     }
     pub(super) async fn manga_updates(&mut self, site: Manga) -> Result<Vec<Entry>> {
@@ -950,9 +979,15 @@ impl Provider {
             .map(|s| s.to_string());
         let thumb = artwork_url(&self.base, raw_thumb.as_deref())
             .or_else(|| artwork_url(&self.base, e.preview["thumbnailRef"].as_str()));
+        let genre_links = "a[href*='genre='],a[href*='genre/'],a[href*='genero/'],.mgen a,.genres a,a[href*='genders']";
+        let title_panel = doc.select("article.lc-panel").first();
+        let genre_links = if site == Manga::Leer && !title_panel.is_empty() {
+            title_panel.select(genre_links)
+        } else {
+            doc.select(genre_links)
+        };
         let mut seen = HashSet::new();
-        let genres: Vec<_> = doc
-            .select("a[href*='genre='],a[href*='genre/'],a[href*='genero/'],.mgen a,.genres a,a[href*='genders']")
+        let genres: Vec<_> = genre_links
             .iter()
             .map(|a| a.text().trim().to_owned())
             .filter(|s| !s.is_empty() && seen.insert(s.clone()))

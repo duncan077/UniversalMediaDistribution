@@ -242,7 +242,7 @@ impl Capibara {
                     item.metadata
                         .get("onlineProviders")
                         .and_then(|v| v["capibaratraductor"].as_str())
-                        .and_then(|s| s.parse().ok())
+                        .and_then(edition_reference)
                 })
                 .unwrap_or(id);
             Ok((edition, number))

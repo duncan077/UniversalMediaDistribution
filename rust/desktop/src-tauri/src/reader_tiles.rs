@@ -206,7 +206,8 @@ async fn materialize(
                 .await
                 .map_err(|e| e.to_string())?
         } else {
-            crate::streams::get_public(url, duration).await?
+            let referer = crate::artwork::host_referer(&url);
+            crate::streams::get_public_image(url, duration, referer.as_ref()).await?
         };
         if !response.status().is_success()
             || response.content_length().is_some_and(|len| len > MAX_BYTES)

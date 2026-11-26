@@ -24,6 +24,53 @@ async fn source(site: &str, router: Router) -> Provider {
 }
 
 #[tokio::test]
+async fn leercapitulo_search_uses_the_catalog_query_and_follows_pagination() {
+    let router = Router::new()
+        .route(
+            "/manga/",
+            get(|Query(args): Query<HashMap<String, String>>| async move {
+                assert_eq!(args["q"], "One Piece");
+                if args["page"] == "1" {
+                    r#"<article class="lc-card">
+                        <a class="lc-card-cover" href="/manga/abc/one-piece/">
+                          <img src="https://www.leercapitulo.co/covers/one-piece.jpg" alt=""><span class="lc-card-badge">Manga</span>
+                        </a>
+                        <div class="lc-card-body"><a class="lc-card-name" href="/manga/abc/one-piece/">One Piece</a></div>
+                      </article>
+                        <a href="/manga/?q=One+Piece&amp;page=2">Siguiente</a>"#
+                } else {
+                    assert_eq!(args["page"], "2");
+                    r#"<a href="/manga/def/one-piece-color/"><h3>One Piece Color</h3></a>"#
+                }
+            }),
+        )
+        .route(
+            "/manga/abc/one-piece/",
+            get(|| async {
+                r#"<aside><a href="/manga/?genre=hentai">Hentai</a></aside>
+                   <article class="lc-panel"><h1>One Piece</h1>
+                     <a href="/manga/?genre=action">Action</a>
+                   </article>"#
+            }),
+        );
+    let mut provider = source("leercapitulo", router).await;
+    let first = provider.search("One Piece", 1).await.unwrap();
+    assert_eq!(first.items[0].external_id, "abc/one-piece");
+    assert_eq!(first.items[0].preview["name"], "One Piece");
+    assert_eq!(
+        first.items[0].preview["thumbnailRef"],
+        "https://www.leercapitulo.co/covers/one-piece.jpg"
+    );
+    assert_eq!(first.next.as_deref(), Some("2"));
+    let title = provider.detail(&first.items[0]).await.unwrap();
+    assert_eq!(title.metadata["genres"], json!(["Action"]));
+    assert!(!title.adult());
+    let second = provider.search("One Piece", 2).await.unwrap();
+    assert_eq!(second.items[0].external_id, "def/one-piece-color");
+    assert!(second.next.is_none());
+}
+
+#[tokio::test]
 async fn zonatmo_extracts_same_named_novel_and_manhwa_as_distinct_editions() {
     let router = Router::new()
         .route("/biblioteca", get(|| async {
@@ -102,6 +149,41 @@ async fn provider_sends_browser_headers_and_accepts_the_requested_format() {
     );
     let mut api = source("framextv", router).await;
     assert_eq!(api.page(None).await.err().unwrap().kind, "throttled");
+}
+
+#[tokio::test]
+async fn jk_metadata_search_applies_native_genre_and_year_without_a_title() {
+    let router = Router::new().route("/directorio", get(|Query(args): Query<HashMap<String, String>>| async move {
+        if args.is_empty() {
+            return r#"<select name="genero"><option value="accion-12">Acción</option></select>"#;
+        }
+        assert_eq!(args["genero"], "accion-12");
+        assert_eq!(args["fecha"], "2024");
+        assert_eq!(args["p"], "1");
+        r#"<script>var animes = {"data":[{"slug":"example","title":"Serie"}],"last_page":2};</script>"#
+    }));
+    let mut provider = source("jkanime", router).await;
+    let page = provider.search_metadata("", Some("action"), Some(2024), None).await.unwrap();
+    assert_eq!(page.next.as_deref(), Some("2"));
+    assert_eq!(page.items[0].preview["releaseYear"], 2024);
+    assert_eq!(page.items[0].preview["genres"], json!(["action"]));
+}
+
+#[tokio::test]
+async fn cinema_genre_search_keeps_the_filter_and_checks_the_card_year() {
+    let router = Router::new()
+        .route("/", get(|| async { r#"<a href="/genero/accion">Acción</a>"# }))
+        .route("/genero/accion", get(|| async {
+            r#"<a href="/pelicula/first"><h2>Example</h2><span class="year">2024</span></a>
+               <a href="/pelicula/second"><h2>Example</h2><span class="year">2023</span></a>
+               <a href="/pelicula/other"><h2>Other</h2><span class="year">2024</span></a>
+               <a href="/genero/accion/page/2">Más</a>"#
+        }));
+    let mut provider = source("pelisplus", router).await;
+    let page = provider.search_metadata("Example", Some("action"), Some(2024), None).await.unwrap();
+    assert_eq!(page.next.as_deref(), Some("2"));
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].external_id, "pelicula/first");
 }
 
 #[tokio::test]

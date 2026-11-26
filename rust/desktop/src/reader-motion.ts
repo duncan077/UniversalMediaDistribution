@@ -1,7 +1,7 @@
 import {ui} from "./locale";
 import {activeProfileId, getProfilePref, windowProfile, writeProfilePref} from "./profile-context";
 
-export function readerMotion(view: HTMLElement, toolbar: HTMLElement) {
+export function readerMotion(view: HTMLElement, toolbar: HTMLElement, onEnd: () => void) {
   const controls = document.createElement("span");
   controls.className = "reader-motion";
   const toggle = document.createElement("button");
@@ -52,7 +52,11 @@ export function readerMotion(view: HTMLElement, toolbar: HTMLElement) {
     remainder = distance - whole;
     last = time;
     view.scrollTop += whole;
-    if (motion === "auto" && view.scrollTop + view.clientHeight >= view.scrollHeight - 1) { stop(); return; }
+    if (motion === "auto" && view.scrollTop + view.clientHeight >= view.scrollHeight - 1) {
+      stop();
+      onEnd();
+      return;
+    }
     frame = requestAnimationFrame(tick);
   }
   function start(kind: "mouse" | "auto") {

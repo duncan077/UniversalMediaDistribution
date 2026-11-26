@@ -299,13 +299,14 @@ async fn favorite(
 async fn reader_mode(
     id: Uuid,
     mode: Option<String>,
+    fallback: Option<String>,
     profile_id: uuid::Uuid,
     store: State<'_, CatalogStore>,
 ) -> CommandResult<String> {
     let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
     work(move || {
         store
-            .reader_mode(id, mode.as_deref())
+            .reader_mode_with_default(id, mode.as_deref(), fallback.as_deref().unwrap_or("paged"))
             .map_err(|e| e.to_string())
     })
     .await
@@ -531,7 +532,7 @@ pub(crate) async fn remote_item_document(
     if server.is_some_and(|expected| expected != base.as_str()) {
         return Err("Cambió el servidor. Volvé a buscar el título.".into());
     }
-    let (doc, _) = catalog_document(
+    let (mut doc, _) = catalog_document(
         catalog_response(&base, &format!("api/v1/catalog/items/{id}"), &[]).await?,
     )
     .await?;
@@ -541,28 +542,13 @@ pub(crate) async fn remote_item_document(
     if hide_adult && doc.items[0].adult() {
         return Err("El filtro +18 ocultó esta ficha.".into());
     }
-    Ok(doc)
-}
-
-#[tauri::command]
-async fn preview_online_item(
-    store: State<'_, CatalogStore>,
-    id: Uuid,
-    hide_adult: bool,
-    server: String,
-) -> CommandResult<(umd_core::CatalogItem, bool)> {
-    if let Some(item) = store
-        .item(id)
-        .map_err(|e| e.to_string())?
-        .and_then(|d| d.items.into_iter().next())
-    {
-        if hide_adult && item.adult() {
-            return Err("El filtro +18 ocultó esta ficha.".into());
-        }
-        return Ok((item, true));
+    if let Some(links) = doc.items[0].metadata.get_mut("onlineProviders").and_then(serde_json::Value::as_object_mut) {
+        links.retain(|site, external| {
+            (site == "capibaratraductor" || umd_providers::Site::parse(site).is_some())
+                && external.as_str().is_some_and(umd_core::provider_reference)
+        });
     }
-    let doc = remote_item_document(&store, id, hide_adult, Some(&server)).await?;
-    Ok((doc.items.into_iter().next().unwrap(), false))
+    Ok(doc)
 }
 
 #[tauri::command]
@@ -819,7 +805,6 @@ pub fn run() {
             server_url,
             search_remote_catalog,
             import_remote_item,
-            preview_online_item,
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             updates::check_update,
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
@@ -838,6 +823,7 @@ pub fn run() {
             providers::json_provider_search,
             providers::json_provider_add,
             providers::provider_search,
+            providers::filtered_provider_page,
             providers::provider_updates,
             providers::refresh_saved_editions,
             providers::import_daily_updates,

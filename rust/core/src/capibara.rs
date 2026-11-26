@@ -17,6 +17,16 @@ pub fn edition_id(id: Uuid) -> Option<u32> {
         .then_some(edition)
 }
 
+pub fn edition_reference(reference: &str) -> Option<Uuid> {
+    if let Ok(id) = reference.parse::<Uuid>() {
+        return edition_id(id).map(|_| id);
+    }
+    let (prefix, number) = reference.strip_prefix("joint-")
+        .map_or((EDITION_PREFIX, reference), |number| (JOINT_PREFIX, number));
+    let number = number.parse::<u32>().ok().filter(|number| *number != 0)?;
+    Some(Uuid::from_u128(prefix | u128::from(number)))
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Edition {
     pub id: u32,

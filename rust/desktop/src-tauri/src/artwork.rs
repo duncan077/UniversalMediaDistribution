@@ -155,11 +155,11 @@ fn sniff_raster_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn host_referer(url: &Url) -> Option<Url> {
+pub(crate) fn host_referer(url: &Url) -> Option<Url> {
     let host = url.host_str()?.to_ascii_lowercase();
     let candidate = if host.contains("olympus") {
         "https://olympusbiblioteca.com/"
-    } else if host.contains("manhwaweb") || host.contains("mweb") {
+    } else if host == "img2mw.xyz" || host.contains("manhwaweb") || host.contains("mweb") {
         "https://manhwaweb.com/"
     } else if host.contains("zonatmo") || host.contains("lectortmo") || host.contains("tmofans") {
         "https://zonatmo.com/"

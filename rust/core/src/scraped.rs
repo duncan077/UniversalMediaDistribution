@@ -131,6 +131,14 @@ pub fn catalog_metadata_only(mut item: CatalogItem) -> CatalogItem {
     item.metadata = metadata.into_iter().collect();
     item
 }
+
+pub fn provider_reference(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 1024
+        && value.trim_end_matches('/').split('/').all(|part| {
+            !part.is_empty() && !matches!(part, "." | "..")
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
 // Keep the array order from the existing catalog. Look up units by their portable
 // identity so a title with thousands of chapters can refresh in linear time.
 fn entry_key(key: &str, value: &Value) -> Vec<String> {
@@ -424,6 +432,12 @@ impl CatalogStore {
                 allowed.then(|| (key.to_owned(), Value::String(raw.to_owned())))
             })
             .collect();
+        let provider_links = incoming.metadata.get("onlineProviders").and_then(Value::as_object)
+            .into_iter().flatten()
+            .filter(|(site, external)| site.len() <= 64 && provider_reference(site) && !site.contains('/')
+                && external.as_str().is_some_and(provider_reference))
+            .map(|(site, external)| (site.clone(), external.clone()))
+            .collect::<Map<String, Value>>();
         let mut clean = catalog_metadata_only(incoming);
         for (key, value) in server_art {
             clean.metadata.entry(key).or_insert(value);
@@ -433,7 +447,7 @@ impl CatalogStore {
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = Self::item_from(&tx, id)?;
-        let merged = if let Some(old) = &previous {
+        let mut merged = if let Some(old) = &previous {
             let mut item = old.clone();
             if item.name.trim().is_empty() && !clean.name.trim().is_empty() {
                 item.name = clean.name;
@@ -462,6 +476,14 @@ impl CatalogStore {
         } else {
             clean
         };
+        if !provider_links.is_empty() {
+            let links = merged.metadata.entry("onlineProviders".into()).or_insert_with(|| serde_json::json!({}));
+            if let Some(links) = links.as_object_mut() {
+                for (site, external) in provider_links {
+                    links.entry(site).or_insert(external);
+                }
+            }
+        }
         let changed = previous.as_ref() != Some(&merged);
         if changed {
             Self::import_into(&tx, &CatalogDocument::new(vec![merged.clone()]), false)?;
@@ -880,6 +902,11 @@ mod tests {
             "publicationStatus": "unknown",
             "description": "Sinopsis nueva",
             "thumbnailRef": "https://cdn.example.org/hero.webp",
+            "onlineProviders": {
+                "olympusxyz": "other-translation",
+                "zonatmo": "library/manhwa/123/hero-returns",
+                "leercapitulo": "https://private.example/movie"
+            },
             "units": [
                 {"kind": "chapter", "displayNumber": "1"},
                 {"kind": "chapter", "displayNumber": "2"}
@@ -899,6 +926,8 @@ mod tests {
             merged.metadata["onlineProviders"]["olympusxyz"],
             "hero-returns"
         );
+        assert_eq!(merged.metadata["onlineProviders"]["zonatmo"], "library/manhwa/123/hero-returns");
+        assert!(merged.metadata["onlineProviders"]["leercapitulo"].is_null());
         let units = merged.metadata["units"].as_array().unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0]["sources"][0]["filePath"], "local/ch1.cbz");

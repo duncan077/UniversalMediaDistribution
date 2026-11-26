@@ -956,6 +956,18 @@ impl ProgressTarget {
 }
 impl CatalogStore {
     pub fn reader_mode(&self, item_id: Uuid, mode: Option<&str>) -> Result<String> {
+        self.reader_mode_with_default(item_id, mode, "paged")
+    }
+
+    pub fn reader_mode_with_default(
+        &self,
+        item_id: Uuid,
+        mode: Option<&str>,
+        default_mode: &str,
+    ) -> Result<String> {
+        if !matches!(default_mode, "paged" | "continuous") {
+            return Err(invalid("Modo de lectura inválido."));
+        }
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let item =
@@ -969,7 +981,7 @@ impl CatalogStore {
                 .flatten()
                 .find(|r| matches_item(&r["item"], &target))
                 .and_then(|r| r["displayMode"].as_str())
-                .unwrap_or("paged")
+                .unwrap_or(default_mode)
                 .into());
         };
         if !matches!(mode, "paged" | "continuous") {

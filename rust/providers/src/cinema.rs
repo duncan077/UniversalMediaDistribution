@@ -66,6 +66,7 @@ struct Link {
     label: String,
     text: String,
     artwork: Option<String>,
+    year: Option<u16>,
 }
 
 fn links(root: &Url, doc: &Document) -> Vec<Link> {
@@ -115,11 +116,18 @@ fn links(root: &Url, doc: &Document) -> Vec<Link> {
                 .or_else(|| img.attr("src"))
                 .map(|s| s.to_string());
             let artwork = artwork_url(root, raw_img.as_deref());
+            let year = a.select("[data-year], .year, .Year, .release-year, time").iter()
+                .find_map(|el| {
+                    let value = el.attr("data-year").or_else(|| el.attr("datetime")).unwrap_or_else(|| el.text());
+                    YEAR.find(&value)?.as_str().parse().ok()
+                })
+                .or_else(|| YEAR.find(&text)?.as_str().parse().ok());
             Some(Link {
                 url,
                 label,
                 text,
                 artwork,
+                year,
             })
         })
         .collect()
@@ -169,7 +177,7 @@ fn cards(links: &[Link], site: Cinema) -> Vec<Entry> {
                 "name": name,
                 "originalLanguage": "es",
                 "thumbnailRef": l.artwork,
-                "releaseYear": YEAR.find(&l.text).and_then(|m| m.as_str().parse::<u16>().ok())
+                "releaseYear": l.year
             }),
         })
     }))
@@ -354,6 +362,19 @@ fn inline_seasons(
 }
 
 impl Provider {
+    pub(super) async fn cinema_genre(&mut self, site: Cinema, token: &str, page: u32) -> Result<Page> {
+        let base = format!("genero/{token}");
+        let route = if page == 1 { base.clone() } else { format!("{base}/page/{page}") };
+        let html = self.html(&route).await?;
+        let links = links(&self.base, &Document::from(html));
+        let next = format!("/{base}/page/{}", page + 1);
+        Ok(Page {
+            items: cards(&links, site),
+            next: links.iter().any(|link| link.url.path().trim_end_matches('/') == next)
+                .then(|| (page + 1).to_string()),
+        })
+    }
+
     pub(super) async fn cinema_page(&mut self, site: Cinema, cursor: Option<&str>) -> Result<Page> {
         let (section, p) = cinema_cursor(site, cursor)?;
         let html = self.html(&site.directory(section, p)).await?;

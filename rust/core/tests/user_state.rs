@@ -481,6 +481,11 @@ fn upgrading_an_existing_library_preserves_personal_state_and_selection_across_r
 fn reader_mode_round_trips_in_a_backup() {
     let (source, target) = store();
     assert_eq!(source.reader_mode(target.item_id, None).unwrap(), "paged");
+    assert_eq!(
+        source.reader_mode_with_default(target.item_id, None, "continuous").unwrap(),
+        "continuous"
+    );
+    assert_eq!(source.reader_mode(target.item_id, None).unwrap(), "paged");
     source
         .reader_mode(target.item_id, Some("continuous"))
         .unwrap();

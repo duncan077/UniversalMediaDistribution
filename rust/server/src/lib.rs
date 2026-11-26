@@ -289,9 +289,23 @@ async fn item(
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
     work.run(move || {
-        let document = catalog
+        let mut document = catalog
             .encode_public_item(id, 8 << 20)?
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Title not found".into()))?;
+        let links: BTreeMap<_, _> = catalog.item_bindings(id)?.into_iter()
+            .filter(|(site, external)| (site == "capibaratraductor" || umd_providers::Site::parse(site).is_some())
+                && umd_core::provider_reference(external))
+            .collect();
+        if !links.is_empty() {
+            let mut item = CatalogDocument::parse(&document)?;
+            if let Some(title) = item.items.first_mut() {
+                title.metadata.insert("onlineProviders".into(), json!(links));
+            }
+            document = serde_json::to_vec(&item).map_err(umd_core::Error::from)?;
+            if document.len() > 8 << 20 {
+                return Err(umd_core::Error::DocumentTooLarge(8 << 20).into());
+            }
+        }
         Ok(limits::json_bytes(document))
     })
     .await

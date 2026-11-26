@@ -106,7 +106,7 @@ let featuredUnit: ContentUnit | undefined;
 // Abort controller & active context for Detail page async work
 let detailAbort: AbortController | null = null;
 let detailSequence = 0;
-let currentDetail: { item: CatalogItem; unit?: ContentUnit; onlineServer?: string; entryView: EntryListView } | null = null;
+let currentDetail: { item: CatalogItem; unit?: ContentUnit; entryView: EntryListView } | null = null;
 const itemRefreshTimes = new Map<string, number>();
 
 function detailProviderActive() {
@@ -400,7 +400,10 @@ async function loadPage(append: boolean, transition: boolean, bootstrap: boolean
     await afterPaint();
     if (request !== generation) return;
   }
-  if (!append && !bootstrap) refreshOnline();
+  if (!append && !bootstrap) {
+    refreshOnline();
+    refreshFilteredProviders();
+  }
   const more = element<HTMLButtonElement>("more");
   more.disabled = true;
   try {
@@ -706,13 +709,111 @@ async function openOnline(summary: CatalogItem) {
   const source = serverAddress;
   const opening = ++previewSequence;
   const seq = onlineSequence;
+  const origin = activePage();
   try {
-    const [item, local] = await invoke<[CatalogItem, boolean]>("preview_online_item", { id: summary.syncId, server: source, hideAdult: hideAdult() });
-    if (opening === previewSequence && seq === onlineSequence && source === serverAddress) {
-      void showDetails(item, undefined, local ? undefined : source);
+    const item = await invoke<CatalogItem>("import_remote_item", { id: summary.syncId, server: source, hideAdult: hideAdult() });
+    if (opening === previewSequence && seq === onlineSequence && source === serverAddress && isPageActive(origin)) {
+      void showDetails(item, undefined, true);
     }
   } catch (error) {
     if (opening === previewSequence && seq === onlineSequence) element("online-status").textContent = String(error);
+  }
+}
+
+interface ProviderFilterHit { item: CatalogItem; entry: unknown | null }
+type ProviderFilterQuery = ReturnType<typeof filters> & { q: string; mediaType: string | null; cursor?: string | null };
+const filteredShelf = element("filtered-provider-shelf");
+const filteredCards = element("filtered-provider-cards");
+const filteredStatus = element("filtered-provider-status");
+const filteredMore = element<HTMLButtonElement>("filtered-provider-more");
+const filteredHits = new Map<string, { hit: ProviderFilterHit; site: string }>();
+let filteredKey = "";
+let filteredSequence = 0;
+let filteredQuery: ProviderFilterQuery;
+let filteredNext = new Map<string, string | null>();
+const filteredGrid = android ? virtualCatalog<{ key: string; hit: ProviderFilterHit; site: string }>(filteredCards,
+  row => row.key, row => titleCard(row.hit.item, () => void openFilteredHit(row.hit, row.site), false)) : null;
+
+function refreshFilteredProviders() {
+  const current = filters();
+  const sites = [...element<HTMLSelectElement>("provider-site").options]
+    .map(option => option.value)
+    .filter(site => site && !["all", "local", "server", "capibaratraductor"].includes(site)
+      && providerEnabled(activeProfileId(), site));
+  const query = {...current, q: search.value.trim(), mediaType: media.value || null};
+  const allowed = (current.genre || current.year) && !favoritesOnly && !listFilter.value;
+  const key = allowed && sites.length ? JSON.stringify([query, sites, hideAdult()]) : "";
+  if (key === filteredKey) return;
+  filteredKey = key;
+  ++filteredSequence;
+  filteredHits.clear();
+  filteredGrid?.disable();
+  filteredCards.replaceChildren();
+  filteredNext = new Map(sites.map(site => [site, null]));
+  filteredShelf.hidden = !key;
+  filteredMore.hidden = true;
+  if (!key) return;
+  filteredQuery = query;
+  element("filtered-provider-heading").textContent = ui("Resultados de proveedores");
+  filteredMore.textContent = ui("Ver más de proveedores");
+  void loadFilteredProviders();
+}
+
+async function loadFilteredProviders() {
+  const seq = filteredSequence;
+  const query = filteredQuery;
+  const jobs = [...filteredNext].values();
+  filteredNext.clear();
+  filteredMore.hidden = true;
+  filteredStatus.textContent = ui("Consultando proveedores…");
+  let failed = 0;
+  const refreshCards = () => {
+    if (filteredGrid) {
+      filteredGrid.set([...filteredHits].map(([key, row]) => ({key, ...row})));
+    }
+  };
+  const worker = async () => {
+    for (const [site, cursor] of jobs) {
+      if (seq !== filteredSequence) return;
+      try {
+        const [hits, next] = await invoke<[ProviderFilterHit[], string | null]>("filtered_provider_page", {
+          site, query: {...query, cursor}, hideAdult: hideAdult(),
+        });
+        if (seq !== filteredSequence) return;
+        for (const hit of hits) {
+          const key = `${site}:${hit.item.syncId}`;
+          if (filteredHits.has(key) || hiddenTitle(hit.item)) continue;
+          filteredHits.set(key, {hit, site});
+          if (!filteredGrid) filteredCards.append(titleCard(hit.item, () => void openFilteredHit(hit, site), false));
+        }
+        refreshCards();
+        if (next && next !== cursor) filteredNext.set(site, next);
+      } catch {
+        failed++;
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  if (seq !== filteredSequence) return;
+  filteredStatus.textContent = filteredHits.size ? ""
+    : ui(failed ? "Algunos proveedores no respondieron." : "Sin resultados de proveedores para estos filtros.");
+  filteredMore.hidden = filteredNext.size === 0;
+}
+filteredMore.onclick = () => void loadFilteredProviders();
+
+async function openFilteredHit(hit: ProviderFilterHit, site: string) {
+  const seq = ++previewSequence;
+  const origin = activePage();
+  try {
+    const item = hit.entry
+      ? await invoke<CatalogItem>("provider_add", {site, entry: hit.entry, hideAdult: hideAdult()})
+      : await invoke<CatalogItem>("json_provider_add", {site, id: hit.item.syncId, hideAdult: hideAdult()});
+    if (seq !== previewSequence || !isPageActive(origin)) return;
+    itemRefreshTimes.set(item.syncId, Date.now());
+    void showDetails(item);
+    void load();
+  } catch (error) {
+    if (seq === previewSequence) filteredStatus.textContent = String(error);
   }
 }
 
@@ -847,7 +948,7 @@ function render(from = 0) {
   element("empty").hidden = firstRun || visible.length > 0;
   const justFavorites = favoritesOnly && !hasFilters();
   element("empty-title").textContent = ui(justFavorites ? "Todavía no tenés favoritos" : favoritesOnly ? "No hay favoritos que coincidan" : serverAddress ? "Sin títulos locales para mostrar" : "Sin títulos para mostrar");
-  element("empty-description").textContent = ui(justFavorites ? "Marcá el corazón de un título para encontrarlo acá." : serverAddress && !favoritesOnly ? "Podés guardar un título desde su ficha en el servidor." : "Probá con otro título o cambiá los filtros.");
+  element("empty-description").textContent = ui(justFavorites ? "Marcá el corazón de un título para encontrarlo acá." : serverAddress && !favoritesOnly ? "Abrí un título del servidor para agregarlo a tu biblioteca." : "Probá con otro título o cambiá los filtros.");
   element("empty-reset").textContent = ui((section === "all" || favoritesOnly) && hasFilters() ? "Limpiar filtros" : "Volver a la biblioteca");
   if (!catalog.hidden) element("more").hidden = cursor === null;
 }
@@ -855,7 +956,7 @@ function render(from = 0) {
 /**
  * Full-page Item Detail view (Avalonia parity — replaces the old #detail-dialog modal!).
  */
-async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineServer?: string) {
+async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnline = false) {
   if (hiddenTitle(initialItem)) {
     status(ui("El filtro +18 ocultó esta ficha."), true);
     return;
@@ -869,7 +970,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
 
   // Fetch the full local item (with chapters, seasons, sources, aliases, contributors) if it came from a summary query
   let item = initialItem;
-  if (!onlineServer && !Array.isArray(item.units) && !Array.isArray(item.seasons) && !Array.isArray(item.sources)) {
+  if (!Array.isArray(item.units) && !Array.isArray(item.seasons) && !Array.isArray(item.sources)) {
     try {
       const full = await invoke<CatalogItem>("library_item", { id: item.syncId });
       item = full;
@@ -880,12 +981,12 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   if (seq !== detailSequence || signal.aborted || !isPageActive(origin)) return;
 
   const content = element("detail");
-  const sameDetail = isPageActive("detail") && currentDetail?.item.syncId === item.syncId && currentDetail.onlineServer === onlineServer;
+  const sameDetail = isPageActive("detail") && currentDetail?.item.syncId === item.syncId;
   const entryView = sameDetail && currentDetail ? currentDetail.entryView : {};
   const scrollY = sameDetail ? window.scrollY : 0;
   const newHighlight = !!unit && unit !== currentDetail?.unit;
   content.dataset.tone = tone(item);
-  currentDetail = { item, unit, onlineServer, entryView };
+  currentDetail = { item, unit, entryView };
 
   // Top Back bar (Avalonia DetailsBackButton + Refresh)
   const topBar = node("div", undefined, "detail-topbar");
@@ -904,59 +1005,54 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
     errors: string[];
   }
 
-  let refreshBtn: HTMLButtonElement | null = null;
-  if (!onlineServer) {
-    const topActions = node("div", undefined, "detail-topbar-actions");
-    refreshBtn = node("button", ui("Actualizar"), "quiet-btn detail-refresh-btn");
-    refreshBtn.type = "button";
-    refreshBtn.onclick = async () => {
-      if (!refreshBtn) return;
-      refreshBtn.disabled = true;
-      feedback.classList.remove("error");
-      feedback.textContent = ui("Actualizando ficha…");
-      try {
-        const res = await invokeProfile<RefreshItemResult>("refresh_item", {
-          id: item.syncId,
-          hideAdult: hideAdult(),
-          discover: true,
-        });
-        itemRefreshTimes.set(item.syncId, Date.now());
-        if (seq !== detailSequence || signal.aborted) return;
-        if (res.changed) {
-          await load();
-          void refreshContinue().catch(() => {});
-          if (seq === detailSequence && !signal.aborted && isPageActive("detail")) {
-            await showDetails(res.item, unit);
-            const activeFeedback = element("detail").querySelector<HTMLElement>(".detail-feedback");
-            if (activeFeedback) {
-              activeFeedback.classList.remove("error");
-              activeFeedback.textContent = ui("Ficha actualizada.");
-            }
+  const topActions = node("div", undefined, "detail-topbar-actions");
+  const refreshBtn = node("button", ui("Actualizar"), "quiet-btn detail-refresh-btn");
+  refreshBtn.type = "button";
+  refreshBtn.onclick = async () => {
+    refreshBtn.disabled = true;
+    feedback.classList.remove("error");
+    feedback.textContent = ui("Actualizando ficha…");
+    try {
+      const res = await invokeProfile<RefreshItemResult>("refresh_item", {
+        id: item.syncId,
+        hideAdult: hideAdult(),
+        discover: true,
+      });
+      itemRefreshTimes.set(item.syncId, Date.now());
+      if (seq !== detailSequence || signal.aborted) return;
+      if (res.changed) {
+        await load();
+        void refreshContinue().catch(() => {});
+        if (seq === detailSequence && !signal.aborted && isPageActive("detail")) {
+          await showDetails(res.item, unit);
+          const activeFeedback = element("detail").querySelector<HTMLElement>(".detail-feedback");
+          if (activeFeedback) {
+            activeFeedback.classList.remove("error");
+            activeFeedback.textContent = ui("Ficha actualizada.");
           }
-          return;
         }
-        if (res.sourcesChecked.length > 0) {
-          feedback.textContent = ui("La ficha ya está al día.");
-        } else if (res.errors.length > 0) {
-          feedback.textContent = ui("No se pudo actualizar la ficha.");
-          feedback.classList.add("error");
-        } else {
-          feedback.textContent = ui("No se encontraron cambios nuevos.");
-        }
-      } catch (err) {
-        if (seq === detailSequence && !signal.aborted) {
-          feedback.textContent = String(err);
-          feedback.classList.add("error");
-        }
-      } finally {
-        if (refreshBtn && refreshBtn.isConnected) refreshBtn.disabled = false;
+        return;
       }
-    };
-    topActions.append(refreshBtn);
-    topBar.append(topActions);
-  }
+      if (res.sourcesChecked.length > 0) {
+        feedback.textContent = ui("La ficha ya está al día.");
+      } else if (res.errors.length > 0) {
+        feedback.textContent = ui("No se pudo actualizar la ficha.");
+        feedback.classList.add("error");
+      } else {
+        feedback.textContent = ui("No se encontraron cambios nuevos.");
+      }
+    } catch (err) {
+      if (seq === detailSequence && !signal.aborted) {
+        feedback.textContent = String(err);
+        feedback.classList.add("error");
+      }
+    } finally {
+      if (refreshBtn.isConnected) refreshBtn.disabled = false;
+    }
+  };
+  topActions.append(refreshBtn);
+  topBar.append(topActions);
 
-  // Cinematic Hero Banner (Avalonia DetailsBackdropHost + Poster + Info + Primary CTA)
   const hero = node("section", undefined, "detail-hero-banner");
   const backdropUrl = safeImage((item.backdropRef as string | null | undefined) || item.thumbnailRef);
   if (backdropUrl) {
@@ -972,9 +1068,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   const heroGrid = node("div", undefined, "detail-hero-grid");
   const posterCol = node("div", undefined, "detail-poster-col");
   posterCol.append(artwork(item));
-  if (!onlineServer) {
-    posterCol.append(favoriteButton(item, true));
-  }
+  posterCol.append(favoriteButton(item, true));
 
   const infoCol = node("div", undefined, "detail-info-col");
 
@@ -986,8 +1080,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
   const providerNames = Object.keys(item.onlineProviders ?? {}).filter(id => providerEnabled(activeProfileId(), id));
   if (providerNames.length) {
     badgesRow.append(node("span", providerNames.join(" · "), "chip mint"));
-  } else if (onlineServer) {
-    badgesRow.append(node("span", ui("Servidor"), "chip mint"));
+
   }
   infoCol.append(badgesRow);
 
@@ -1079,107 +1172,87 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
 
   const body = node("div", undefined, "detail-body");
 
-  if (onlineServer) {
-    const saveBtn = node("button", ui("Agregar a mi biblioteca"), "primary");
-    saveBtn.type = "button";
-    saveBtn.onclick = async () => {
-      saveBtn.disabled = true;
-      try {
-        const local = await invoke<CatalogItem>("import_remote_item", { id: item.syncId, server: onlineServer, hideAdult: hideAdult() });
-        if (isPageActive("detail") && saveBtn.isConnected) void showDetails(local);
+  // Chapters / Episodes / Tracks list (full page, NOT a dropdown!)
+  const controls = contentControls(
+    item,
+    (message, error = false) => {
+      if (!isPageActive("detail")) { status(message, error); return; }
+      feedback.textContent = message;
+      feedback.classList.toggle("error", error);
+    },
+    unit,
+    {
+      signal,
+      view: entryView,
+      scrollToHighlight: !sameDetail || newHighlight,
+      onContinueReady: (cta) => {
+        ctaHost.replaceChildren();
+        if (!cta) return;
+        const btn = node("button", cta.label, "primary detail-continue-btn");
+        btn.type = "button";
+        btn.dataset.icon = "play";
+        btn.onclick = cta.run;
+        ctaHost.append(btn);
+      },
+      onUnitsChanged: () => { void invoke<CatalogItem>("library_item",{id:item.syncId}).then(updated => showDetails(updated)).catch(e => status(String(e),true)); },
+      onProgressChanged: () => {
+        void refreshContinue().catch(() => {});
+      },
+    },
+  );
+
+  // Side-by-side / stacked personal panels: List membership + Friend activity
+  const personalGrid = node("div", undefined, "detail-personal-grid");
+  personalGrid.append(
+    inlineListMembership(item, openListsPage, signal),
+    inlineFriendActivity(item, signal),
+  );
+
+  // Management actions: Metadata refresh + Delete catalog item (with inline confirmation!)
+  const managePanel = node("section", undefined, "surface-panel detail-manage-panel");
+  const manageRow = node("div", undefined, "detail-manage-row");
+  const code = item.subtype.replace(/^(movie|book)\./, "");
+  if (item.mediaType.toLowerCase() === "movie" || ["manga", "web_novel"].includes(code)) {
+    manageRow.append(
+      metadataControls(item, code.startsWith("anime_") || item.mediaType.toLowerCase() === "book", async (updated) => {
         await load();
-      } catch (error) {
-        feedback.textContent = String(error);
+        if (isPageActive("detail")) void showDetails(updated, unit);
+      }),
+    );
+  }
+
+  const deleteWrap = node("div", undefined, "detail-delete-wrap");
+  const deleteBtn = node("button", ui("Eliminar de la biblioteca"), "danger-btn");
+  deleteBtn.type = "button";
+  deleteBtn.onclick = () => {
+    const confirm = node("div", undefined, "notice-danger inline-confirm");
+    const msg = node("span", ui("¿Eliminar «{0}» de tu biblioteca local?", displayTitle(item)));
+    const yes = node("button", ui("Confirmar eliminación"), "danger-btn");
+    yes.type = "button";
+    yes.onclick = async () => {
+      yes.disabled = true;
+      try {
+        await invoke<boolean>("delete_catalog_item", { id: item.syncId });
+        await load();
+        void refreshContinue().catch(() => {});
+        goBack();
+        status(ui("Título eliminado de la biblioteca."));
+      } catch (err) {
+        feedback.textContent = String(err);
         feedback.classList.add("error");
-      } finally {
-        saveBtn.disabled = false;
+        yes.disabled = false;
       }
     };
-    ctaHost.append(saveBtn);
-    body.append(feedback);
-  } else {
-    // Chapters / Episodes / Tracks list (full page, NOT a dropdown!)
-    const controls = contentControls(
-      item,
-      (message, error = false) => {
-        if (!isPageActive("detail")) { status(message, error); return; }
-        feedback.textContent = message;
-        feedback.classList.toggle("error", error);
-      },
-      unit,
-      {
-        signal,
-        view: entryView,
-        scrollToHighlight: !sameDetail || newHighlight,
-        onContinueReady: (cta) => {
-          ctaHost.replaceChildren();
-          if (!cta) return;
-          const btn = node("button", cta.label, "primary detail-continue-btn");
-          btn.type = "button";
-          btn.dataset.icon = "play";
-          btn.onclick = cta.run;
-          ctaHost.append(btn);
-        },
-        onUnitsChanged: () => { void invoke<CatalogItem>("library_item",{id:item.syncId}).then(updated => showDetails(updated)).catch(e => status(String(e),true)); },
-        onProgressChanged: () => {
-          void refreshContinue().catch(() => {});
-        },
-      },
-    );
+    const no = node("button", ui("Cancelar"), "quiet-btn");
+    no.type = "button";
+    no.onclick = () => confirm.replaceWith(deleteBtn);
+    confirm.append(msg, yes, no);
+    deleteBtn.replaceWith(confirm);
+  };
+  deleteWrap.append(deleteBtn);
+  managePanel.append(manageRow, deleteWrap);
 
-    // Side-by-side / stacked personal panels: List membership + Friend activity
-    const personalGrid = node("div", undefined, "detail-personal-grid");
-    personalGrid.append(
-      inlineListMembership(item, openListsPage, signal),
-      inlineFriendActivity(item, signal),
-    );
-
-    // Management actions: Metadata refresh + Delete catalog item (with inline confirmation!)
-    const managePanel = node("section", undefined, "surface-panel detail-manage-panel");
-    const manageRow = node("div", undefined, "detail-manage-row");
-    const code = item.subtype.replace(/^(movie|book)\./, "");
-    if (item.mediaType.toLowerCase() === "movie" || ["manga", "web_novel"].includes(code)) {
-      manageRow.append(
-        metadataControls(item, code.startsWith("anime_") || item.mediaType.toLowerCase() === "book", async (updated) => {
-          await load();
-          if (isPageActive("detail")) void showDetails(updated, unit);
-        }),
-      );
-    }
-
-    const deleteWrap = node("div", undefined, "detail-delete-wrap");
-    const deleteBtn = node("button", ui("Eliminar de la biblioteca"), "danger-btn");
-    deleteBtn.type = "button";
-    deleteBtn.onclick = () => {
-      const confirm = node("div", undefined, "notice-danger inline-confirm");
-      const msg = node("span", ui("¿Eliminar «{0}» de tu biblioteca local?", displayTitle(item)));
-      const yes = node("button", ui("Confirmar eliminación"), "danger-btn");
-      yes.type = "button";
-      yes.onclick = async () => {
-        yes.disabled = true;
-        try {
-          await invoke<boolean>("delete_catalog_item", { id: item.syncId });
-          await load();
-          void refreshContinue().catch(() => {});
-          goBack();
-          status(ui("Título eliminado de la biblioteca."));
-        } catch (err) {
-          feedback.textContent = String(err);
-          feedback.classList.add("error");
-          yes.disabled = false;
-        }
-      };
-      const no = node("button", ui("Cancelar"), "quiet-btn");
-      no.type = "button";
-      no.onclick = () => confirm.replaceWith(deleteBtn);
-      confirm.append(msg, yes, no);
-      deleteBtn.replaceWith(confirm);
-    };
-    deleteWrap.append(deleteBtn);
-    managePanel.append(manageRow, deleteWrap);
-
-    body.append(feedback, personalGrid, controls, managePanel);
-  }
+  body.append(feedback, personalGrid, controls, managePanel);
 
   content.replaceChildren(topBar, hero, body);
   const alreadyOnDetail = isPageActive("detail");
@@ -1190,26 +1263,32 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, onlineS
     more.hidden = description.scrollHeight <= description.clientHeight + 1;
   });
 
-  // Quietly refresh chapters, metadata, and artwork in the background (throttled per item)
-  if (!onlineServer) {
-    const lastRefresh = itemRefreshTimes.get(item.syncId) ?? 0;
-    const hasProviders = providerNames.length > 0;
-    const needsArtwork = !safeImage(item.thumbnailRef);
-    if (Date.now() - lastRefresh > 5 * 60_000 && (serverAddress || hasProviders || needsArtwork)) {
-      itemRefreshTimes.set(item.syncId, Date.now());
-      void invokeProfile<RefreshItemResult>("refresh_item", {
+  const lastRefresh = itemRefreshTimes.get(item.syncId) ?? 0;
+  const hasProviders = providerNames.length > 0;
+  const needsArtwork = !safeImage(item.thumbnailRef);
+  if (Date.now() - lastRefresh > 5 * 60_000 && (fromOnline || serverAddress || hasProviders || needsArtwork)) {
+    itemRefreshTimes.set(item.syncId, Date.now());
+    if (fromOnline) feedback.textContent = ui("Consultando proveedores…");
+    void afterPaint().then(() => {
+      if (signal.aborted) return null;
+      return invokeProfile<RefreshItemResult>("refresh_item", {
         id: item.syncId,
         hideAdult: hideAdult(),
-        discover: !hasProviders && needsArtwork,
-      }).then(async res => {
-        if (!res.changed) return;
-        await load();
-        void refreshContinue().catch(() => {});
-        if (seq === detailSequence && !signal.aborted && isPageActive("detail") && !detailProviderActive()) {
-          void showDetails(res.item, unit);
-        }
-      }).catch(() => {});
-    }
+        discover: fromOnline || (!hasProviders && needsArtwork),
+        refreshServer: !fromOnline,
+      });
+    }).then(async res => {
+      if (!res || seq !== detailSequence || signal.aborted) return;
+      if (fromOnline) feedback.textContent = res.errors.length && !res.sourcesChecked.length ? ui("No se pudo actualizar la ficha.") : "";
+      if (!res.changed) return;
+      await load();
+      void refreshContinue().catch(() => {});
+      if (seq === detailSequence && !signal.aborted && isPageActive("detail") && !detailProviderActive()) {
+        void showDetails(res.item, unit);
+      }
+    }).catch(() => {
+      if (fromOnline && !signal.aborted) feedback.textContent = ui("No se pudo actualizar la ficha.");
+    });
   }
 }
 
@@ -1401,7 +1480,7 @@ const startAccount = setupAccount(async () => {
   await refreshListFilterOptions();
   await load();
   void refreshContinue().catch(() => {});
-  if (isPageActive("detail") && currentDetail && !currentDetail.onlineServer) {
+  if (isPageActive("detail") && currentDetail) {
     const { item: { syncId: id }, unit } = currentDetail;
     try {
       const fresh = await invoke<CatalogItem>("library_item", { id });
@@ -1470,9 +1549,10 @@ for (const [id, restore] of [["copy-library", false], ["restore-library", true]]
 
 window.addEventListener("umd-catalog-changed", () => { void load(); void refreshContinue().catch(() => {}); });
 window.addEventListener("umd-provider-availability-changed", () => {
+  refreshFilteredProviders();
   if (isPageActive("detail") && currentDetail) {
-    const { item, unit, onlineServer } = currentDetail;
-    void showDetails(item, unit, onlineServer);
+    const { item, unit } = currentDetail;
+    void showDetails(item, unit);
   }
 });
 window.addEventListener("umd-lists-changed", async () => {

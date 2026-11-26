@@ -1,7 +1,7 @@
 use crate::{normalize, CatalogFilters};
 use rusqlite::{functions::FunctionFlags, types::Value, Connection};
 
-fn genre(label: &str) -> String {
+pub fn genre(label: &str) -> String {
     let key = normalize(&label.replace(['-', '_', '/', '.'], " "));
     match key.as_str() {
         "accion" => "action",

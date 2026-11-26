@@ -306,7 +306,9 @@ export function setupStreams(report: (message: string, error?: boolean) => void)
         provider.replaceChildren(new Option(ui("Todos los proveedores"), ""));
         for (const id of new Set(channels.map(c => c.provider))) provider.add(new Option(providerName(id), id));
         provider.closest("label")!.hidden = mode !== "all";
-        status.textContent = failed.length ? ui("Fuentes que no respondieron: {0}", failed.join(", ")) : "";
+        const single = results.length === 1 ? results[0] : undefined;
+        status.textContent = single?.status === "rejected" ? String(single.reason)
+          : failed.length ? ui("Fuentes que no respondieron: {0}", failed.join(", ")) : "";
         populateGroups();
         byId("channels").hidden = false;
         render(true);

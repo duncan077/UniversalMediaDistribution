@@ -1,6 +1,11 @@
 {
   "Sin títulos locales para mostrar": "No local titles to show",
-  "Podés guardar un título desde su ficha en el servidor.": "Open a server title to save it to your library.",
+  "Abrí un título del servidor para agregarlo a tu biblioteca.": "Open a server title to add it to your library.",
+  "Resultados de proveedores": "Provider results",
+  "Ver más de proveedores": "More from providers",
+  "Consultando proveedores…": "Checking providers…",
+  "Algunos proveedores no respondieron.": "Some providers did not respond.",
+  "Sin resultados de proveedores para estos filtros.": "No provider results match these filters.",
   "Catálogo del servidor": "Server catalog",
   "Consultá el catálogo del servidor y guardá en tu biblioteca los títulos que elijas.": "Browse the server catalog and save the titles you choose to your library.",
   "Conectar": "Connect",

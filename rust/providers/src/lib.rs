@@ -1,5 +1,6 @@
 mod av1;
 pub mod browser_http;
+mod filtered;
 mod doramas;
 mod doramas_public;
 mod jk;
@@ -129,6 +130,7 @@ pub struct Provider {
     doramas_routes: Option<doramas::EpisodeRoutes>,
     olympus_routes: Option<indexed::OlympusChapters>,
     leer_decoder: Option<(Url, Instant, (String, String))>,
+    filter_genres: Option<std::collections::BTreeMap<String, String>>,
 }
 
 struct Pacing {
@@ -161,6 +163,7 @@ impl Provider {
             doramas_routes: None,
             olympus_routes: None,
             leer_decoder: None,
+            filter_genres: None,
         }
     }
     pub async fn open(site: Site) -> Result<Self> {

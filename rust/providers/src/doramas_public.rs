@@ -74,13 +74,7 @@ fn preview(path: &str, name: &str, thumb: Option<String>) -> Option<Entry> {
 
 fn cards(base: &Url, html: &str) -> Vec<Entry> {
     let doc = Document::from(html);
-    let main = doc.select("main a[href]");
-    let list = if main.is_empty() {
-        doc.select("a[href]")
-    } else {
-        main
-    };
-    dedup(list.iter().filter_map(|a| {
+    let read_card = |a: dom_query::Selection<'_>| {
         let url = base
             .join(&a.attr("href")?)
             .ok()
@@ -98,7 +92,12 @@ fn cards(base: &Url, html: &str) -> Vec<Entry> {
             .map(|s| s.to_string());
         let thumb = artwork_url(base, raw_thumb.as_deref());
         preview(path, &name, thumb)
-    }))
+    };
+    let main = dedup(doc.select("main a[href]").iter().filter_map(read_card));
+    if !main.is_empty() {
+        return main;
+    }
+    dedup(doc.select("a[href]").iter().filter_map(read_card))
 }
 
 impl Provider {
@@ -252,5 +251,23 @@ impl Provider {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{slug}-{season}x{key}"));
         self.public_video(&format!("episodios/{route}")).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_recent_cards_when_main_contains_only_navigation_and_episodes() {
+        let base = Url::parse("https://doramasflix.in/").unwrap();
+        let html = r#"
+            <main><a href="/buscar">Buscar</a><a href="/episodios/serie-1x1">Episodio</a></main>
+            <section><article><a href="/doramas-online/serie"><img alt="Serie"></a></article></section>
+        "#;
+        let entries = cards(&base, html);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].external_id, "doramas-online/serie");
+        assert_eq!(entries[0].preview["name"], "Serie");
     }
 }
