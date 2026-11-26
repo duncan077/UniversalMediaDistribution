@@ -779,6 +779,8 @@ async fn fetch_linked_provider_detail(
 #[tauri::command]
 pub async fn refresh_item(
     id: Uuid,
+    remote_id: Option<Uuid>,
+    server: Option<String>,
     hide_adult: Option<bool>,
     discover: Option<bool>,
     refresh_server: Option<bool>,
@@ -809,12 +811,13 @@ pub async fn refresh_item(
         .flatten()
         .is_some_and(|s| !s.trim().is_empty())
     {
-        match crate::remote_item_document(&store, id, hide_adult, None).await {
+        let remote_id = remote_id.unwrap_or(id);
+        match crate::remote_item_document(&store, remote_id, hide_adult, server.as_deref()).await {
             Ok(doc) => {
                 if let Some(incoming) = doc.items.into_iter().next() {
                     let db = store.inner().clone();
                     match work(move || {
-                        db.merge_remote_item(id, incoming)
+                        db.merge_remote_item_for(remote_id, incoming, Some(id))
                             .map_err(|e| e.to_string())
                     })
                     .await

@@ -193,6 +193,8 @@ struct Search {
     browse: bool,
     #[serde(default)]
     summary: bool,
+    #[serde(default)]
+    hide_adult: bool,
     year: Option<i32>,
     genre: Option<String>,
     category: Option<String>,
@@ -238,9 +240,10 @@ async fn items(
     Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
+    let hide_adult = query.hide_adult;
     let query = query.query()?;
     work.run(move || {
-        let page = catalog.encode_public_page(&query, false, 8 << 20)?;
+        let page = catalog.encode_public_page(&query, false, 8 << 20, hide_adult)?;
         Ok(limits::json_bytes(page.body))
     })
     .await
@@ -249,9 +252,10 @@ async fn items(
 async fn recent(
     State(state): State<ServerState>,
     Extension(work): Extension<CatalogWork>,
+    Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
-    work.run(move || Ok(limits::json_bytes(catalog.encode_recent(8 << 20)?)))
+    work.run(move || Ok(limits::json_bytes(catalog.encode_recent(8 << 20, query.hide_adult)?)))
         .await
 }
 
@@ -261,11 +265,12 @@ async fn search(
     Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
+    let hide_adult = query.hide_adult;
     let query = query.query()?;
     let summary = query.filters.summary;
     let (cursor, mut response) = work
         .run(move || {
-            let page = catalog.encode_public_page(&query, true, 8 << 20)?;
+            let page = catalog.encode_public_page(&query, true, 8 << 20, hide_adult)?;
             Ok((page.continuation_token, limits::json_bytes(page.body)))
         })
         .await?;

@@ -1,5 +1,6 @@
 import {ui, displayTitle} from "./locale";
 import {invoke} from "./bridge";
+import {hideAdult, hiddenTitle} from "./content-filter";
 import {attachArtworkImage} from "./artwork";
 import {activeProfileId, getProfilePref, invokeProfile, providerEnabled, setProfilePref, windowProfile, writeProfilePref} from "./profile-context";
 import type {CatalogItem} from "./main";
@@ -11,13 +12,6 @@ interface Edition { id: number; joint: boolean; scan: string; slug: string }
 interface Entry { externalId: string; preview: { name: string; mediaType?:string;subtype?:string; genres?: string[]; categories?: string[]; thumbnailRef?: string | null; releaseYear?: number | null } }
 interface Hit { item?: CatalogItem; summary?:boolean; edition?: Edition; entry?: Entry; title: string; group: string; cover?: string | null }
 interface Page { items: Hit[]; nextPage: number | null }
-
-type ContentLabels = { genres?: string[]; categories?: string[] };
-const adultLabels = new Set(["adult", "adulto", "porn", "porno", "+18", "18+"]);
-export function hiddenTitle(item?: ContentLabels) {
-  return getProfilePref(activeProfileId(), "umd-hide-adult") === "true" && !!item &&
-    [...(item.categories ?? []), ...(item.genres ?? [])].some(label => adultLabels.has(String(label).trim().toLowerCase()));
-}
 
 function similar(a:string,b:string) {
   if (a===b) return !!a;
@@ -44,16 +38,15 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
   let generation = 0;
   let query = "";
   type Source = { id: string; name: string; cursor: string | null; favorite: boolean };
+  type SourcePage = { hits: Hit[]; next: string | null };
   let pending: Source[] = [];
   const providerOptions = () => Array.from(site.options).filter(o => !["all", "local", "server"].includes(o.value));
   const options = providerOptions();
   const explorePrefs = document.getElementById("provider-preferences")!;
   const settingsPrefs = document.getElementById("settings-provider-preferences")!;
-  const hide = document.getElementById("hide-adult") as HTMLInputElement;
   const prefBoxes: { box: HTMLInputElement; id: string; kind: "enabled" | "favorite" }[] = [];
 
   const syncPrefs = (profileId: string | null) => {
-    hide.checked = getProfilePref(profileId, "umd-hide-adult") === "true";
     for (const { box, id, kind } of prefBoxes) {
       box.checked = kind === "enabled" ? providerEnabled(profileId, id) : getProfilePref(profileId, "provider-favorite-" + id) === "true";
     }
@@ -79,7 +72,6 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       void writeProfilePref(key, value).then(onSaved).catch(() => syncPrefs(activeProfileId()));
     }
   };
-  hide.onchange = () => applyPref("umd-hide-adult", String(hide.checked));
   function preferenceBox(id: string, kind: "enabled" | "favorite", text: string) {
     const label = document.createElement("label");
     const box = document.createElement("input");
@@ -177,12 +169,11 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
     try {
       const { activeId } = await windowProfile();
       const sites = options.filter(o => providerEnabled(activeId, o.value)).map(o => o.value);
-      const hideAdult = getProfilePref(activeId, "umd-hide-adult") === "true";
       const refresh = (command: string, extra: Record<string, unknown> = {}) =>
         invoke<number>(command, { sites, ...extra }).then(updated => {
           if (updated) window.dispatchEvent(new Event("umd-catalog-changed"));
         });
-      await Promise.allSettled([refresh("refresh_saved_editions"), refresh("import_daily_updates", { hideAdult })]);
+      await Promise.allSettled([refresh("refresh_saved_editions"), refresh("import_daily_updates", { hideAdult: hideAdult() })]);
       refreshedAt = Date.now();
     } catch {
       /* Retry later or when back online instead of locking out for an hour. */
@@ -246,12 +237,12 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       add.textContent = ui("Agregando…");
       try {
         const item = provider.startsWith("json-") && hit.item
-          ? await invoke<CatalogItem>("json_provider_add",{site:provider,id:hit.item.syncId,preview:hit.summary?null:hit.item,hideAdult:hide.checked})
+          ? await invoke<CatalogItem>("json_provider_add",{site:provider,id:hit.item.syncId,preview:hit.summary?null:hit.item,hideAdult:hideAdult()})
           : hit.item
-          ? (provider === "local" ? hit.item : await invoke<CatalogItem>("import_remote_item", { id: hit.item.syncId, hideAdult: hide.checked }))
+          ? (provider === "local" ? hit.item : await invoke<CatalogItem>("import_remote_item", { id: hit.item.syncId, hideAdult: hideAdult() }))
           : hit.entry
-            ? await invoke<CatalogItem>("provider_add", { site: provider, entry: hit.entry, hideAdult: hide.checked })
-            : await invoke<CatalogItem>("capibara_add", { edition: hit.edition, hideAdult: hide.checked });
+            ? await invoke<CatalogItem>("provider_add", { site: provider, entry: hit.entry, hideAdult: hideAdult() })
+            : await invoke<CatalogItem>("capibara_add", { edition: hit.edition, hideAdult: hideAdult() });
         if (hiddenTitle(item)) throw new Error(ui("El filtro +18 ocultó esta ficha."));
         const openDetails = request === generation && isPageActive("provider");
         await onAdded(item, openDetails);
@@ -268,7 +259,7 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
   }
 
   let daily = false;
-  async function read(source: Source): Promise<{ hits: Hit[]; next: string | null }> {
+  async function read(source: Source): Promise<SourcePage> {
     const mediaType = groupMedia(type.value) || null;
     const subtypeGroup = type.value && type.value !== "audio" ? type.value : null;
     if (source.id === "local" || source.id === "server") {
@@ -279,7 +270,7 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
         items = page.document.items;
         next = page.continuationToken;
       } else {
-        [items, next] = await invoke<[CatalogItem[], string | null]>("search_remote_catalog", { query, cursor: source.cursor, mediaType, subtypeGroup });
+        [items, next] = await invoke<[CatalogItem[], string | null]>("search_remote_catalog", { query, cursor: source.cursor, mediaType, subtypeGroup, hideAdult: hideAdult() });
       }
       return { hits: items.map(item => ({ item, title: displayTitle(item), group: source.name, cover: item.thumbnailRef })), next };
     }
@@ -310,6 +301,8 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
     ]);
     const profileId = profile?.activeId ?? activeProfileId();
     if (request !== generation) return;
+    let serverPage: SourcePage | undefined;
+    const failed: string[] = [];
     if (first) {
       pending = Array.from(site.options)
         .filter(o => {
@@ -330,10 +323,23 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
           favorite: getProfilePref(profileId, "provider-favorite-" + o.value) === "true",
         }))
         .sort((a, b) => Number(b.favorite) - Number(a.favorite));
+      if (site.value === "all" && !daily) {
+        const server = pending.find(source => source.id === "server");
+        if (server) {
+          try {
+            serverPage = await read(server);
+            if (request !== generation) return;
+            pending = pending.filter(source => source.id !== "local");
+          } catch {
+            if (request !== generation) return;
+            failed.push(server.name);
+            pending = pending.filter(source => source !== server);
+          }
+        }
+      }
     }
     const batch = pending.sort((a, b) => Number(b.favorite) - Number(a.favorite));
     pending = [];
-    const failed: string[] = [];
     const groups = batch.map(src => {
       const groupLi = document.createElement("li");
       groupLi.className = "provider-group";
@@ -345,7 +351,7 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
       while (index < batch.length && request === generation) {
         const slot = index++, source = batch[slot], group = groups[slot];
         try {
-          const data = await read(source);
+          const data = (source.id === "server" && serverPage) || await read(source);
           if (request !== generation) return;
           for (const hit of data.hits) {
             if (hiddenTitle(hit.item ?? hit.entry?.preview)) continue;
@@ -419,6 +425,11 @@ export function setupProvider(onAdded: (item: CatalogItem, openDetails: boolean)
 
   onPageEnter("provider", () => {
     void windowProfile().then(({ activeId }) => syncPrefs(activeId)).catch(() => {});
+  });
+  window.addEventListener("umd-content-filter-changed", () => {
+    clear();
+    query = input.value.trim();
+    if (isPageActive("provider") && (query || daily)) void search(true);
   });
 
   document.getElementById("provider-open")!.addEventListener("click", () => openSearch());

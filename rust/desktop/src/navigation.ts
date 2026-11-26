@@ -5,14 +5,26 @@ import { canGoBack, goBack } from "./router";
 function uniformNeighbor(current: HTMLElement, key: string, interactive: string) {
   const card = current.closest<HTMLElement>(".entry-card, .shelf-row > .card, [data-virtual-index]");
   if (!card?.parentElement) return;
+  if (key === "ArrowRight" && current.matches(".entry-select")) {
+    return card.querySelector<HTMLButtonElement>(".entry-alternatives");
+  }
+  if (key === "ArrowLeft" && current.matches(".entry-alternatives")) {
+    return card.querySelector<HTMLButtonElement>(".entry-select");
+  }
   let next: Element | null = null;
   if (card.dataset.virtualIndex !== undefined && (key === "ArrowUp" || key === "ArrowDown")) {
     const columns = Number(card.parentElement.dataset.virtualColumns);
     const index = Number(card.dataset.virtualIndex) + (key === "ArrowUp" ? -columns : columns);
     next = card.parentElement.querySelector(`[data-virtual-index="${index}"]`);
   } else if (card.matches(".entry-card") && (key === "ArrowUp" || key === "ArrowDown")) {
+    if (key === "ArrowUp" && current.closest(".entry-actions, .entry-servers")) {
+      return card.querySelector<HTMLButtonElement>(".entry-select");
+    }
     next = key === "ArrowUp" ? card.previousElementSibling : card.nextElementSibling;
-    if (!next?.matches(".entry-card")) return;
+    while (next && !next.matches(".entry-card")) {
+      next = key === "ArrowUp" ? next.previousElementSibling : next.nextElementSibling;
+    }
+    return next?.querySelector<HTMLButtonElement>(".entry-select");
   } else if (card.matches(".shelf-row > .card") && (key === "ArrowLeft" || key === "ArrowRight")) {
     next = key === "ArrowLeft" ? card.previousElementSibling : card.nextElementSibling;
   }
@@ -60,6 +72,23 @@ export function setupNavigation() {
   if (!navigator.userAgent.includes("UMD-TV")) return;
   document.documentElement.classList.add("television");
   document.getElementById("all")?.focus();
+  const searchFields = "input[type=search]";
+  document.querySelectorAll<HTMLInputElement>(searchFields).forEach(input => { input.readOnly = true; });
+  function enableSearch(target: EventTarget | null) {
+    if (!(target instanceof HTMLInputElement) || !target.matches(searchFields) || !target.readOnly) return false;
+    target.blur();
+    target.readOnly = false;
+    target.focus({preventScroll: true});
+    return true;
+  }
+  document.addEventListener("focusout", event => {
+    const input = event.target;
+    if (input instanceof HTMLInputElement && input.matches(searchFields)) input.readOnly = true;
+  });
+  document.addEventListener("click", event => { enableSearch(event.target); });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Enter" && enableSearch(event.target)) event.preventDefault();
+  });
   const interactive = "button:enabled, input:enabled, select:enabled, summary, a[href], video[controls], audio[controls], [tabindex='0']";
   document.addEventListener("keydown", event => {
     if (event.defaultPrevented || !["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
@@ -79,6 +108,17 @@ export function setupNavigation() {
       }
       return;
     }
+    if (!dialog && event.key === "ArrowRight" && page?.id === "page-catalog" &&
+        current.matches("#rail .nav-item[aria-current='page']")) {
+      const title = Array.from(page.querySelectorAll<HTMLButtonElement>(".open-title:enabled"))
+        .find(button => button.getClientRects().length > 0 && !button.closest("[inert]"));
+      if (title) {
+        event.preventDefault();
+        title.focus({preventScroll: true});
+        title.scrollIntoView({block: "nearest", inline: "nearest"});
+        return;
+      }
+    }
     const horizontal = event.key === "ArrowLeft" || event.key === "ArrowRight";
     if (current.matches("video, audio") && horizontal) return;
     if (!horizontal && current.classList.contains("player-viewport")) {
@@ -89,7 +129,7 @@ export function setupNavigation() {
         return;
       }
     }
-    if (horizontal && current.matches("input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]), textarea") || !horizontal && current.matches("select")) return;
+    if (horizontal && current.matches("input:not([readonly]):not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]), textarea") || !horizontal && current.matches("select")) return;
     const neighbor = uniformNeighbor(current, event.key, interactive);
     if (neighbor && !neighbor.closest("[inert]") && neighbor.getClientRects().length) {
       event.preventDefault();

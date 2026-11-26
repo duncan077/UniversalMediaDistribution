@@ -6,6 +6,7 @@ import {clearProfilePrefs, windowProfile, type Profiles} from "./profile-context
 export function setupProfiles() {
   const element = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
   const trigger = element<HTMLButtonElement>("profiles-open");
+  const triggerName = trigger.querySelector("span")!;
   const dialog = element<HTMLDialogElement>("profiles-dialog");
   const list = element("profiles-list");
   const form = element<HTMLFormElement>("profile-form");
@@ -39,7 +40,11 @@ export function setupProfiles() {
   }
   function showCurrent(state: Profiles) {
     const active = state.profiles.find(p => p.id === state.activeId);
-    if (active) trigger.textContent = ui("Perfil · {0}", active.name);
+    if (active) {
+      const label = ui("Perfil · {0}", active.name);
+      triggerName.textContent = label;
+      trigger.setAttribute("aria-label", label);
+    }
   }
   async function refresh() {
     const state = await invoke<Profiles>("profiles");

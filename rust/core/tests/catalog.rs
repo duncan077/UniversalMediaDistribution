@@ -25,7 +25,7 @@ fn catalog_and_public_search_separate_same_name_comics_manga_and_novels() {
         let local = store.page(&query).unwrap().page.document.items;
         assert_eq!(local.len(), expected);
         assert!(local.iter().all(|item| item.matches_subtype_group(group)));
-        let remote = store.encode_public_page(&query, true, 8 << 20).unwrap();
+        let remote = store.encode_public_page(&query, true, 8 << 20, false).unwrap();
         assert_eq!(
             CatalogDocument::parse(&remote.body).unwrap().items.len(),
             expected
@@ -54,7 +54,7 @@ fn public_page_stops_at_encoded_budget_and_resumes_without_repeating_rows() {
     for search in [false, true] {
         let mut query = CatalogQuery::default();
         for n in 1..=3 {
-            let encoded = store.encode_public_page(&query, search, 1600).unwrap();
+            let encoded = store.encode_public_page(&query, search, 1600, false).unwrap();
             assert!(encoded.body.len() <= 1600);
             let body: serde_json::Value = serde_json::from_slice(&encoded.body).unwrap();
             let items = if search {
@@ -706,7 +706,7 @@ fn recent_shelf_keeps_arrival_order_across_full_publications() {
     next.items.extend(catalog.items.into_iter().rev());
     store.publish(&next).unwrap();
     let names: Vec<_> = store
-        .recently_added()
+        .recently_added(false)
         .unwrap()
         .items
         .into_iter()

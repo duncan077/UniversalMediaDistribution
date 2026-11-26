@@ -4,10 +4,14 @@ import {invoke} from "./bridge";
 import {flushProgress} from "./player";
 
 interface BackupInfo { revision: number; updatedAt: string; hasBackup: boolean; itemCount: number | null; favoriteCount?: number | null; listCount?: number | null }
-interface Login { username: string; displayName: string; backup: BackupInfo | null; backupError?: string; automatic: boolean }
+interface Login { username: string; displayName: string; baseUrl: string; backup: BackupInfo | null; backupError?: string; automatic: boolean }
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) { const result = document.createElement(tag); if (text !== undefined) result.textContent = text; return result; }
 
-export function setupAccount(reloaded: () => Promise<void>, report: (message: string, error?: boolean) => void) {
+export function setupAccount(
+  reloaded: () => Promise<void>,
+  report: (message: string, error?: boolean) => void,
+  serverChanged: (address: string) => void,
+) {
   const button = document.getElementById("account") as HTMLButtonElement;
   const dialog = el("dialog"); dialog.className = "account-dialog"; document.body.append(dialog);
   const header = el("header"); header.className = "dialog-header";
@@ -81,7 +85,11 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
     if (working) return; working = true; message.textContent = ui("Conectando…"); message.className = "";
     content.querySelectorAll<HTMLInputElement | HTMLButtonElement>("button,input").forEach(b => b.disabled = true);
     try { await flushProgress(); await task(); } catch (e) { message.textContent = String(e); message.className = "error"; }
-    finally { working = false; content.querySelectorAll<HTMLInputElement | HTMLButtonElement>("button,input").forEach(b => b.disabled = false); }
+    finally {
+      working = false;
+      if (!logged && !content.querySelector("form")) render();
+      content.querySelectorAll<HTMLInputElement | HTMLButtonElement>("button,input").forEach(b => b.disabled = false);
+    }
   }
   function field(form: HTMLFormElement, title: string, type: string, max: number) {
     const label = el("label", title); label.className = "field"; const input = el("input"); input.type = type; input.required = true; input.maxLength = max; label.append(input); form.append(label); return input;
@@ -89,7 +97,8 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
   function render() {
     content.replaceChildren(); message.textContent = "";
     if (!logged) {
-      const form = el("form"); const url = field(form, ui("Servidor"), "url", 2048); url.placeholder = "https://tu-servidor";
+      const form = el("form"); const url = field(form, ui("Dirección del servidor"), "text", 2048);
+      url.inputMode = "url"; url.setAttribute("autocomplete", "url"); url.spellcheck = false; url.placeholder = "umd.example.com";
       const user = field(form, ui("Usuario"), "text", 64); user.autocomplete = "username"; user.minLength = 3;
       const password = field(form, ui("Contraseña"), "password", 256); password.autocomplete = "current-password"; password.minLength = 1;
       const display = field(form, ui("Nombre visible"), "text", 100); display.required = false; display.parentElement!.hidden = true;
@@ -104,6 +113,7 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
       form.addEventListener("submit", event => { event.preventDefault(); void action(async () => {
         try {
           logged = await invokeProfile<Login>("account_login", { baseUrl: url.value, username: user.value, password: password.value, register: register.checked, displayName: display.value.trim() || null, deviceName: device.value.trim() || device.placeholder });
+          serverChanged(logged.baseUrl);
           password.value = "";
           button.textContent = logged.displayName;
           window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:true}));
@@ -158,6 +168,16 @@ export function setupAccount(reloaded: () => Promise<void>, report: (message: st
     }
     const logout = el("button", ui("Cerrar sesión")); logout.type = "button"; logout.className = "logout"; logout.addEventListener("click", () => action(async () => { await invokeProfile("account_logout",{purgeDownloads:getProfilePref(activeProfileId(),"torrent-purge")==="on"}); logged = null; window.dispatchEvent(new CustomEvent("umd-account-changed",{detail:false})); button.textContent = ui("Cuenta y respaldo"); render(); })); content.append(logout);
   }
+  window.addEventListener("umd-server-changed", event => {
+    const address = (event as CustomEvent<string>).detail;
+    if (logged && logged.baseUrl !== address) {
+      logged = null;
+      pendingLocalChanges = false;
+      button.textContent = ui("Cuenta y respaldo");
+      window.dispatchEvent(new CustomEvent("umd-account-changed", {detail:false}));
+      if (dialog.open && !working) render();
+    }
+  });
   button.addEventListener("click", async () => {
     if (working) { if (!dialog.open) dialog.showModal(); return; }
     try {

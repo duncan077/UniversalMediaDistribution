@@ -3,6 +3,7 @@ import {invoke} from "./bridge";
 import {Channel} from "@tauri-apps/api/core";
 import {invokeProfile} from "./profile-context";
 import type {CatalogItem} from "./main";
+import {hiddenTitle} from "./content-filter";
 import type {Target} from "./player";
 import {isPageActive, navigateTo, onPageEnter} from "./router";
 
@@ -309,7 +310,7 @@ async function findTitle(title: PartyTitle) {
   try {
     const ids = await invoke<string[]>("party_titles", { mediaType: title.mediaType, name: title.name });
     if (!activeContainer() || !same(room?.content, title)) return;
-    const items = ids.length ? await invoke<CatalogItem[]>("library_summaries", {ids}) : [];
+    const items = ids.length ? (await invoke<CatalogItem[]>("library_summaries", {ids})).filter(item => !hiddenTitle(item)) : [];
     if (!activeContainer() || !same(room?.content, title)) return;
     if (!items.length) {
       setStatus(ui("Este título todavía no está en tu biblioteca. Importá su catálogo y volvé a abrirlo."));

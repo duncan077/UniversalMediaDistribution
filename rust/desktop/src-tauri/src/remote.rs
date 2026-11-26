@@ -1,6 +1,6 @@
 use crate::{private_files::PrivateFiles, work, CommandResult};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 use umd_core::{CatalogStore, MAX_DOCUMENT_BYTES};
 pub(crate) mod friends;
 mod incremental;
@@ -24,6 +24,66 @@ struct Session {
     party_socket: Option<party::Connection>,
     etag: Option<(i64, reqwest::header::HeaderValue)>,
     last_sync: Option<(i64, (u64, i64))>,
+}
+
+fn saved_server_address(store: &CatalogStore) -> CommandResult<Option<String>> {
+    store.setting("server_url")
+        .map(|address| address.filter(|value| !value.trim().is_empty()))
+        .map_err(|e| e.to_string())
+}
+
+fn persist_server_address(store: &CatalogStore, base: &reqwest::Url) -> CommandResult<bool> {
+    if saved_server_address(store)?.as_deref() == Some(base.as_str()) {
+        return Ok(false);
+    }
+    store.set_setting("server_url", base.as_str()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn publish_server_address(
+    app: &tauri::AppHandle,
+    store: &CatalogStore,
+    base: &reqwest::Url,
+    sessions: &mut std::collections::HashMap<uuid::Uuid, Session>,
+) -> CommandResult<()> {
+    let changed = persist_server_address(store, base)?;
+    // An account token only belongs to the server that issued it.
+    sessions.retain(|_, session| session.base == *base);
+    if changed {
+        app.state::<crate::artwork::Origin>().set(Some(base.clone()));
+        let _ = app.emit("server-address-changed", base.as_str());
+    }
+    Ok(())
+}
+
+impl RemoteState {
+    pub(crate) async fn configure_server(
+        &self,
+        app: &tauri::AppHandle,
+        store: &CatalogStore,
+        base: &reqwest::Url,
+    ) -> CommandResult<()> {
+        let mut sessions = self.0.lock().await;
+        publish_server_address(app, store, base, &mut sessions)
+    }
+}
+
+pub(crate) fn reuse_legacy_server(store: &CatalogStore, files: &PrivateFiles) -> CommandResult<()> {
+    if saved_server_address(store)?.is_some() {
+        return Ok(());
+    }
+    let profiles = store.profiles().map_err(|e| e.to_string())?;
+    let Ok(active) = uuid::Uuid::parse_str(&profiles.active_id) else {
+        return Ok(());
+    };
+    if let Ok(Some(saved)) = files.read::<SavedSession>(active, "session") {
+        if saved.is_current() {
+            if let Ok(base) = private_url(&saved.base) {
+                persist_server_address(store, &base)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(PartialEq)]
@@ -110,26 +170,9 @@ pub(crate) async fn json_response(mut response: reqwest::Response) -> CommandRes
     .await
 }
 pub(crate) fn private_url(value: &str) -> CommandResult<reqwest::Url> {
-    let mut base = reqwest::Url::parse(value.trim()).map_err(|e| e.to_string())?;
-    if !base.username().is_empty()
-        || base.password().is_some()
-        || base.host_str().is_none()
-        || !matches!(base.scheme(), "http" | "https")
-    {
-        return Err("Dirección de servidor inválida.".into());
-    }
-    if base.scheme() == "http"
-        && !matches!(
-            base.host_str(),
-            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
-        )
-    {
+    let base = crate::server_base(value)?;
+    if base.scheme() == "http" && !crate::loopback_server(&base) {
         return Err("Para iniciar sesión fuera de esta computadora, usá HTTPS.".into());
-    }
-    base.set_query(None);
-    base.set_fragment(None);
-    if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
     }
     Ok(base)
 }
@@ -144,6 +187,20 @@ struct SavedSession {
     gzip: bool,
     automatic: bool,
 }
+impl SavedSession {
+    fn is_current(&self) -> bool {
+        chrono::DateTime::parse_from_rfc3339(&self.expires).is_ok_and(|v| v > chrono::Utc::now())
+    }
+}
+
+fn login_server_address(store: &CatalogStore, address: Option<&str>) -> CommandResult<reqwest::Url> {
+    if let Some(address) = address.filter(|value| !value.trim().is_empty()) {
+        return private_url(address);
+    }
+    let address = saved_server_address(store)?.ok_or("Primero conectá un servidor.")?;
+    private_url(&address)
+}
+
 fn session_client() -> CommandResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
@@ -154,8 +211,9 @@ fn session_client() -> CommandResult<reqwest::Client> {
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn account_login(
+    app: tauri::AppHandle,
     profile_id: uuid::Uuid,
-    base_url: String,
+    base_url: Option<String>,
     username: String,
     password: String,
     register: bool,
@@ -167,7 +225,7 @@ pub async fn account_login(
 ) -> CommandResult<Value> {
     let mut state = remote.0.lock().await;
     let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
-    let base = private_url(&base_url)?;
+    let base = login_server_address(&store, base_url.as_deref())?;
     let client = session_client()?;
     let path = if register {
         "api/v1/accounts/register"
@@ -230,8 +288,15 @@ pub async fn account_login(
     } else {
         files.remove(profile_id, "session")?;
     }
-    // Revoke a previous session when replacing the in-memory account.
-    if let Some(old) = state.remove(&profile_id) {
+    let old = state.remove(&profile_id);
+    if let Err(error) = publish_server_address(&app, &store, &session.base, &mut state) {
+        state.extend(old.map(|session| (profile_id, session)));
+        return Err(error);
+    }
+    let automatic = session.automatic;
+    let base_url = session.base.to_string();
+    state.insert(profile_id, session);
+    if let Some(old) = old {
         let _ = old
             .client
             .delete(old.base.join("api/v1/accounts/session").unwrap())
@@ -239,10 +304,8 @@ pub async fn account_login(
             .send()
             .await;
     }
-    let automatic = session.automatic;
-    state.insert(profile_id, session);
     Ok(
-        json!({"username":result["username"],"displayName":result["displayName"],"backup":backup.ok(),"backupError":backup_error,"automatic":automatic}),
+        json!({"username":result["username"],"displayName":result["displayName"],"baseUrl":base_url,"backup":backup.ok(),"backupError":backup_error,"automatic":automatic}),
     )
 }
 async fn fetch(session: &mut Session) -> CommandResult<Value> {
@@ -403,24 +466,30 @@ pub async fn account_logout(
 
 #[tauri::command]
 pub async fn account_current(
+    app: tauri::AppHandle,
     store: State<'_, CatalogStore>,
     files: State<'_, PrivateFiles>,
     profile_id: uuid::Uuid,
     remote: State<'_, RemoteState>,
 ) -> CommandResult<Option<Value>> {
     let mut guard = remote.0.lock().await;
-    if let std::collections::hash_map::Entry::Vacant(slot) = guard.entry(profile_id) {
+    if !guard.contains_key(&profile_id) {
         let store = store.for_profile(profile_id).map_err(|e| e.to_string())?;
         let Some(saved) = files.read::<SavedSession>(profile_id, "session")? else {
             return Ok(None);
         };
-        if !chrono::DateTime::parse_from_rfc3339(&saved.expires)
-            .is_ok_and(|v| v > chrono::Utc::now())
-        {
+        if !saved.is_current() {
             files.remove(profile_id, "session")?;
             return Ok(None);
         }
         let base = private_url(&saved.base)?;
+        if let Some(address) = saved_server_address(&store)? {
+            if crate::server_base(&address)? != base {
+                return Ok(None);
+            }
+        } else {
+            publish_server_address(&app, &store, &base, &mut guard)?;
+        }
         let revision = store
             .backup_revision(base.as_str(), saved.account)
             .map_err(|e| e.to_string())?;
@@ -447,10 +516,11 @@ pub async fn account_current(
             }
             restored.user["backupError"] = json!(e);
         }
-        slot.insert(restored);
+        guard.insert(profile_id, restored);
     }
     Ok(guard.get(&profile_id).map(|session| {
         let mut user = session.user.clone();
+        user["baseUrl"] = json!(session.base.as_str());
         user["automatic"] = json!(session.automatic);
         user["backup"] = session
             .pending
@@ -848,6 +918,8 @@ mod tests {
             "http://example.org",
             "file:///etc/passwd",
             "https://user:secret@example.org",
+            "user:secret@example.org",
+            "https:/example.org",
             "javascript:alert(1)",
         ] {
             assert!(private_url(url).is_err(), "{url}");
@@ -859,11 +931,43 @@ mod tests {
         ] {
             assert!(private_url(url).is_ok(), "{url}");
         }
-        assert_eq!(
-            private_url("https://example.org/umd?q=x#fragment")
-                .unwrap()
-                .as_str(),
-            "https://example.org/umd/"
-        );
+        for (input, expected) in [
+            (" example.org/umd/api/v1?q=x#fragment ", "https://example.org/umd/"),
+            ("example.org:8443", "https://example.org:8443/"),
+            ("127.0.0.1:9005", "http://127.0.0.1:9005/"),
+            ("localhost:443", "http://localhost:443/"),
+            ("[::1]:9005", "http://[::1]:9005/"),
+        ] {
+            assert_eq!(private_url(input).unwrap().as_str(), expected);
+            assert_eq!(crate::server_base(input).unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn account_and_catalog_reuse_the_saved_address() {
+        let store = CatalogStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let files = PrivateFiles(dir.path().to_owned());
+        let active = uuid::Uuid::parse_str(&store.profiles().unwrap().active_id).unwrap();
+        assert!(login_server_address(&store, None).is_err());
+        let previous = SavedSession {
+            base: "https://account.example.org/".into(),
+            account: uuid::Uuid::new_v4(),
+            user: Value::Null,
+            token: "test".into(),
+            expires: (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+            incremental: false,
+            gzip: false,
+            automatic: false,
+        };
+        files.save(active, "session", &previous).unwrap();
+        reuse_legacy_server(&store, &files).unwrap();
+        assert_eq!(crate::catalog_base(&store).unwrap().as_str(), previous.base);
+        assert_eq!(login_server_address(&store, None).unwrap().as_str(), previous.base);
+        let replacement = login_server_address(&store, Some("catalog.example.org")).unwrap();
+        assert!(persist_server_address(&store, &replacement).unwrap());
+        reuse_legacy_server(&store, &files).unwrap();
+        assert_eq!(crate::catalog_base(&store).unwrap(), replacement);
+        assert_eq!(login_server_address(&store, None).unwrap(), replacement);
     }
 }

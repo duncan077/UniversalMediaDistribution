@@ -4,6 +4,7 @@ import {invoke} from "./bridge";
 import type {CatalogItem} from "./main";
 import {setupSharedLists} from "./shared-lists";
 import {isPageActive, navigateTo, onPageEnter} from "./router";
+import {hiddenTitle} from "./content-filter";
 
 export interface MediaListEntry { itemId?: string; name: string }
 export interface MediaList { id: string; name: string; items: MediaListEntry[] }
@@ -265,6 +266,7 @@ export function setupLists(
     const frag = document.createDocumentFragment();
     for (const entry of activeList.items) {
       const item = entry.itemId ? byId.get(entry.itemId) : undefined;
+      if (hiddenTitle(item)) continue;
       if (item) {
         const card = renderCard(item, () => showDetails(item), true);
         const removeFromList = el("button", "×", "list-card-remove");
@@ -293,6 +295,9 @@ export function setupLists(
 
   onPageEnter("lists", () => {
     void render().catch(e => { output.textContent = String(e); });
+  });
+  window.addEventListener("umd-content-filter-changed", () => {
+    if (isPageActive("lists")) void render().catch(e => { output.textContent = String(e); });
   });
 
   form.onsubmit = e => {

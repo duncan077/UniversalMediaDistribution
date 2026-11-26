@@ -10,6 +10,31 @@ use umd_server::{router, ServerState};
 const TOKEN: &str = "test-admin-token-with-at-least-32-bytes";
 
 #[tokio::test]
+async fn adult_filter_runs_before_search_and_recent_limits() {
+    let catalog = CatalogStore::in_memory().unwrap();
+    let items = (1..=15).map(|id| {
+        let genres = if id <= 2 { vec!["Fantasía"] } else { vec!["Erótico"] };
+        serde_json::from_value(json!({
+            "syncId":uuid::Uuid::from_u128(id),
+            "name":format!("Obra {id}"), "mediaType":"book", "subtype":"manga", "genres":genres,
+        })).unwrap()
+    }).collect();
+    catalog.import(&umd_core::CatalogDocument::new(items), false).unwrap();
+    let app = app_with_catalog(catalog);
+    for (path, expected) in [
+        ("/api/v1/catalog/search?hideAdult=true&limit=3", vec!["Obra 1", "Obra 2"]),
+        ("/api/v1/catalog/search?limit=3", vec!["Obra 1", "Obra 2", "Obra 3"]),
+        ("/api/v1/catalog/recent?hideAdult=true", vec!["Obra 2", "Obra 1"]),
+    ] {
+        let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+        let document = umd_core::CatalogDocument::parse(&bytes).unwrap();
+        assert_eq!(document.items.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[tokio::test]
 async fn filtered_summary_preserves_id_and_full_detail() {
     let app = app();
     let document = json!({"format":"universal-media-distribution.catalog","version":1,"items":[

@@ -1,7 +1,9 @@
 use crate::*;
 use rusqlite::{params, Connection};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -407,11 +409,12 @@ impl CatalogStore {
         query: &CatalogQuery,
         search: bool,
         max: usize,
+        hide_adult: bool,
     ) -> Result<EncodedCatalogPage> {
         query.validate_limit(if search { 500 } else { 100 })?;
         let cursor = canonical_cursor(query)?;
         let count = query.limit.unwrap_or(50) as usize;
-        let (filter, mut args) = page_filter(self.1, query, false);
+        let (filter, mut args) = page_filter(self.1, query, hide_adult);
         args.extend([cursor.into(), (count as i64 + 1).into()]);
         let column = if query.filters.summary {
             "s.summary"
@@ -560,23 +563,7 @@ impl CatalogStore {
         } else {
             None
         };
-        let mut favorite_ids = Vec::new();
-        {
-            let favorites_sql = if hide_adult {
-                format!(
-                    "SELECT f.id FROM rust_favorites f JOIN rust_catalog_summary s ON s.id=f.id WHERE f.profile_id=?1{HIDE_ADULT_SQL} ORDER BY f.id"
-                )
-            } else {
-                "SELECT id FROM rust_favorites WHERE profile_id=?1 ORDER BY id".into()
-            };
-            let mut favorites = connection.prepare_cached(&favorites_sql)?;
-            for row in favorites.query_map([self.1.to_string()], |row| row.get::<_, String>(0))? {
-                favorite_ids.push(
-                    Uuid::parse_str(&row?)
-                        .map_err(|_| Error::Invalid("Invalid favorite identity".into()))?,
-                );
-            }
-        }
+        let favorite_ids = self.favorite_ids_from(&connection, hide_adult)?;
         let mut document = CatalogDocument::new(items);
         document.exported_at = updated_at;
         document.source_label = source_label;
@@ -629,11 +616,29 @@ impl CatalogStore {
         Ok((format!("W/{validator}"), document))
     }
 
-    pub fn encode_recent(&self, max: usize) -> Result<Vec<u8>> {
+    pub fn encode_recent(&self, max: usize, hide_adult: bool) -> Result<Vec<u8>> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
-        let mut statement = db.prepare_cached("SELECT s.summary FROM rust_catalog_arrivals a JOIN rust_catalog_summary s ON s.id=a.id ORDER BY a.rowid DESC LIMIT 12")?;
-        let rows = statement.query([])?;
+        let mut statement = db.prepare_cached(RECENT_ADDITIONS_SQL)?;
+        let rows = statement.query([hide_adult])?;
         encode_document(rows, &now(), Some("Universal Media Distribution"), max)
+    }
+
+    pub fn favorite_ids(&self, hide_adult: bool) -> Result<Vec<Uuid>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        self.favorite_ids_from(&db, hide_adult)
+    }
+
+    fn favorite_ids_from(&self, connection: &Connection, hide_adult: bool) -> Result<Vec<Uuid>> {
+        let sql = if hide_adult {
+            "SELECT f.id FROM rust_favorites f JOIN rust_catalog_summary s ON s.id=f.id WHERE f.profile_id=?1 AND NOT s.is_adult ORDER BY f.id"
+        } else {
+            "SELECT id FROM rust_favorites WHERE profile_id=?1 ORDER BY id"
+        };
+        let mut query = connection.prepare_cached(sql)?;
+        let rows = query.query_map([self.1.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            Uuid::parse_str(&row?).map_err(|_| Error::Invalid("Invalid favorite identity".into()))
+        }).collect()
     }
 
     pub fn encode_public_item(&self, id: Uuid, max: usize) -> Result<Option<Vec<u8>>> {
@@ -720,21 +725,24 @@ impl CatalogStore {
             Some((revision, updated, choices.clone()));
         Ok(choices)
     }
-    pub fn home_recent(&self) -> Result<serde_json::Value> {
-        let added = self.recently_added()?;
+    pub fn home_recent(&self, hide_adult: bool) -> Result<serde_json::Value> {
+        let added = self.recently_added(hide_adult)?;
         let db = self.0.lock().map_err(|_| Error::Lock)?;
-        let mut stmt=db.prepare("SELECT s.summary FROM rust_catalog_changes c JOIN rust_catalog_summary s ON s.id=c.id ORDER BY c.changed_at DESC,c.rowid DESC LIMIT 20")?;
+        let mut stmt = db.prepare_cached(
+            "SELECT s.summary FROM rust_catalog_changes c JOIN rust_catalog_summary s ON s.id=c.id
+             WHERE (NOT ?1 OR NOT s.is_adult) ORDER BY c.changed_at DESC, c.rowid DESC LIMIT 20",
+        )?;
         let mut updated = Vec::new();
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+        for row in stmt.query_map([hide_adult], |r| r.get::<_, String>(0))? {
             updated.push(serde_json::from_str::<CatalogItem>(&row?)?);
         }
         Ok(serde_json::json!({"added":added.items,"updated":updated}))
     }
 
-    pub fn recently_added(&self) -> Result<CatalogDocument> {
+    pub fn recently_added(&self, hide_adult: bool) -> Result<CatalogDocument> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
-        let mut stmt = db.prepare_cached("SELECT s.summary FROM rust_catalog_arrivals a JOIN rust_catalog_summary s ON s.id=a.id ORDER BY a.rowid DESC LIMIT 12")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut stmt = db.prepare_cached(RECENT_ADDITIONS_SQL)?;
+        let rows = stmt.query_map([hide_adult], |r| r.get::<_, String>(0))?;
         let mut items = Vec::new();
         for row in rows {
             items.push(serde_json::from_str(&row?)?);
@@ -895,6 +903,76 @@ impl CatalogStore {
             .map(|text| serde_json::from_str(&text))
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// Find counterparts even when the local title is on a different page.
+    pub fn matching_catalog_summaries(
+        &self,
+        titles: &[CatalogItem],
+    ) -> Result<BTreeMap<Uuid, CatalogItem>> {
+        let connection = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut matches = BTreeMap::new();
+        for title in titles {
+            if let Some(id) = title.sync_id {
+                if let Some(local) = Self::matching_summary_from(&connection, id, title)? {
+                    matches.insert(id, local);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    pub(crate) fn matching_summary_from(
+        connection: &Connection,
+        id: Uuid,
+        title: &CatalogItem,
+    ) -> Result<Option<CatalogItem>> {
+        if let Some(exact) = Self::summary_from(connection, id)? {
+            return Ok(Some(exact));
+        }
+        fn year(item: &CatalogItem) -> Option<i64> {
+            item.metadata
+                .get("releaseYear")
+                .and_then(Value::as_i64)
+                .or_else(|| item.metadata.get("releaseDate")?.as_str()?.get(..4)?.parse().ok())
+                .filter(|year| (1800..=2200).contains(year))
+        }
+        let mut query = connection.prepare_cached(
+            "SELECT s.summary FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE c.name_key=?1",
+        )?;
+        let mut rows = query.query([title.key()])?;
+        let incoming_year = year(title);
+        let incoming_providers = title
+            .metadata
+            .get("onlineProviders")
+            .and_then(Value::as_object);
+        let mut matched = None;
+        while let Some(row) = rows.next()? {
+            let local: CatalogItem = serde_json::from_slice(raw_text(row, 0)?)?;
+            if year(&local)
+                .zip(incoming_year)
+                .is_some_and(|(a, b)| a != b)
+            {
+                continue;
+            }
+            if let (Some(local_providers), Some(incoming_providers)) = (
+                local.metadata.get("onlineProviders").and_then(Value::as_object),
+                incoming_providers,
+            ) {
+                if local_providers.iter().any(|(site, value)| {
+                    value.as_str()
+                        .zip(incoming_providers.get(site).and_then(Value::as_str))
+                        .is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b))
+                }) {
+                    continue;
+                }
+            }
+            if matched.is_some() {
+                return Ok(None);
+            }
+            matched = Some(local);
+        }
+        Ok(matched)
     }
 
     pub fn summaries(&self, ids: &[Uuid]) -> Result<Vec<CatalogItem>> {
@@ -1213,6 +1291,9 @@ fn canonical_cursor(query: &CatalogQuery) -> Result<String> {
 }
 
 const HIDE_ADULT_SQL: &str = " AND NOT s.is_adult";
+const RECENT_ADDITIONS_SQL: &str =
+    "SELECT s.summary FROM rust_catalog_arrivals a JOIN rust_catalog_summary s ON s.id=a.id
+     WHERE (NOT ?1 OR NOT s.is_adult) ORDER BY a.rowid DESC LIMIT 12";
 
 fn page_filter(
     profile: Uuid,

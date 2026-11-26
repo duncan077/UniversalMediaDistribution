@@ -1,7 +1,10 @@
 package org.universalmediadistribution.rust
 
 import android.content.Context
+import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.ColorDrawable
 import android.media.MediaPlayer
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -35,6 +38,8 @@ class NativePlayback(private val owner: MainActivity) {
   private var library: LibVLC? = null
   private var surface: Surface? = null
   private var view: View? = null
+  private var videoWeb: WebView? = null
+  private var webBackground = Color.WHITE
   private var ready = false
   private var ended = false
   private var error = ""
@@ -117,6 +122,7 @@ class NativePlayback(private val owner: MainActivity) {
     val oldLibrary = library; library = null
     val oldSurface = surface; surface = null
     view?.let { (it.parent as? ViewGroup)?.removeView(it) }; view = null
+    videoWeb?.setBackgroundColor(webBackground); videoWeb = null
     session = ""; ready = false; ended = false; error = ""
     tracksDirty = true; devicesDirty = true
     changingRenderer = false; rendererFailed = false
@@ -206,12 +212,16 @@ class NativePlayback(private val owner: MainActivity) {
   private fun open(a: JSONObject, web: WebView) {
     val uri = Uri.parse(a.getString("source"))
     val root = owner.findViewById<FrameLayout>(android.R.id.content)
+    webBackground = (web.background as? ColorDrawable)?.color ?: Color.WHITE
+    videoWeb = web
+    web.setBackgroundColor(Color.TRANSPARENT)
     if (a.getString("engine") == "vlc") {
-      val renderer = VLCVideoLayout(owner); view = renderer; root.addView(renderer)
+      val renderer = VLCVideoLayout(owner); view = renderer; root.addView(renderer, 0)
+      renderer.setBackgroundColor(Color.BLACK)
       layout(web,a.getJSONObject("box"))
       val core = LibVLC(owner, arrayListOf("--no-video-title-show")); library=core
       val player = VlcPlayer(core); vlc = player
-      player.attachViews(renderer,null,false,false)
+      player.attachViews(renderer,null,false,true)
       player.setEventListener { event -> if (vlc === player) when(event.type) {
         VlcPlayer.Event.Playing -> { ready=true; ended=false; tracksDirty=true }
         VlcPlayer.Event.ESAdded, VlcPlayer.Event.ESDeleted, VlcPlayer.Event.ESSelected -> tracksDirty=true
@@ -230,7 +240,8 @@ class NativePlayback(private val owner: MainActivity) {
       player.play()
     } else {
       val frame = FrameLayout(owner)
-      view = frame; root.addView(frame); layout(web, a.getJSONObject("box"))
+      frame.setBackgroundColor(Color.BLACK)
+      view = frame; root.addView(frame, 0); layout(web, a.getJSONObject("box"))
       val renderer = TextureView(owner)
       frame.addView(renderer, FrameLayout.LayoutParams(-1, -1))
       captionView = TextView(owner).also { text ->
@@ -240,6 +251,17 @@ class NativePlayback(private val owner: MainActivity) {
         frame.addView(text, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
       }
       val player=MediaPlayer(); system=player
+      fun fitVideo() {
+        val width = renderer.width.toFloat()
+        val height = renderer.height.toFloat()
+        if (system !== player || width <= 0 || height <= 0 || player.videoWidth <= 0 || player.videoHeight <= 0) return
+        val aspect = player.videoWidth.toFloat() / player.videoHeight
+        val scaleX = (height * aspect / width).coerceAtMost(1f)
+        val scaleY = (width / (height * aspect)).coerceAtMost(1f)
+        renderer.setTransform(Matrix().apply { setScale(scaleX, scaleY, width / 2, height / 2) })
+      }
+      renderer.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitVideo() }
+      player.setOnVideoSizeChangedListener { _, _, _ -> fitVideo() }
       fun attach(texture:SurfaceTexture) { surface?.release(); surface=Surface(texture); player.setSurface(surface) }
       renderer.surfaceTextureListener=object:TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(t:SurfaceTexture,w:Int,h:Int) { if(system===player) attach(t) }

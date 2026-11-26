@@ -2,6 +2,7 @@ import {invoke} from "./bridge";
 import {ui} from "./locale";
 import {ProviderMedia} from "./provider-playback";
 import {attachPartyPlayer} from "./party";
+import {attachPlaybackOverlay} from "./playback-overlay";
 import {nativeSourceUrl} from "./safety";
 import type {Target} from "./player";
 
@@ -10,11 +11,11 @@ interface State {closed?:boolean;error?:string;ready?:boolean;paused:boolean;end
   audio?:Track[];subtitle?:Track[];selectedAudio:number;selectedSubtitle:number;renderers?:Track[];selectedRenderer?:number;rendererFailed?:boolean}
 interface PlayerOptions {
   engines:HTMLSelectElement; servers?:HTMLSelectElement; wireless?:HTMLButtonElement;
-  fullscreenButton?:HTMLButtonElement;
+  fullscreenButton:HTMLButtonElement;
   initiallyPaused:boolean; discover?:boolean; startCast:()=>void;
 }
 
-function formatMediaTime(seconds: number): string {
+export function formatMediaTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const total = Math.floor(seconds);
   const h = Math.floor(total / 3600);
@@ -41,50 +42,6 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   stagePlaceholder.append(stageBadge,stageText);
   view.append(stagePlaceholder);
 
-  // Ultra-slim top bar shown when Modo cine (immersive mode) hides the main header & HUD
-  const immersiveBar=document.createElement("div");
-  immersiveBar.className="player-immersive-bar";
-  immersiveBar.hidden=true;
-  const immersiveLead=document.createElement("div");
-  immersiveLead.className="player-immersive-lead";
-  const immersiveTitle=document.createElement("span");
-  immersiveTitle.className="player-immersive-title";
-  immersiveTitle.textContent=label;
-  const immersiveTime=document.createElement("span");
-  immersiveTime.className="player-immersive-time";
-  immersiveTime.textContent="0:00";
-  immersiveLead.append(immersiveTitle,immersiveTime);
-
-  const immersiveActions=document.createElement("div");
-  immersiveActions.className="player-immersive-actions";
-  const immersiveToggle=document.createElement("button");
-  immersiveToggle.type="button";
-  immersiveToggle.className="quiet-btn player-immersive-play";
-  immersiveToggle.textContent="▶";
-  immersiveToggle.setAttribute("aria-label",ui("Reproducir"));
-  const exitImmersiveBtn=document.createElement("button");
-  exitImmersiveBtn.type="button";
-  exitImmersiveBtn.className="quiet-btn";
-  exitImmersiveBtn.textContent=ui("Mostrar controles");
-  const immersiveClose=document.createElement("button");
-  immersiveClose.type="button";
-  immersiveClose.className="close";
-  immersiveClose.textContent="×";
-  immersiveClose.setAttribute("aria-label",ui("Cerrar reproductor"));
-  immersiveClose.onclick=()=>dialog.close();
-  immersiveActions.append(immersiveToggle,exitImmersiveBtn,immersiveClose);
-  immersiveBar.append(immersiveLead,immersiveActions);
-  view.before(immersiveBar);
-
-  const theatreBtn=document.createElement("button");
-  theatreBtn.type="button";
-  theatreBtn.className="player-icon-btn player-theatre-btn";
-  theatreBtn.textContent="⤢";
-  theatreBtn.title=ui("Modo cine");
-  theatreBtn.setAttribute("aria-label",ui("Modo cine"));
-  theatreBtn.setAttribute("aria-pressed","false");
-  header.insertBefore(theatreBtn, options.fullscreenButton ?? header.lastElementChild);
-
   const controls=document.createElement("div");controls.className="native-hud";view.after(controls);
   controls.setAttribute("role","group");controls.setAttribute("aria-label",ui("Controles de reproducción"));
   const timeline=document.createElement("div"), mainBar=document.createElement("div");
@@ -103,6 +60,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
 
   const toggle=document.createElement("button"), seek=document.createElement("input");
   toggle.type="button";toggle.className="primary native-play-btn";
+  toggle.disabled=true;
   const toggleGlyph=document.createElement("span"), toggleLabel=document.createElement("span");
   toggleGlyph.className="native-btn-glyph";toggleGlyph.setAttribute("aria-hidden","true");toggleGlyph.textContent="▶";
   toggleLabel.className="native-btn-label";toggleLabel.textContent=ui("Reproducir");
@@ -177,21 +135,6 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   timeline.append(elapsedDisplay, seek, durationDisplay);
   transport.append(toggle, back, forward, volumeGroup, stateChip);
 
-  let hudTimer=0;
-  const wake=()=>{
-    controls.classList.remove("native-hud-idle");
-    dialog.classList.remove("player-chrome-idle");
-    clearTimeout(hudTimer);
-    hudTimer=window.setTimeout(()=>{
-      if(!controls.matches(":hover,:focus-within") && !header.matches(":hover,:focus-within") && state?.ready && !state.paused) {
-        controls.classList.add("native-hud-idle");
-        dialog.classList.add("player-chrome-idle");
-      }
-    },3500);
-  };
-  for(const event of ["pointermove","pointerdown","keydown","focusin"]) dialog.addEventListener(event,wake,eventOpts);
-  wake();
-
   const audio=tracks(ui("Audio"),"audio"),subs=tracks(ui("Subtítulos"),"subtitle");
   const externalCaptions = engine === "android"
     ? sidecars.slice(0,100).map((track,i) => ({id:-2-i,name:track.label || track.language || ui("Subtítulos")})) : [];
@@ -202,7 +145,6 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   let queue=Promise.resolve(),previousBox="",seeks=0,plays=0,pauses=0,failures=0;
   let pauseAfterSwitch = options.initiallyPaused;
   let polling = false;
-  let immersive = false;
   let layoutFrame = 0;
 
   const captionsAvailable = ui("Sin subtítulos");
@@ -266,7 +208,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   function box() {
     const r=view.getBoundingClientRect();
     return {x:r.x,y:r.y,width:r.width,height:r.height,pageWidth:window.innerWidth,
-      visible:!document.hidden && view.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))};
+      visible:!document.hidden && dialog.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))};
   }
   const call=(op:string,extra:Record<string,unknown>={})=>invoke<State>("native_playback",{operation:op,args:{id,...extra}});
 
@@ -288,25 +230,6 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   window.addEventListener("resize",scheduleLayout,eventOpts);
   document.addEventListener("fullscreenchange",scheduleLayout,eventOpts);
 
-  const setImmersive=(active:boolean)=>{
-    if(immersive===active)return;
-    immersive=active;
-    dialog.classList.toggle("is-immersive",active);
-    immersiveBar.hidden=!active;
-    theatreBtn.setAttribute("aria-pressed",String(active));
-    scheduleLayout();
-    if(active) exitImmersiveBtn.focus({preventScroll:true});
-    else toggle.focus({preventScroll:true});
-  };
-  theatreBtn.onclick=()=>setImmersive(!immersive);
-  exitImmersiveBtn.onclick=()=>setImmersive(false);
-  dialog.addEventListener("cancel",event=>{
-    if(immersive){
-      event.preventDefault();
-      setImmersive(false);
-    }
-  },eventOpts);
-
   function request(op:string,value?:number) {
     const sidecar=engine==="android" && op==="subtitle" && value!==undefined && value < -1 ? sidecars[-value-2] : undefined;
     const task=queue.then(async()=>{if(!closed){const result=await call(op,{value,address:sidecar?.url});if(op==="seek")seeks++;update(result);}});queue=task.catch(fail);return task;
@@ -317,7 +240,10 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     void request(state.paused?"play":"pause").catch(fail);
   };
   toggle.onclick=togglePlayPause;
-  immersiveToggle.onclick=togglePlayPause;
+  // The Android video plane can be composed behind the WebView. Desktop VLC uses a separate native surface.
+  const overlay=dialog.classList.contains("has-native-video-plane")
+    ? attachPlaybackOverlay(dialog,view,controls,options.fullscreenButton,toggle,togglePlayPause)
+    : undefined;
 
   // Keyboard & TV remote media shortcuts
   dialog.addEventListener("keydown",event=>{
@@ -343,10 +269,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     } else if(key==="m"){
       event.preventDefault();
       mute.click();
-    } else if(key==="t"){
-      event.preventDefault();
-      setImmersive(!immersive);
-    } else if(key==="f" && options.fullscreenButton){
+    } else if(!overlay && (key==="f" || key==="t")){
       event.preventDefault();
       options.fullscreenButton.click();
     }
@@ -395,21 +318,19 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     if(!s.ready)return;
     stagePlaceholder.hidden = true;
     stateChip.hidden = true;
-    if(previousPaused!==undefined && previousPaused!==s.paused){
+    if(previousPaused===undefined){
+      overlay?.wake();
+    } else if(previousPaused!==s.paused){
       if(s.paused) pauses++; else plays++;
-      wake();
     }
     previousPaused=s.paused;
     media.update({position:s.position,duration:s.duration||null,paused:s.paused,ended:s.ended,ready:4,seeking:false,seekable:s.duration>0,plays,pauses,seeks});
     const actionLabel=s.paused?ui("Reproducir"):ui("Pausar");
-    const glyph=s.paused?"▶":"⏸";
+    const glyph=s.paused?"▶":"⏸︎";
     if(toggleLabel.textContent!==actionLabel)toggleLabel.textContent=actionLabel;
     if(toggleGlyph.textContent!==glyph)toggleGlyph.textContent=glyph;
-    if(immersiveToggle.textContent!==glyph){
-      immersiveToggle.textContent=glyph;
-      immersiveToggle.setAttribute("aria-label",actionLabel);
-      immersiveToggle.title=actionLabel;
-    }
+    toggle.disabled=false;
+    overlay?.state(s.paused,true);
     back.disabled = forward.disabled = !s.duration;
     seek.disabled=!s.duration;seek.max=String(s.duration);
     const totalLabel = s.duration ? formatMediaTime(s.duration) : ui("En vivo");
@@ -419,8 +340,6 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       syncSeekFill(s.position, s.duration);
       const currentText = formatMediaTime(s.position);
       if(elapsedDisplay.textContent!==currentText)elapsedDisplay.textContent=currentText;
-      const summaryTime = s.duration ? `${currentText} / ${totalLabel}` : `${currentText} · ${totalLabel}`;
-      if(immersiveTime.textContent!==summaryTime)immersiveTime.textContent=summaryTime;
     }
     list(audio,s.audio,s.selectedAudio,ui("Sin pistas de audio"));
     const captions=engine==="android" && s.subtitle ? [...s.subtitle,...externalCaptions] : s.subtitle;
@@ -476,17 +395,15 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   })();
   return {
     transport:()=>restored && state?.ready ? {position:state.position,paused:state.paused} : undefined,
-    close:()=>{
+    close:(preserveFullscreen=false)=>{
       closed=true;
       cancelAnimationFrame(layoutFrame);
       resizeObserver.disconnect();
-      clearTimeout(hudTimer);
       events.abort();
       clearTimeout(timer);
       detach();
       stagePlaceholder.remove();
-      immersiveBar.remove();
-      theatreBtn.remove();
+      overlay?.close(preserveFullscreen);
       controls.remove();
       if(restored&&state?.ready)save(state.position,state.ended);
       if(started || referer)void call("close").catch(()=>{});

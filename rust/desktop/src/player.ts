@@ -1,11 +1,14 @@
-import {nativePlayer} from "./native-player";
+import {formatMediaTime, nativePlayer} from "./native-player";
+import {attachPlaybackOverlay} from "./playback-overlay";
 import {ui, displayTitle} from "./locale";
 import {readerMotion} from "./reader-motion";
 import {followProvider} from "./provider-playback";
-import {activeProfileId, getProfilePref, invokeProfile, providerEnabled, windowProfile, writeProfilePref} from "./profile-context";
+import {activeProfileId, getProfilePref, invokeProfile, preferredProvidersForProfile, providerEnabled, windowProfile, writeProfilePref} from "./profile-context";
 import {invoke} from "./bridge";
 import {isHttpsUrl, mediaUrl, remoteUrl} from "./safety";
 import {Channel, convertFileSrc} from "@tauri-apps/api/core";
+import {getCurrentWindow} from "@tauri-apps/api/window";
+import {hideAdult} from "./content-filter";
 import type HlsType from "hls.js";
 import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -319,6 +322,8 @@ export function contentControls(
   const available = entries(item);
   const hasUnits = available.some(e => e.target.unitKind !== null);
   const progressMap = new Map<number, Progress>();
+  const television = document.documentElement.classList.contains("television");
+  let collapseEntry: (() => void) | undefined;
 
   const section = node("section", undefined, "entries-section");
   const isAlive = () => section.isConnected && isPageActive("detail") && !options.signal?.aborted;
@@ -368,6 +373,7 @@ export function contentControls(
 
   const filterInput = node("input", undefined, "entries-filter-input") as HTMLInputElement;
   filterInput.type = "search";
+  filterInput.readOnly = television;
   filterInput.placeholder = isBook ? ui("Buscar capítulo…") : isAudio ? ui("Buscar pista…") : ui("Buscar episodio…");
   filterInput.setAttribute("aria-label", filterInput.placeholder);
   filterInput.hidden = available.length <= 10;
@@ -498,7 +504,60 @@ export function contentControls(
 
   type FoundSource = { site: string; title: string; edition: unknown };
 
+  async function openDiscoveredSource(entry: Entry, preferred: string | undefined, open: (site: string, content: string[] | VideoChoice[]) => Promise<boolean>) {
+    if (!isAlive()) return false;
+    const args = {id: item.syncId, number: entry.target.displayNumber, season: entry.target.seasonNumber,
+      hideAdult: hideAdult()};
+    const found: FoundSource[] = [];
+    const matches = new Channel<FoundSource[]>();
+    let finished = false;
+    let wake: (() => void) | undefined;
+    const notify = () => wake?.();
+    matches.onmessage = batch => { found.push(...batch); notify(); };
+    options.signal?.addEventListener("abort", notify, {once: true});
+    void invokeProfile("find_unit_sources", {...args, matches}).catch(() => {}).finally(() => {
+      finished = true;
+      notify();
+    });
+    try {
+      let attempts = 0;
+      while (isAlive() && attempts < 6) {
+        if (!found.length) {
+          if (finished) break;
+          await new Promise<void>(resolve => { wake = resolve; });
+          wake = undefined;
+          continue;
+        }
+        const preferredIndex = found.findIndex(choice => choice.site === preferred);
+        const [choice] = found.splice(Math.max(0, preferredIndex), 1);
+        attempts++;
+        try {
+          const content = await invoke<string[] | VideoChoice[]>("select_unit_source", {...args, choice});
+          if (isAlive() && await open(choice.site, content)) {
+            enabledLinks.add(choice.site);
+            window.dispatchEvent(new Event("umd-catalog-changed"));
+            return true;
+          }
+        } catch { /* Try a different matched edition. */ }
+      }
+      return false;
+    } finally {
+      matches.onmessage = () => {};
+      options.signal?.removeEventListener("abort", notify);
+    }
+  }
+
   async function openEntryQuick(entry: Entry, preferred?: string): Promise<boolean> {
+    if (television && section.hasAttribute("data-provider-busy")) return true;
+    if (television) section.dataset.providerBusy = "";
+    try {
+      return await openEntry(entry, preferred);
+    } finally {
+      if (television) delete section.dataset.providerBusy;
+    }
+  }
+
+  async function openEntry(entry: Entry, preferred?: string): Promise<boolean> {
     const nav = makeChapterNav(entry, preferred);
     const prov = primaryProviderFor(entry);
     const number = entry.target.displayNumber;
@@ -527,20 +586,9 @@ export function contentControls(
             if (await read(site, raw)) return true;
           } catch { /* The chapter may be absent in this edition. */ }
         }
-        if (preferred && canFindChapter && isAlive()) {
-          const found: FoundSource[] = [];
-          const matches = new Channel<FoundSource[]>();
-          matches.onmessage = batch => { if (isAlive()) found.push(...batch); };
-          const hideAdult = getProfilePref(profileId, "umd-hide-adult") === "true";
-          await invokeProfile("find_unit_sources", {...args, hideAdult, matches});
-          found.sort((a, b) => Number(b.site === preferred) - Number(a.site === preferred));
-          for (const choice of found.slice(0, 6)) {
-            if (!isAlive()) return false;
-            try {
-              const raw = await invoke<string[]>("select_unit_source", {...args, hideAdult, choice});
-              if (await read(choice.site, raw)) return true;
-            } catch { /* Continue with the remaining providers. */ }
-          }
+        if ((preferred || television) && canFindChapter && isAlive() &&
+            await openDiscoveredSource(entry, preferred, (site, content) => read(site, content as string[]))) {
+          return true;
         }
       } catch (error) {
         if (isAlive()) report(String(error), true);
@@ -552,16 +600,40 @@ export function contentControls(
     for (const source of entry.sources) {
       const url = remoteUrl(source.filePath);
       if (!url) continue;
-      await openCatalogSource(entry, source, url, nav);
-      return true;
+      if (await openCatalogSource(entry, source, url, nav)) return true;
     }
-    if (preferred && illustrated && entry.target.unitKind === "chapter") return false;
+    if (television && canFindVideo && (entry.target.unitKind === "episode" || entry.target.unitKind === null && !hasUnits)) {
+      const mediaNumber = number ?? (hasUnits ? null : "1");
+      const favored = profileId ? preferredProvidersForProfile(profileId) : [];
+      const candidates = [...new Set([preferred, ...favored, ...PROVIDERS.map(([id]) => id)])]
+        .filter((id): id is string => !!id && enabledLinks.has(id) && !READER_PROVIDERS.has(id) && id !== "capibaratraductor");
+      report(ui("Buscando video…"));
+      try {
+        if (mediaNumber) {
+          for (const site of candidates) {
+            if (!isAlive()) return false;
+            try {
+              const sources = await invoke<VideoChoice[]>("provider_unit", {
+                site, id: item.syncId, number: mediaNumber, season: entry.target.seasonNumber,
+              });
+              if (await openProviderVideos(entry, sources, site, report, isAlive)) return true;
+            } catch { /* Try the next linked provider. */ }
+          }
+        }
+        return await openDiscoveredSource(entry, preferred,
+          (site, content) => openProviderVideos(entry, content as VideoChoice[], site, report, isAlive));
+      } finally {
+        if (isAlive()) report("");
+      }
+    }
+    if ((television || preferred) && illustrated && entry.target.unitKind === "chapter") return false;
     // 4. Video provider -> trigger inline picker on card or scroll card into view
     if (prov && !prov.reader || canFindChapter || canFindVideo) {
       const targetCard = listHost.querySelector<HTMLElement>(`[data-entry-index="${entry.index}"]`);
       if (targetCard) {
         targetCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        const trigger = targetCard.querySelector<HTMLButtonElement>("[data-provider-trigger], [data-source-discovery]");
+        const triggers = Array.from(targetCard.querySelectorAll<HTMLButtonElement>("[data-provider-trigger], [data-source-discovery]"));
+        const trigger = (preferred ? triggers.find(button => button.dataset.providerTrigger === preferred) : undefined) ?? triggers[0];
         trigger?.click();
         return !!trigger;
       }
@@ -583,14 +655,16 @@ export function contentControls(
         listStatus.textContent = ui("Abriendo libro…");
         const opened = await invoke<OpenedMedia>("open_catalog_book", { address: url, format });
         listStatus.textContent = "";
-        if (isAlive()) await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, nav);
+        if (!isAlive()) return false;
+        await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, nav);
       } else if (kind === "video" && isEmbeddedSource(source)) {
         listStatus.textContent = ui("Buscando video…");
         const stream = await invoke<VideoResolution>("resolve_video", { address: url, webFallback: true });
         listStatus.textContent = "";
+        if (!isAlive()) return false;
         if ("providerPlayer" in stream) {
-          if (isAlive()) await openProviderSession(stream.providerPlayer, entry, report, nav, choices);
-          return;
+          await openProviderSession(stream.providerPlayer, entry, report, nav, choices);
+          return true;
         }
         const safeUrl = remoteUrl(stream.url);
         if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
@@ -598,15 +672,29 @@ export function contentControls(
           const trackUrl = remoteUrl(track.url);
           return trackUrl ? [{ ...track, url: trackUrl }] : [];
         });
-        if (isAlive()) await play(entry, kind, [safeUrl], report, stream.hls, { ...stream, url: safeUrl, tracks }, nav, choices);
+        await play(entry, kind, [safeUrl], report, stream.hls, { ...stream, url: safeUrl, tracks }, nav, choices);
       } else {
         const tracks = catalogTracks(source);
         const direct = selected ?? (tracks.length ? {url,hls:/\.m3u8$/i.test(new URL(url).pathname),tracks} : undefined);
-        if (isAlive()) await play(entry, kind, [url], report, direct?.hls ?? false, direct, nav, choices);
+        if (!isAlive()) return false;
+        await play(entry, kind, [url], report, direct?.hls ?? false, direct, nav, choices);
       }
+      return true;
     } catch (e) {
       listStatus.textContent = "";
       report(String(e), true);
+      return false;
+    }
+  }
+
+  async function startTvEntry(entry: Entry) {
+    try {
+      if (await openEntryQuick(entry) || !isAlive()) return;
+      const optionsButton = listHost.querySelector<HTMLButtonElement>(`[data-entry-index="${entry.index}"] .entry-alternatives[aria-expanded='false']`);
+      optionsButton?.click();
+      report(ui("No se encontraron proveedores para esta unidad."), true);
+    } catch (error) {
+      if (isAlive()) report(String(error), true);
     }
   }
 
@@ -652,6 +740,10 @@ export function contentControls(
     options.onContinueReady({
       label,
       run: () => {
+        if (television) {
+          void initialProgress.then(() => { if (isAlive()) return startTvEntry(bestDefaultEntry()); });
+          return;
+        }
         if (targetEntry.seasonNumber !== null && selectedSeason !== "all" && selectedSeason !== targetEntry.seasonNumber) {
           selectedSeason = targetEntry.seasonNumber;
           renderSeasons();
@@ -727,6 +819,41 @@ export function contentControls(
     }
   }
 
+  async function openProviderVideos(
+    entry: Entry, sources: VideoChoice[], provider: string,
+    feedback: (message: string, error?: boolean) => void, isCurrent: () => boolean,
+  ) {
+    const choices = sources.map(source => ({...source, provider}));
+    const attempted = new Set<number>();
+    const nav = makeChapterNav(entry, provider);
+    let failure: unknown;
+    for (const [index, source] of choices.entries()) {
+      if (!isCurrent()) return false;
+      attempted.add(index);
+      try {
+        const media = source.external || source.embed
+          ? await invoke<VideoResolution>("resolve_video", { address: source.url, provider, webFallback: true })
+          : source;
+        if (!isCurrent()) return false;
+        const playback: PlaybackChoices = {sources: choices, index, attempted};
+        feedback("");
+        if ("providerPlayer" in media) {
+          await openProviderSession(media.providerPlayer, entry, feedback, nav, playback);
+          return true;
+        }
+        const safeUrl = remoteUrl(media.url);
+        if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
+        const tracks = media.tracks?.length ? media.tracks : source.tracks;
+        await play(entry, "video", [safeUrl], feedback, media.hls, {...media, url: safeUrl, tracks}, nav, playback);
+        return true;
+      } catch (error) {
+        failure = error;
+      }
+    }
+    if (isCurrent()) throw failure ?? new Error(ui("No se encontraron servidores para este episodio."));
+    return false;
+  }
+
   function buildEntryCard(entry: Entry): HTMLElement {
     const isHighlighted = !!highlightUnit && samePartyUnit(entry.target, highlightUnit);
 
@@ -746,7 +873,6 @@ export function contentControls(
       entry.target.displayNumber ?? (isBook ? "📖" : "▶"),
       "entry-number",
     );
-    topRow.append(numPill);
 
     // Title & meta
     const meta = node("div", undefined, "entry-meta");
@@ -757,7 +883,15 @@ export function contentControls(
     if (entry.unitName) {
       meta.append(node("p", entry.unitName, "entry-subtitle"));
     }
-    topRow.append(meta);
+    const selectEntry = television ? node("button", undefined, "entry-select") : undefined;
+    if (selectEntry) {
+      selectEntry.type = "button";
+      selectEntry.append(numPill, meta);
+      selectEntry.onclick = () => { void startTvEntry(entry); };
+      topRow.append(selectEntry);
+    } else {
+      topRow.append(numPill, meta);
+    }
 
     // Action buttons
     const actions = node("div", undefined, "entry-actions");
@@ -774,67 +908,6 @@ export function contentControls(
     let hasRemoteAction = false;
     let discovery = 0;
 
-    function showVideoSources(sources: VideoChoice[], provider: string, name: string) {
-      serverTray.replaceChildren();
-      const choices = sources.map(source => ({...source, provider}));
-      if (!isAlive() || !card.isConnected) return;
-      if (!choices.length) {
-        reportProvider(ui("No se encontraron servidores para este episodio."), true);
-        return;
-      }
-      const header = node("div", undefined, "entry-servers-header");
-      header.append(node("span", ui("Servidores disponibles ({0})", name)));
-      const closeTray = node("button", ui("Cerrar"), "quiet-btn");
-      closeTray.type = "button";
-      closeTray.onclick = () => { serverTray.replaceChildren(); serverTray.hidden = true; };
-      header.append(closeTray);
-      serverTray.append(header);
-
-      const row = node("div", undefined, "button-row");
-      for (const source of choices) {
-        const index = choices.indexOf(source);
-        const playback = ():PlaybackChoices => ({sources:choices,index,attempted:new Set([index])});
-        const nav = makeChapterNav(entry);
-        const needsExtraction = source.external || source.embed;
-        const choice = node("button", ui("Ver {0} en UMD", source.label), "primary");
-        choice.type = "button";
-        choice.onclick = async () => {
-          choice.disabled = true;
-          reportProvider("");
-          try {
-            const media = needsExtraction ? await invoke<VideoResolution>("resolve_video", { address: source.url, provider, webFallback: true }) : source;
-            if ("providerPlayer" in media) {
-              if (isAlive() && card.isConnected) await openProviderSession(media.providerPlayer, entry, reportProvider, nav, playback());
-              return;
-            }
-            const safeUrl = remoteUrl(media.url);
-            if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
-            const rawTracks = media.tracks?.length ? media.tracks : source.tracks;
-            const tracks = (rawTracks ?? []).flatMap(track => {
-              const trackUrl = remoteUrl(track.url);
-              return trackUrl ? [{ ...track, url: trackUrl }] : [];
-            });
-            if (isAlive() && card.isConnected) {
-              await play(entry, "video", [safeUrl], reportProvider, media.hls, { ...media, url: safeUrl, tracks }, nav, playback());
-            }
-          } catch (e) {
-            reportProvider(String(e), true);
-          } finally {
-            choice.disabled = false;
-          }
-        };
-        row.append(choice);
-        if (needsExtraction) {
-          row.append(
-            providerPlayerButton(source.label, source.url, false, entry, reportProvider, nav, playback()),
-            providerPlayerButton(source.label, source.url, true, entry, reportProvider),
-          );
-        }
-      }
-      serverTray.append(row);
-      serverTray.hidden = false;
-    }
-
     // 1. Online providers (manga readers + video providers)
     for (const [provider, name] of PROVIDERS) {
       if (!number || !enabledLinks.has(provider)) continue;
@@ -846,10 +919,11 @@ export function contentControls(
       openBtn.type = "button";
       openBtn.dataset.providerTrigger = provider;
       openBtn.onclick = async () => {
-        ++discovery;
+        const request = ++discovery;
+        const isCurrent = () => request === discovery && isAlive() && card.isConnected;
         card.dataset.providerBusy = "";
         openBtn.disabled = true;
-        reportProvider("");
+        reportProvider(reader ? ui("Abriendo capítulo…") : ui("Buscando video…"));
         serverTray.replaceChildren();
         serverTray.hidden = true;
         const args = { site: provider, id: item.syncId, number, season: entry.target.seasonNumber };
@@ -859,15 +933,18 @@ export function contentControls(
               .map(remoteUrl)
               .filter((u): u is string => u !== null);
             if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
-            if (isAlive() && card.isConnected) await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, provider));
+            if (isCurrent()) {
+              reportProvider("");
+              await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, provider));
+            }
           } else {
             const sources = await invoke<VideoChoice[]>("provider_unit", args);
-            showVideoSources(sources, provider, name);
+            await openProviderVideos(entry, sources, provider, reportProvider, isCurrent);
           }
         } catch (e) {
-          reportProvider(String(e), true);
+          if (isCurrent()) reportProvider(String(e), true);
         } finally {
-          delete card.dataset.providerBusy;
+          if (request === discovery) delete card.dataset.providerBusy;
           openBtn.disabled = false;
         }
       };
@@ -935,7 +1012,7 @@ export function contentControls(
         reportProvider("");
         const args = {
           id: item.syncId, number, season: entry.target.seasonNumber,
-          hideAdult: getProfilePref(profileId, "umd-hide-adult") === "true",
+          hideAdult: hideAdult(),
         };
         const matches = new Channel<FoundSource[]>();
         matches.onmessage = found => {
@@ -957,9 +1034,7 @@ export function contentControls(
                   if (!urls.length) throw new Error(ui("La fuente devolvió una dirección inválida."));
                   await play(entry, "images", urls, reportProvider, false, undefined, makeChapterNav(entry, choice.site));
                 } else {
-                  ++discovery;
-                  delete card.dataset.providerBusy;
-                  showVideoSources(result as VideoChoice[], choice.site, name);
+                  await openProviderVideos(entry, result as VideoChoice[], choice.site, reportProvider, isCurrent);
                 }
               } catch (error) {
                 if (isCurrent()) reportProvider(String(error), true);
@@ -968,6 +1043,7 @@ export function contentControls(
               }
             };
             buttons.append(button);
+            if (television && document.activeElement === find) button.focus({preventScroll: true});
           }
         };
         try {
@@ -1104,8 +1180,41 @@ export function contentControls(
       actions.append(remove);
     }
 
-    topRow.append(actions);
-    card.append(topRow, serverTray, providerStatus);
+    if (selectEntry) {
+      const alternatives = node("button", ui("Opciones"), "quiet-btn entry-alternatives");
+      alternatives.type = "button";
+      alternatives.setAttribute("aria-expanded", "false");
+      topRow.append(alternatives);
+      actions.hidden = true;
+      const close = () => {
+        ++discovery;
+        delete card.dataset.providerBusy;
+        actions.hidden = true;
+        serverTray.hidden = true;
+        serverTray.replaceChildren();
+        reportProvider("");
+        alternatives.setAttribute("aria-expanded", "false");
+      };
+      alternatives.onclick = () => {
+        if (!actions.hidden) {
+          close();
+          collapseEntry = undefined;
+          return;
+        }
+        collapseEntry?.();
+        collapseEntry = close;
+        actions.hidden = false;
+        alternatives.setAttribute("aria-expanded", "true");
+        const firstAction = actions.querySelector<HTMLButtonElement>("button:enabled");
+        firstAction?.focus({preventScroll: true});
+        firstAction?.scrollIntoView({block: "nearest", inline: "nearest"});
+      };
+      card.append(topRow, actions);
+    } else {
+      topRow.append(actions);
+      card.append(topRow);
+    }
+    card.append(serverTray, providerStatus);
     return card;
   }
 
@@ -1130,6 +1239,7 @@ export function contentControls(
 
   function renderEntries() {
     Object.assign(listView, {season:selectedSeason, descending, search:searchFilter, limit:visibleLimit});
+    collapseEntry = undefined;
     listHost.replaceChildren();
     const list = filteredEntries();
     if (!list.length) {
@@ -1269,7 +1379,7 @@ export function contentControls(
   }
 
   // Async: load saved progress for all chapters/episodes + capibara link state
-  void refreshProgress();
+  const initialProgress = refreshProgress();
   if (capibaraEnabled && illustrated && available.some(e => e.target.unitKind === "chapter")) {
     void invoke<boolean>("capibara_linked", { id: item.syncId })
       .then(value => {
@@ -1312,6 +1422,105 @@ export async function toggleFullscreen(el: HTMLElement, btn: HTMLButtonElement) 
   } catch { /* Fullscreen unsupported in this webview */ }
 }
 
+function webVideoOverlay(
+  dialog: HTMLDialogElement, viewport: HTMLElement, media: HTMLVideoElement,
+  fullscreen: HTMLButtonElement, settings: HTMLElement, error: (e: unknown) => void,
+) {
+  const controls = node("div", undefined, "native-hud");
+  const timeline = node("div", undefined, "native-timeline");
+  const bar = node("div", undefined, "native-bar");
+  const transport = node("div", undefined, "native-transport");
+  const start = node("span", "0:00", "native-time");
+  const end = node("span", "--:--", "native-time");
+  const seek = node("input", undefined, "native-seek");
+  seek.type = "range";
+  seek.min = "0";
+  seek.step = "1";
+  seek.setAttribute("aria-label", ui("Posición"));
+  const play = node("button", undefined, "primary native-play-btn");
+  const mute = node("button", undefined, "quiet-btn native-mute-btn");
+  const volume = node("input", undefined, "native-volume");
+  volume.type = "range";
+  volume.min = "0";
+  volume.max = "100";
+  volume.setAttribute("aria-label", ui("Volumen"));
+  volume.oninput = () => { media.muted = false; media.volume = Number(volume.value) / 100; };
+  mute.onclick = () => { media.muted = !media.muted; };
+  const captions = node("select");
+  captions.hidden = true;
+  captions.setAttribute("aria-label", ui("Subtítulos"));
+  settings.append(captions);
+  timeline.append(start, seek, end);
+  transport.append(play, mute, volume);
+  bar.append(transport);
+  controls.append(timeline, bar);
+  controls.setAttribute("role", "group");
+  controls.setAttribute("aria-label", ui("Controles de reproducción"));
+  viewport.after(controls);
+
+  const toggle = () => {
+    if (media.paused) void media.play().catch(error);
+    else media.pause();
+  };
+  play.onclick = toggle;
+  const overlay = attachPlaybackOverlay(dialog, viewport, controls, fullscreen, play, toggle);
+  const events = new AbortController();
+  const options = {signal:events.signal};
+  function updatePlayback() {
+    play.textContent = media.paused ? "▶ " + ui("Reproducir") : "⏸︎ " + ui("Pausar");
+    overlay.state(media.paused, true);
+  }
+  function updateVolume() {
+    const level = media.muted ? 0 : Math.round(media.volume * 100);
+    volume.value = String(level);
+    volume.style.setProperty("--vol-pct", level + "%");
+    mute.textContent = level ? "🔊" : "🔇";
+    mute.title = ui(level ? "Silenciar" : "Activar sonido");
+    mute.setAttribute("aria-label", mute.title);
+  }
+  const paintSeek = () => {
+    const position = Number(seek.value);
+    start.textContent = formatMediaTime(seek.disabled ? media.currentTime : position);
+    seek.style.setProperty("--seek-pct", (seek.disabled ? 0 : position / media.duration * 100) + "%");
+  };
+  let scrubbing = false;
+  seek.onpointerdown = () => { scrubbing = true; };
+  seek.oninput = paintSeek;
+  seek.onchange = () => { scrubbing = false; if (!seek.disabled) media.currentTime = Number(seek.value); };
+  seek.onblur = seek.onpointercancel = () => { scrubbing = false; };
+  function updateTime() {
+    const duration = media.duration;
+    seek.disabled = !Number.isFinite(duration) || duration <= 0;
+    seek.max = seek.disabled ? "0" : String(duration);
+    end.textContent = duration === Infinity ? ui("En vivo") : formatMediaTime(duration);
+    if (!scrubbing) { seek.value = String(media.currentTime); paintSeek(); }
+  }
+  const tracks = () => Array.from(media.textTracks).filter(track => ["captions", "subtitles"].includes(track.kind));
+  function updateCaptions() {
+    const rows = tracks();
+    captions.hidden = rows.length === 0;
+    captions.replaceChildren(new Option(ui("Sin subtítulos"), "-1"), ...rows.map((track, index) =>
+      new Option(track.label || track.language || ui("Subtítulos"), String(index))));
+    captions.value = String(rows.findIndex(track => track.mode === "showing"));
+  }
+  captions.onchange = () => tracks().forEach((track, index) => { track.mode = index === Number(captions.value) ? "showing" : "disabled"; });
+  for (const event of ["addtrack", "removetrack", "change"]) media.textTracks.addEventListener(event, updateCaptions, options);
+  for (const event of ["play", "pause", "ended"]) media.addEventListener(event, updatePlayback, options);
+  for (const event of ["timeupdate", "durationchange", "loadedmetadata"]) media.addEventListener(event, updateTime, options);
+  media.addEventListener("volumechange", updateVolume, options);
+  dialog.addEventListener("keydown", event => {
+    if (!event.defaultPrevented && ["k", "MediaPlayPause"].includes(event.key) &&
+        !(event.target as HTMLElement | null)?.matches("input, select, textarea")) {
+      event.preventDefault();
+      toggle();
+    }
+  }, options);
+  updateTime();
+  updateVolume();
+  updatePlayback();
+  return (preserveFullscreen = false) => { events.abort(); overlay.close(preserveFullscreen); };
+}
+
 async function play(
   entry: { label: string; target: Target | null },
   kind: OpenedMedia["kind"],
@@ -1339,7 +1548,7 @@ async function play(
   if (choices?.dialog && !choices.dialog.open) return;
   const dialog = choices?.dialog ?? node("dialog", undefined, "player-dialog");
   const isMedia = kind === "video" || kind === "audio";
-  dialog.classList.remove("is-native-player", "is-web-player", "is-immersive");
+  dialog.classList.remove("is-native-player", "is-web-player", "has-native-video-plane");
   dialog.classList.toggle("media-player-dialog", isMedia);
   if (kind === "epub" || kind === "images") {
     const source = new URL(safeUrls[0]);
@@ -1420,7 +1629,7 @@ async function play(
       report(String(e), true);
     }
   };
-  let cleanup = () => {};
+  let cleanup: (preserveFullscreen?: boolean) => void = () => {};
   const onClose = () => {
     document.removeEventListener("fullscreenchange", syncFullscreen);
     if (document.fullscreenElement === dialog) void document.exitFullscreen().catch(() => {});
@@ -1455,7 +1664,7 @@ async function play(
       dialog.removeEventListener("close",onClose);
       const interrupted = () => dialog.remove();
       dialog.addEventListener("close",interrupted,{once:true});
-      cleanup(); dialog.replaceChildren();
+      cleanup(true); dialog.replaceChildren();
       try {
         await play(entry,kind,[next.url],report,next.hls,next,chapterNav,{...playback, dialog, index, engine,transport,discover,
           triedEngines: index === playback.index ? triedEngines : undefined});
@@ -1531,7 +1740,16 @@ async function play(
     const isDash = kind === "video" && (stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl));
     if (engines.value !== "web") {
       dialog.classList.add("is-native-player");
-      titleGroup.append(node("span", engines.value === "android" ? "Android" : "VLC", "player-engine-badge"));
+      if (android) dialog.classList.add("has-native-video-plane");
+      else {
+        titleGroup.append(node("span", "VLC", "player-engine-badge"));
+        fsBtn.setAttribute("aria-pressed", String(dialog.classList.contains("is-playback-fullscreen")));
+        fsBtn.onclick = () => {
+          const active = dialog.classList.toggle("is-playback-fullscreen");
+          fsBtn.setAttribute("aria-pressed", String(active));
+          void getCurrentWindow().setFullscreen(active).catch(error);
+        };
+      }
       const player = nativePlayer(
         engines.value, primaryUrl, viewport, headerEnd, output, entry.label, entry.target, validTracks,
         resume,
@@ -1539,7 +1757,12 @@ async function play(
         {engines,servers,wireless,fullscreenButton:fsBtn,initiallyPaused:choices?.transport?.paused ?? false, discover:playback.discover,
           startCast:()=>{if(!switching){switching=true;void switchTo(currentStream, playback.index, "vlc", true);}}},
       );
-      cleanup = player.close;
+      cleanup = preserveFullscreen => {
+        player.close(preserveFullscreen);
+        if (!android && !preserveFullscreen && dialog.classList.contains("is-playback-fullscreen")) {
+          void getCurrentWindow().setFullscreen(false).catch(() => {});
+        }
+      };
       getTransport = () => player.transport() ?? choices?.transport;
       return;
     }
@@ -1581,7 +1804,8 @@ async function play(
     }
     const media = node(kind);
     getTransport = () => media.readyState >= 1 ? {position:media.currentTime,paused:media.paused} : choices?.transport;
-    media.controls = true;
+    media.controls = kind === "audio";
+    if (media instanceof HTMLVideoElement) media.playsInline = true;
     const remote = (media as HTMLVideoElement & {remote?:{prompt:()=>Promise<void>}}).remote;
     if(remote && typeof remote.prompt==="function"){
       const cast=node("button",ui("Transmitir"),"quiet-btn");
@@ -1620,6 +1844,25 @@ async function play(
     media.addEventListener("error", () => failed(ui("No se pudo reproducir esta fuente. El formato o códec puede no ser compatible con el reproductor del sistema.")));
 
     let dash: import("dashjs").MediaPlayerClass | undefined;
+    viewport.append(media);
+    const stopOverlay = media instanceof HTMLVideoElement
+      ? webVideoOverlay(dialog, viewport, media, fsBtn, webControls, error) : () => {};
+    const background = () => { if (document.hidden) save(); };
+    document.addEventListener("visibilitychange", background);
+    const detachParty = entry.target ? attachPartyPlayer(media, entry.target, entry.label, headerEnd, output) : () => {};
+    cleanup = preserveFullscreen => {
+      stopOverlay(preserveFullscreen);
+      detachParty();
+      document.removeEventListener("visibilitychange", background);
+      save();
+      ready = false;
+      media.pause();
+      hls?.destroy();
+      dash?.reset();
+      media.removeAttribute("src");
+      media.load();
+      closeRelay();
+    };
     if (webTracks.length) {
       media.crossOrigin = "anonymous";
       let hasDefault = false;
@@ -1636,13 +1879,13 @@ async function play(
     }
     if (isDash) {
       const {MediaPlayer} = await import("dashjs");
-      if (!dialog.open) return;
+      if (!dialog.open || !viewport.isConnected) return;
       dash = MediaPlayer().create();
       dash.on(MediaPlayer.events.ERROR, () => failed(ui("La transmisión DASH se interrumpió.")));
       dash.initialize(media as HTMLVideoElement, mediaAddress, false);
     } else if ((hlsHint || /\.m3u8(?:\?|$)/i.test(primaryUrl)) && !media.canPlayType("application/vnd.apple.mpegurl")) {
       const {default: Hls} = await import("hls.js");
-      if (!dialog.open) return;
+      if (!dialog.open || !viewport.isConnected) return;
       if (Hls.isSupported()) {
         hls = new Hls();
         hls.loadSource(mediaAddress);
@@ -1663,22 +1906,6 @@ async function play(
     } else {
       media.src = mediaAddress;
     }
-    viewport.append(media);
-    const background = () => { if (document.hidden) save(); };
-    document.addEventListener("visibilitychange", background);
-    const detachParty = entry.target ? attachPartyPlayer(media, entry.target, entry.label, headerEnd, output) : () => {};
-    cleanup = () => {
-      detachParty();
-      document.removeEventListener("visibilitychange", background);
-      save();
-      ready = false;
-      media.pause();
-      hls?.destroy();
-      dash?.reset();
-      media.removeAttribute("src");
-      media.load();
-      closeRelay();
-    };
     return;
   }
 

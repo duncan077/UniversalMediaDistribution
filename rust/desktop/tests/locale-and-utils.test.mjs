@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import {readdirSync, readFileSync} from "node:fs";
 import test from "node:test";
 import {catalogGroup, groupMedia} from "../src/catalog-types.ts";
+import {unifyCatalog} from "../src/catalog-union.ts";
+import {adultFilterKey, hideAdult, isAdultTitle} from "../src/content-filter.ts";
 import {
   isHttpsUrl,
   mediaUrl,
@@ -38,6 +40,32 @@ test("catalog filters preserve the type when opening same-name books", () => {
   assert.equal(catalogGroup("book", "book.light_novel"), "prose");
   assert.equal(catalogGroup("book", "book.comic"), "comic");
   assert.equal(groupMedia("prose"), "book");
+});
+
+test("the adult filter defaults to hidden and recognizes preview ratings and accented labels", () => {
+  const storage = memoryStorage({"umd-profile:old:umd-hide-adult":"false"});
+  assert.equal(hideAdult(storage),true);
+  assert.equal(isAdultTitle({genres:["ERÓTICO"]}),true);
+  assert.equal(isAdultTitle({categories:["Hentai"]}),true);
+  assert.equal(isAdultTitle({contentRating:"NC-17"}),true);
+  assert.equal(isAdultTitle({genres:["Romance"],contentRating:"PG-13"}),false);
+  storage.setItem(adultFilterKey,"false");
+  assert.equal(hideAdult(storage),false);
+});
+
+test("combined catalog uses local IDs and complements them with the server data", () => {
+  const local = {syncId:"local", name:"La luna", mediaType:"book", subtype:"manga", description:"Local", genres:["mystery"]};
+  const laterLocal = {...local, syncId:"later", name:"Otra obra"};
+  const remote = {...local, syncId:"remote", description:"Remota", thumbnailRef:"/cover.webp", genres:["adventure"]};
+  const novel = {...remote, syncId:"novel", subtype:"novel"};
+  const laterRemote = {...remote, syncId:"next", name:"Otra obra"};
+  const titleMap = unifyCatalog([local], [remote, remote, novel, laterRemote], {remote:local,next:laterLocal});
+  assert.deepEqual([...titleMap.keys()], ["local","novel","later"]);
+  assert.deepEqual(titleMap.get("local"), {
+    local:true, remoteId:"remote", item:{...local,thumbnailRef:"/cover.webp",genres:["mystery","adventure"]},
+  });
+  assert.equal(titleMap.get("novel").local,false);
+  assert.equal(titleMap.get("later").local,true);
 });
 
 test("remoteUrl rejects credentials and non-HTTP(S) schemes", () => {

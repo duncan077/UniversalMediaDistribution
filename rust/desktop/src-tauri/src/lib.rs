@@ -108,7 +108,7 @@ async fn home_bootstrap(
         let get = || -> umd_core::Result<HomeBootstrap> {
             Ok(HomeBootstrap {
                 page: profile.display_page(&query, hide_adult, &preferred_providers)?,
-                recent: reader.home_recent()?,
+                recent: reader.home_recent(hide_adult)?,
                 continuing: profile.continue_items(hide_adult, 12)?,
                 lists: profile.personal_lists()?,
                 server_address: reader.setting("server_url")?.unwrap_or_default(),
@@ -143,6 +143,8 @@ fn open_library(app: &tauri::AppHandle) -> CommandResult<()> {
     };
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let (store, db) = database::LocalDatabase::open(directory.clone())?;
+    let files = private_files::PrivateFiles(directory.join("private-profiles"));
+    remote::reuse_legacy_server(&store, &files)?;
     let reader = store.readers(if cfg!(target_os = "android") { 2 } else { 4 }).map_err(|e| e.to_string())?;
     let capibara = capibara::Capibara::new().map_err(|e| e.to_string())?;
     providers::setup_sources(&store)?;
@@ -152,11 +154,11 @@ fn open_library(app: &tauri::AppHandle) -> CommandResult<()> {
         store.setting("torrent-fast-resume").map_err(|e| e.to_string())?.as_deref() != Some("off"),
         std::sync::atomic::Ordering::Relaxed,
     );
-    app.manage(private_files::PrivateFiles(directory.join("private-profiles")));
+    app.manage(files);
     app.manage(downloads);
     app.manage(capibara);
     app.manage(CatalogReads(reader));
-    app.state::<artwork::Origin>().set(store.setting("server_url").ok().flatten().and_then(|url| reqwest::Url::parse(&url).ok()));
+    app.state::<artwork::Origin>().set(store.setting("server_url").ok().flatten().and_then(|url| server_base(&url).ok()));
     if let Ok(cache) = app.path().app_cache_dir() {
         app.state::<artwork::Origin>().set_cache(cache);
     }
@@ -247,9 +249,9 @@ async fn filter_choices(reader: State<'_, CatalogReads>) -> CommandResult<serde_
     work(move || store.filter_choices().map_err(|e| e.to_string())).await
 }
 #[tauri::command]
-async fn home_recent(reader: State<'_, CatalogReads>) -> CommandResult<serde_json::Value> {
+async fn home_recent(reader: State<'_, CatalogReads>, hide_adult: Option<bool>) -> CommandResult<serde_json::Value> {
     let store = reader.0.get();
-    work(move || store.home_recent().map_err(|e| e.to_string())).await
+    work(move || store.home_recent(hide_adult.unwrap_or(false)).map_err(|e| e.to_string())).await
 }
 #[tauri::command]
 async fn delete_catalog_item(id: Uuid, store: State<'_, CatalogStore>) -> CommandResult<bool> {
@@ -465,7 +467,46 @@ fn catalog_base(store: &CatalogStore) -> CommandResult<reqwest::Url> {
         .setting("server_url")
         .map_err(|e| e.to_string())?
         .ok_or("Primero conectá un servidor.")?;
-    reqwest::Url::parse(&raw).map_err(|e| e.to_string())
+    server_base(&raw)
+}
+
+fn loopback_server(base: &reqwest::Url) -> bool {
+    matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]" | "::1"))
+}
+
+fn server_base(address: &str) -> CommandResult<reqwest::Url> {
+    let address = address.trim();
+    let invalid = || "Dirección de servidor inválida.".to_owned();
+    if address.is_empty() || address.contains('\\') || address.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let implicit = !address.split_once("://")
+        .is_some_and(|(prefix, _)| !prefix.contains(['/', '?', '#']));
+    let authority = address.strip_prefix("//").unwrap_or(address);
+    if implicit && (authority.starts_with('/') || authority.split(['/', '?', '#']).next().is_some_and(|host| host.ends_with(':'))) {
+        return Err(invalid());
+    }
+    let mut base = if implicit {
+        reqwest::Url::parse(&format!("https://{authority}"))
+    } else {
+        reqwest::Url::parse(address)
+    }.map_err(|_| invalid())?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+    {
+        return Err(invalid());
+    }
+    if implicit && loopback_server(&base) {
+        base = reqwest::Url::parse(&format!("http://{authority}")).map_err(|_| invalid())?;
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+    let path = base.path().trim_end_matches('/');
+    let path = path.strip_suffix("/api/v1").unwrap_or(path);
+    base.set_path(&format!("{path}/"));
+    Ok(base)
 }
 
 async fn catalog_response(
@@ -507,6 +548,7 @@ async fn search_remote_catalog(
     cursor: Option<String>,
     media_type: Option<String>,
     subtype_group: Option<String>,
+    hide_adult: Option<bool>,
 ) -> CommandResult<(Vec<umd_core::CatalogItem>, Option<String>)> {
     let query = CatalogQuery {
         q: query,
@@ -518,7 +560,12 @@ async fn search_remote_catalog(
         },
         ..Default::default()
     };
-    let page = online_page(&store, query, false, false).await?;
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        online_page(&store, query, false, hide_adult.unwrap_or(false)),
+    )
+    .await
+    .map_err(|_| "El servidor tardó demasiado en responder.")??;
     Ok((page.items, page.next))
 }
 
@@ -575,20 +622,8 @@ async fn import_remote_item(
     .await
 }
 
-async fn connect_catalog(store: &CatalogStore, address: &str) -> CommandResult<String> {
-    let mut base = reqwest::Url::parse(address.trim()).map_err(|e| e.to_string())?;
-    if !matches!(base.scheme(), "http" | "https")
-        || base.host_str().is_none()
-        || !base.username().is_empty()
-        || base.password().is_some()
-    {
-        return Err("Use an HTTP or HTTPS server URL without credentials".into());
-    }
-    base.set_query(None);
-    base.set_fragment(None);
-    let path = base.path().trim_end_matches('/');
-    let path = path.strip_suffix("/api/v1").unwrap_or(path);
-    base.set_path(&format!("{path}/"));
+async fn check_catalog_address(address: &str) -> CommandResult<reqwest::Url> {
+    let base = server_base(address)?;
     let response = catalog_response(
         &base,
         "api/v1/catalog/search",
@@ -596,23 +631,26 @@ async fn connect_catalog(store: &CatalogStore, address: &str) -> CommandResult<S
     )
     .await?;
     catalog_document(response).await?;
-    store
-        .set_setting("server_url", base.as_str())
-        .map_err(|e| e.to_string())?;
-    Ok(base.to_string())
+    Ok(base)
 }
 
 #[tauri::command]
-async fn connect_server(store: State<'_, CatalogStore>, artwork: State<'_, artwork::Origin>, base_url: String) -> CommandResult<String> {
-    let url = connect_catalog(&store, &base_url).await?;
-    artwork.set(reqwest::Url::parse(&url).ok());
-    Ok(url)
+async fn connect_server(
+    app: tauri::AppHandle,
+    store: State<'_, CatalogStore>,
+    remote: State<'_, remote::RemoteState>,
+    base_url: String,
+) -> CommandResult<String> {
+    let base = check_catalog_address(&base_url).await?;
+    remote.configure_server(&app, &store, &base).await?;
+    Ok(base.into())
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OnlinePage {
     items: Vec<umd_core::CatalogItem>,
+    local_matches: std::collections::BTreeMap<Uuid, umd_core::CatalogItem>,
     next: Option<String>,
     recent: bool,
 }
@@ -626,7 +664,11 @@ async fn online_page(
     let reader = store.clone();
     let base = work(move || catalog_base(&reader)).await?;
     let result = if recent {
-        let response = catalog_response(&base, "api/v1/catalog/recent", &[]).await?;
+        let params = [("hideAdult", "true")];
+        let mut response = catalog_response(&base, "api/v1/catalog/recent", if hide_adult { &params } else { &[] }).await?;
+        if hide_adult && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            response = catalog_response(&base, "api/v1/catalog/recent", &[]).await?;
+        }
         if matches!(
             response.status(),
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
@@ -649,6 +691,9 @@ async fn online_page(
             ("summary", "true"),
             ("limit", if recent { "12" } else { "24" }),
         ];
+        if hide_adult {
+            params.push(("hideAdult", "true"));
+        }
         for (key, value) in [
             ("q", Some(query.q.as_str())),
             ("cursor", query.cursor.as_deref()),
@@ -665,6 +710,10 @@ async fn online_page(
             }
         }
         let mut response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+        if hide_adult && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            params.retain(|(name, _)| *name != "hideAdult");
+            response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+        }
         if response.status() == reqwest::StatusCode::BAD_REQUEST
             && f.subtype_group.as_deref()
                 .is_some_and(|g| matches!(g, "manga" | "prose" | "comic"))
@@ -682,12 +731,13 @@ async fn online_page(
         items: doc
             .items
             .into_iter()
-            .filter(|i| i.sync_id.is_some() && !(hide_adult && i.adult()))
+            .filter(|i| i.sync_id.is_some() && !i.deleted && !(hide_adult && i.adult()))
             .filter(|item| {
                 query.filters.subtype_group.as_deref()
                     .is_none_or(|group| item.matches_subtype_group(group))
             })
             .collect(),
+        local_matches: Default::default(),
         next: if recent {
             None
         } else {
@@ -704,7 +754,30 @@ async fn browse_online_catalog(
     recent: bool,
     hide_adult: bool,
 ) -> CommandResult<OnlinePage> {
-    online_page(&reader.0.get(), query, recent, hide_adult).await
+    let store = reader.0.get();
+    let mut page = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        online_page(&store, query, recent, hide_adult),
+    )
+    .await
+    .map_err(|_| "El servidor tardó demasiado en responder.")??;
+    work(move || {
+        page.local_matches = store
+            .matching_catalog_summaries(&page.items)
+            .map_err(|e| e.to_string())?;
+        Ok(page)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn catalog_favorites(
+    reader: State<'_, CatalogReads>,
+    profile_id: Uuid,
+    hide_adult: bool,
+) -> CommandResult<Vec<Uuid>> {
+    let store = reader.0.get().for_profile(profile_id).map_err(|e| e.to_string())?;
+    work(move || store.favorite_ids(hide_adult).map_err(|e| e.to_string())).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -813,6 +886,7 @@ pub fn run() {
             updates::restart_update,
             connect_server,
             browse_online_catalog,
+            catalog_favorites,
             native_player::native_playback,
             streams::resolve_video,
             streams::live_variants,
@@ -892,15 +966,13 @@ mod online_catalog_tests {
             }
         }));
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/", socket.local_addr().unwrap());
+        let host = socket.local_addr().unwrap();
+        let base = format!("http://{host}/");
         let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
         let store = CatalogStore::in_memory().unwrap();
-        assert_eq!(
-            connect_catalog(&store, &format!("{base}api/v1"))
-                .await
-                .unwrap(),
-            base
-        );
+        let verified = check_catalog_address(&format!("{host}/api/v1")).await.unwrap();
+        assert_eq!(verified.as_str(), base);
+        store.set_setting("server_url", verified.as_str()).unwrap();
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert_eq!(calls.lock().unwrap()[0]["limit"], "1");
         let fallback = online_page(&store, Default::default(), true, false)
@@ -918,9 +990,7 @@ mod online_catalog_tests {
         assert_eq!(calls.lock().unwrap().len(), 3);
         assert_eq!(calls.lock().unwrap()[2]["q"], "Demo");
         assert_eq!(store.page(&Default::default()).unwrap().total, 0);
-        assert!(connect_catalog(&store, &format!("{base}missing/"))
-            .await
-            .is_err());
+        assert!(check_catalog_address(&format!("{base}missing/")).await.is_err());
         assert_eq!(
             store.setting("server_url").unwrap().as_deref(),
             Some(base.as_str())

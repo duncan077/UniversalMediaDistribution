@@ -403,9 +403,31 @@ impl CatalogStore {
         id: Uuid,
         incoming: CatalogItem,
     ) -> Result<(CatalogItem, bool)> {
+        self.merge_remote_item_for(id, incoming, None)
+    }
+
+    pub fn merge_remote_item_for(
+        &self,
+        remote_id: Uuid,
+        incoming: CatalogItem,
+        expected_local_id: Option<Uuid>,
+    ) -> Result<(CatalogItem, bool)> {
         if incoming.deleted {
             return Err(Error::Invalid("Título eliminado".into()));
         }
+        let identity = CatalogItem {
+            sync_id: incoming.sync_id,
+            media_type: incoming.media_type.clone(),
+            subtype: incoming.subtype.clone(),
+            name: incoming.name.clone(),
+            deleted: false,
+            metadata: ["releaseYear", "releaseDate", "onlineProviders"]
+                .into_iter()
+                .filter_map(|key| {
+                    incoming.metadata.get(key).map(|value| (key.to_owned(), value.clone()))
+                })
+                .collect(),
+        };
         let server_art: Vec<(String, Value)> = ["thumbnailRef", "backdropRef"]
             .into_iter()
             .filter_map(|key| {
@@ -442,10 +464,19 @@ impl CatalogStore {
         for (key, value) in server_art {
             clean.metadata.entry(key).or_insert(value);
         }
-        clean.sync_id = Some(id);
+        clean.sync_id = Some(remote_id);
         clean.validate()?;
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = Self::matching_summary_from(&tx, remote_id, &identity)?
+            .and_then(|item| item.sync_id)
+            .unwrap_or(remote_id);
+        if expected_local_id.is_some_and(|expected| expected != id) {
+            return Err(Error::Invalid(
+                "Cambió la ficha de la biblioteca. Volvé a abrir el título.".into(),
+            ));
+        }
+        clean.sync_id = Some(id);
         let previous = Self::item_from(&tx, id)?;
         let mut merged = if let Some(old) = &previous {
             let mut item = old.clone();
@@ -648,6 +679,42 @@ impl CatalogStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn browsing_equivalent_titles_reuses_local_identity_and_keeps_other_editions() {
+        let store = CatalogStore::in_memory().unwrap();
+        let manga = Uuid::from_u128(2);
+        let novel = Uuid::from_u128(1);
+        let make = |id, name, subtype, year, chapter| {
+            serde_json::from_value::<CatalogItem>(json!({
+                "syncId":id, "name":name, "mediaType":"book", "subtype":subtype, "releaseYear":year,
+                "units":[{"kind":"chapter","displayNumber":chapter}]
+            })).unwrap()
+        };
+        store.import(&CatalogDocument::new(vec![
+            make(manga, "La luna", "manga", 2012, "1"),
+            make(novel, "La luna", "novel", 2012, "1"),
+        ]), false).unwrap();
+        store.set_favorite(manga, true).unwrap();
+        let remapped = make(Uuid::from_u128(3), "LA   LUNA", "book.manga", 2012, "2");
+        let remake = make(Uuid::from_u128(4), "La luna", "manga", 2024, "1");
+        let comic = make(Uuid::from_u128(5), "La luna", "comic", 2012, "1");
+        let matched = store.matching_catalog_summaries(&[remapped.clone(),remake.clone(),comic]).unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[&remapped.id().unwrap()].sync_id, Some(manga));
+        assert_eq!(store.page(&Default::default()).unwrap().total, 2);
+        assert!(store.merge_remote_item_for(remake.id().unwrap(), remake, Some(manga)).is_err());
+
+        let remote_id = remapped.id().unwrap();
+        let (merged, _) = store.merge_remote_item_for(remote_id, remapped, Some(manga)).unwrap();
+        assert_eq!(merged.sync_id, Some(manga));
+        assert_eq!(merged.metadata["units"].as_array().unwrap().len(), 2);
+        let page = store.page(&Default::default()).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.favorite_ids, vec![manga]);
+        assert!(store.item(remote_id).unwrap().is_none());
+    }
+
     #[test]
     fn a_corrected_novel_binding_does_not_replace_manga_or_its_favorite() {
         let store = CatalogStore::in_memory().unwrap();

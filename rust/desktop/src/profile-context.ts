@@ -1,4 +1,5 @@
 import {invoke} from "./bridge";
+import {hideAdult} from "./content-filter";
 import {
   clearProfilePrefs,
   disabledProvidersForProfile,
@@ -63,7 +64,7 @@ export async function invokeProfile<T>(command: string, args: Record<string,unkn
   const {activeId} = await windowProfile();
   const view = command === "library" || command === "home_bootstrap"
     ? {
-        hideAdult: getProfilePref(activeId, "umd-hide-adult") === "true",
+        hideAdult: hideAdult(),
         preferredProviders: preferredProvidersForProfile(activeId),
       }
     : {};

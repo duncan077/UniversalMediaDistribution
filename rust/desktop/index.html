@@ -41,11 +41,10 @@
           <input id="search" type="search" placeholder="Buscar en tu biblioteca" aria-label="Buscar en el catálogo" maxlength="200" />
           <kbd>Ctrl F</kbd>
         </label>
-        <button id="provider-open" class="search-providers" data-icon="compass">Buscar en proveedores</button>
-        <button id="profiles-open" class="profile-trigger" data-icon="profile">Perfiles</button>
+        <button id="provider-open" class="search-providers" data-icon="compass" aria-label="Buscar en proveedores" title="Buscar en proveedores"><span>Buscar en proveedores</span></button>
+        <button id="profiles-open" class="profile-trigger" data-icon="profile" aria-label="Perfiles"><span>Perfiles</span></button>
+        <span id="activity" role="status" hidden>Cargando…</span>
       </header>
-      <span id="activity" role="status" hidden>Cargando…</span>
-      <p id="status" role="status" aria-live="polite"></p>
       <div class="workspace">
         <!-- Page: Catalog / Home / Sections -->
         <section id="page-catalog" data-page="catalog">
@@ -80,20 +79,6 @@
               <button type="button" class="shelf-nav shelf-prev" aria-label="Desplazar a la izquierda">‹</button>
               <button type="button" class="shelf-nav shelf-next" aria-label="Desplazar a la derecha">›</button>
             </div>
-          </section>
-
-          <!-- Online Server Shelf -->
-          <section id="online-shelf" class="shelf-section" aria-labelledby="online-heading" hidden>
-            <div class="collection-heading">
-              <div><h2 id="online-heading">Catálogo del servidor</h2></div>
-            </div>
-            <p id="online-status" role="status"></p>
-            <div class="shelf-host">
-              <div id="online-cards" class="catalog"></div>
-              <button type="button" class="shelf-nav shelf-prev" aria-label="Desplazar a la izquierda">‹</button>
-              <button type="button" class="shelf-nav shelf-next" aria-label="Desplazar a la derecha">›</button>
-            </div>
-            <button type="button" id="online-more" class="load-more" hidden>Ver más del servidor</button>
           </section>
 
           <section id="filtered-provider-shelf" class="shelf-section" aria-labelledby="filtered-provider-heading" hidden>
@@ -140,6 +125,7 @@
             <button type="button" id="filters-clear">Limpiar filtros</button>
           </div>
           <p id="catalog-loading" class="muted" role="status" hidden>Cargando títulos…</p>
+          <p id="catalog-source-status" class="page-status" role="status"></p>
           <section id="catalog" class="catalog" aria-label="Títulos"></section>
           <section id="empty" class="empty" hidden>
             <h2 id="empty-title"></h2><p id="empty-description"></p>
@@ -209,8 +195,7 @@
               <label class="field">Tipo de obra<select id="provider-type"><option value="">Todos</option><option value="anime">Anime</option><option value="liveAction">Acción real</option><option value="manga">Manga y manhwa</option><option value="prose">Libros y novelas</option><option value="comic">Cómics</option><option value="audio">Audio</option></select></label>
               <button type="submit" class="primary">Buscar</button>
             </form>
-            <details class="provider-prefs-box"><summary>Preferencias de búsqueda y filtro +18</summary>
-              <label class="toggle-row"><input type="checkbox" id="hide-adult"> Ocultar contenido +18</label>
+            <details class="provider-prefs-box"><summary>Preferencias de búsqueda</summary>
               <div id="provider-preferences"></div>
             </details>
           </div>
@@ -300,7 +285,8 @@
       <header class="dialog-header"><h2 id="settings-title">Configuración</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
       <div class="settings-sections">
         <section class="settings-group"><h3>Biblioteca y servidor</h3>
-          <label class="toggle-row"><input type="checkbox" id="online-enabled" checked><span>Consultar el catálogo online en la biblioteca</span></label>
+          <label class="toggle-row"><input type="checkbox" id="online-enabled" checked><span>Usar el catálogo del servidor cuando esté disponible</span></label>
+          <label class="toggle-row"><input type="checkbox" id="hide-adult" checked><span>Ocultar contenido +18</span></label>
           <button type="button" id="connect" data-icon="server">Conectar servidor</button>
           <button type="button" id="import" data-icon="import">Importar catálogo</button>
           <button type="button" id="export" data-icon="export">Exportar catálogo</button>
@@ -394,9 +380,9 @@
     <dialog id="server-dialog" aria-labelledby="server-title">
       <form id="server-form">
         <header class="dialog-header"><h2 id="server-title">Conectar servidor</h2><button type="button" class="close" data-close aria-label="Cerrar">×</button></header>
-        <p>Consultá el catálogo del servidor y guardá en tu biblioteca los títulos que elijas.</p>
+        <p>Esta dirección se usa para el catálogo, la cuenta y el respaldo.</p>
         <label class="field">Dirección del servidor
-          <input id="server-address" type="url" placeholder="http://127.0.0.1:9005" required maxlength="2048" />
+          <input id="server-address" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="umd.example.com" required maxlength="2048" />
         </label>
         <p id="server-error" role="alert"></p>
         <p id="server-progress" role="status"></p>
@@ -408,7 +394,9 @@
       <p id="party-overlay-status" role="status"></p>
       <div id="party-overlay-content"></div>
     </dialog>
-    <div id="app-notice-stack" class="app-notice-stack" aria-live="polite"></div>
+    <div id="app-notice-stack" class="app-notice-stack" aria-live="polite">
+      <p id="status" role="status"></p>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
