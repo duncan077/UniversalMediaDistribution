@@ -1505,11 +1505,19 @@ function webVideoOverlay(
   const captions = node("select");
   captions.hidden = true;
   captions.setAttribute("aria-label", ui("Subtítulos"));
-  settings.append(captions);
+  captions.dataset.tvPrimary = "";
+  const tv = document.documentElement.classList.contains("television");
+  if (tv) {
+    settings.prepend(captions);
+    settings.classList.add("native-settings");
+  } else {
+    settings.append(captions);
+  }
   timeline.append(start, seek, end);
   transport.append(play, mute, volume);
   bar.append(transport);
   controls.append(timeline, bar);
+  if (tv) controls.append(settings);
   controls.setAttribute("role", "group");
   controls.setAttribute("aria-label", ui("Controles de reproducción"));
   viewport.after(controls);
@@ -1865,20 +1873,23 @@ async function play(
     let mediaAddress = primaryUrl;
     let webTracks = validTracks;
     let closeRelay = () => {};
-    if (stream?.referer && !isDash) {
+    const pageReferrer = isDash ? null : stream?.referer ?? null;
+    if (pageReferrer || validTracks.length) {
       const id = crypto.randomUUID();
       try {
         const relay = await invoke<{url: string; tracks: string[]}>("web_stream_relay", {
-          id, address: primaryUrl, referer: stream.referer, hls: hlsHint, tracks: validTracks.map(track => track.url),
+          id, address: primaryUrl, referer: pageReferrer, hls: hlsHint, tracks: validTracks.map(track => track.url),
         });
         closeRelay = () => { void invoke("close_stream_relay", {id}).catch(() => {}); };
         if (!dialog.open || !header.isConnected) { closeRelay(); return; }
         cleanup = closeRelay;
         mediaAddress = relay.url;
-        webTracks = validTracks.flatMap((track, index) => relay.tracks[index] ? [{...track, url: relay.tracks[index]}] : []);
+        webTracks = validTracks.map((track, index) => relay.tracks[index] ? {...track, url: relay.tracks[index]} : track);
       } catch (e) {
-        failed(String(e));
-        return;
+        if (pageReferrer) {
+          failed(String(e));
+          return;
+        }
       }
     }
     const media = node(kind);

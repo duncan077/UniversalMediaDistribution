@@ -580,6 +580,8 @@
   "Buscando pantallas…": "Searching for displays…",
   "Controles de reproducción": "Playback controls",
   "Sin subtítulos": "No subtitles",
+  "No se pudo cambiar el subtítulo.": "Could not switch the subtitle track.",
+  "No se pudo cambiar la pista de audio.": "Could not switch the audio track.",
   "Sin pistas de audio": "No audio tracks",
   "Transmitir": "Cast",
   "Motor": "Engine",

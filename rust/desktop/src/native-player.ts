@@ -7,7 +7,8 @@ import {nativeSourceUrl} from "./safety";
 import type {Target} from "./player";
 
 type Track = {id:number;name:string};
-interface State {closed?:boolean;error?:string;ready?:boolean;pointerMoved?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
+type TrackKind = "audio" | "subtitle";
+interface State {closed?:boolean;error?:string;trackFailed?:boolean;ready?:boolean;pointerMoved?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
   audio?:Track[];subtitle?:Track[];selectedAudio:number;selectedSubtitle:number;renderers?:Track[];selectedRenderer?:number;rendererFailed?:boolean}
 interface PlayerOptions {
   engines:HTMLSelectElement; servers?:HTMLSelectElement; wireless?:HTMLButtonElement;
@@ -28,6 +29,7 @@ export function formatMediaTime(seconds: number): string {
 export function nativePlayer(engine:string, address:string, view:HTMLElement, header:HTMLElement, out:HTMLElement,
     label:string,target:Target|null,sidecars:{url:string;language:string;label:string;default:boolean}[],resume:number,save:(position:number,ended:boolean)=>void, onFatal:(message:string)=>void, referer:string|undefined, hls:boolean, options:PlayerOptions) {
   const id=crypto.randomUUID(), embedded=/Android|Windows/i.test(navigator.userAgent);
+  const tv = document.documentElement.classList.contains("television");
   const events=new AbortController(), eventOpts={signal:events.signal};
   const dialog=header.closest("dialog")!;
 
@@ -81,11 +83,12 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   durationDisplay.className="native-time native-time-total";
   durationDisplay.textContent="--:--";
 
-  const tracks=(trackLabel:string,op:string)=>{
+  const tracks=(trackLabel:string,kind:TrackKind)=>{
     const el=document.createElement("select");el.setAttribute("aria-label",trackLabel);
     el.disabled = true;
     el.add(new Option(ui("Cargando…"), ""));
-    el.onchange=()=>void request(op,Number(el.value)).catch(fail);return el;
+    el.onchange=()=>void selectTrack(kind,Number(el.value));
+    return el;
   };
   function skip(seconds: number) {
     const b = document.createElement("button"); b.type = "button"; b.className = "quiet-btn native-skip-btn"; b.disabled = true;
@@ -133,21 +136,31 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     syncSeekFill(pos, dur);
   };
   timeline.append(elapsedDisplay, seek, durationDisplay);
-  transport.append(toggle, back, forward, volumeGroup, stateChip);
+  transport.append(...(tv ? [back, toggle, forward] : [toggle, back, forward]), volumeGroup, stateChip);
 
   const audio=tracks(ui("Audio"),"audio"),subs=tracks(ui("Subtítulos"),"subtitle");
+  subs.dataset.tvPrimary = "";
   const externalCaptions = engine === "android"
     ? sidecars.slice(0,100).map((track,i) => ({id:-2-i,name:track.label || track.language || ui("Subtítulos")})) : [];
+  const audioField = field(ui("Audio"), audio), subtitleField = field(ui("Subtítulos"), subs);
+  if (tv) settings.append(subtitleField, audioField);
   if(options.servers && options.servers.options.length > 1) settings.append(field(ui("Servidor"), options.servers));
-  settings.append(field(ui("Audio"),audio),field(ui("Subtítulos"),subs),field(ui("Motor"),options.engines));
+  if (!tv) settings.append(audioField, subtitleField);
+  settings.append(field(ui("Motor"),options.engines));
 
   let closed=false, fatal=false, started=false, restoring=false, restored=false, timer=0, lastSave=Date.now(), state:State|undefined;
   let queue=Promise.resolve(),previousBox="",seeks=0,plays=0,pauses=0,failures=0;
   let pauseAfterSwitch = options.initiallyPaused;
   let polling = false;
   let layoutFrame = 0;
+  const trackChanges = {
+    audio: {pending:false,revision:0},
+    subtitle: {pending:false,revision:0},
+  };
+  const trackRevisions = () => ({audio:trackChanges.audio.revision,subtitle:trackChanges.subtitle.revision});
 
   const captionsAvailable = ui("Sin subtítulos");
+  const audioAvailable = ui("Sin pistas de audio");
   const devices = document.createElement("select");
   const castStatus = document.createElement("span");
   castStatus.setAttribute("role","status");
@@ -243,8 +256,49 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   document.addEventListener("fullscreenchange",scheduleLayout,eventOpts);
 
   function request(op:string,value?:number) {
-    const sidecar=engine==="android" && op==="subtitle" && value!==undefined && value < -1 ? sidecars[-value-2] : undefined;
-    const task=queue.then(async()=>{if(!closed){const result=await call(op,{value,address:sidecar?.url});if(op==="seek")seeks++;update(result);}});queue=task.catch(fail);return task;
+    const task = queue.then(async () => {
+      if (closed) return;
+      const revisions = trackRevisions();
+      const result = await call(op, {value});
+      if (op === "seek") seeks++;
+      update(result, revisions);
+    });
+    queue = task.catch(fail);
+    return task;
+  }
+
+  async function selectTrack(kind: TrackKind, value: number) {
+    if (closed || fatal || !state?.ready) return;
+    const change = trackChanges[kind];
+    const [control, field, empty, message] = kind === "audio"
+      ? [audio, "selectedAudio", audioAvailable, ui("No se pudo cambiar la pista de audio.")] as const
+      : [subs, "selectedSubtitle", captionsAvailable, ui("No se pudo cambiar el subtítulo.")] as const;
+    let selected = state[field];
+    if (change.pending) {
+      list(control, undefined, selected, empty);
+      return;
+    }
+    change.pending = true;
+    control.setAttribute("aria-busy", "true");
+    try {
+      const sidecar = kind === "subtitle" && engine === "android" && value < -1 ? sidecars[-value-2] : undefined;
+      const result = await call(kind, {value,address:sidecar?.url,referer:sidecar ? referer : undefined});
+      if (closed || result.closed) return;
+      if (result.trackFailed || result.error || !result.ready) throw Error(message);
+      selected = result[field];
+      if (state) state[field] = selected;
+      change.revision++;
+      if (out.textContent === message) {
+        out.textContent = "";
+        out.classList.remove("is-error");
+      }
+    } catch {
+      fail(message);
+    } finally {
+      change.pending = false;
+      control.removeAttribute("aria-busy");
+      if (!closed) list(control, undefined, selected, empty);
+    }
   }
 
   const togglePlayPause=()=>{
@@ -270,14 +324,13 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
 
     const targetEl=event.target as HTMLElement|null;
     if(targetEl?.matches("input, select, textarea"))return;
-    const isTv=document.documentElement.classList.contains("television");
     const key=event.key.toLowerCase();
     if(key==="k" || (event.key===" " && !targetEl?.matches("button, summary, a"))){
       event.preventDefault();
       togglePlayPause();
-    } else if(key==="j" || (!isTv && event.key==="ArrowLeft")){
+    } else if(key==="j" || (!tv && event.key==="ArrowLeft")){
       if(state?.duration){event.preventDefault();back.click();}
-    } else if(key==="l" || (!isTv && event.key==="ArrowRight")){
+    } else if(key==="l" || (!tv && event.key==="ArrowRight")){
       if(state?.duration){event.preventDefault();forward.click();}
     } else if(key==="m"){
       event.preventDefault();
@@ -301,7 +354,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
 
   const media=new ProviderMedia(request);
   const detach=target && options.followRoom?attachPartyPlayer(media,target,label,header,out):()=>{};
-  function list(el:HTMLSelectElement, rows:Track[]|undefined, selected:number, empty:string) {
+  function list(el:HTMLSelectElement, rows:Track[]|undefined, selected:number|undefined, empty:string) {
     if (rows) {
       const key=JSON.stringify(rows);
       if(el.dataset.rows!==key) {
@@ -310,12 +363,17 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
         el.disabled=rows.length < 2;
       }
     }
+    if (selected === undefined) return;
     const value=String(selected);
     if(el.value!==value && [...el.options].some(option=>option.value===value)) el.value=value;
   }
-  function update(s:State) {
+  function update(s:State, revisions = trackRevisions()) {
     if(closed)return;
     if(s.closed || s.error){fatal=true;onFatal(ui("No se pudo reproducir con este motor."));return;}
+    if (state) {
+      if (trackChanges.audio.pending || revisions.audio !== trackChanges.audio.revision) s.selectedAudio = state.selectedAudio;
+      if (trackChanges.subtitle.pending || revisions.subtitle !== trackChanges.subtitle.revision) s.selectedSubtitle = state.selectedSubtitle;
+    }
     state=s;
     if (Array.isArray(s.renderers)) {
       const rows = [{id:0,name:ui("Este dispositivo")}, ...s.renderers];
@@ -332,9 +390,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     if(s.pointerMoved) overlay?.wake();
     stagePlaceholder.hidden = true;
     stateChip.hidden = true;
-    if(previousPaused===undefined){
-      overlay?.wake();
-    } else if(previousPaused!==s.paused){
+    if(previousPaused!==undefined && previousPaused!==s.paused){
       if(s.paused) pauses++; else plays++;
     }
     previousPaused=s.paused;
@@ -355,13 +411,14 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       const currentText = formatMediaTime(s.position);
       if(elapsedDisplay.textContent!==currentText)elapsedDisplay.textContent=currentText;
     }
-    list(audio,s.audio,s.selectedAudio,ui("Sin pistas de audio"));
+    list(audio,s.audio,trackChanges.audio.pending ? undefined : s.selectedAudio,audioAvailable);
     const captions=engine==="android" && s.subtitle ? [...s.subtitle,...externalCaptions] : s.subtitle;
-    list(subs,engine==="android" && captions?.length ? [{id:-1,name:ui("Desactivado")},...captions]:captions,s.selectedSubtitle,captionsAvailable);
+    list(subs,engine==="android" && captions?.length ? [{id:-1,name:ui("Desactivado")},...captions]:captions,
+      trackChanges.subtitle.pending ? undefined : s.selectedSubtitle,captionsAvailable);
     if(!restored && !restoring){
       restoring=true;
       const preferred=sidecars.slice(0,100).findIndex(t=>t.default);
-      if(engine==="android" && preferred>=0)void request("subtitle",-2-preferred).catch(fail);
+      if(engine==="android" && preferred>=0)void selectTrack("subtitle",-2-preferred);
       if (pauseAfterSwitch) {pauseAfterSwitch = false; void request("pause").catch(fail);}
       if(resume>0 && (!s.duration || resume<s.duration)){
         void request("seek",resume).then(()=>{
@@ -383,7 +440,8 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       await queue;if(closed || fatal)return;
       const rect=box(),signature=JSON.stringify(rect);
       if(embedded && signature!==previousBox){await call("layout",{box:rect});previousBox=signature;}
-      update(await call("read"));
+      const revisions = trackRevisions();
+      update(await call("read"), revisions);
       failures=0;
     }catch(e){failures++;fail(e);}
     finally {

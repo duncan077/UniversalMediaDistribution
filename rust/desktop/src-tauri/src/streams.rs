@@ -118,7 +118,7 @@ pub(crate) async fn fetch_media(
 
 pub(crate) async fn relay_media(
     url: Url,
-    player_page: &Url,
+    player_page: Option<&Url>,
     range: Option<&str>,
 ) -> CommandResult<reqwest::Response> {
     let duration = Duration::from_secs(30);
@@ -127,9 +127,9 @@ pub(crate) async fn relay_media(
         fetch_response(
             url,
             duration,
-            Some(player_page),
+            player_page,
             range,
-            Some(player_page),
+            player_page,
             RequestKind::Relay,
         ),
     )

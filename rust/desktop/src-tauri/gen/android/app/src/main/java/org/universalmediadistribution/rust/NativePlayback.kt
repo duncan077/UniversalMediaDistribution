@@ -100,6 +100,53 @@ class NativePlayback(private val owner: MainActivity) {
   private var captions = emptyList<Cue>()
   private var externalTrack = -1
   private var captionView: TextView? = null
+  private val subtitleTypes = intArrayOf(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT,
+    MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE)
+
+  private fun selectAudio(player: MediaPlayer, track: Int): Boolean {
+    val type = MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO
+    if (player.trackInfo.getOrNull(track)?.trackType != type) return false
+    if (player.getSelectedTrack(type) != track) player.selectTrack(track)
+    return player.getSelectedTrack(type) == track
+  }
+
+  private fun selectedSubtitle(player: MediaPlayer): Int {
+    for (type in subtitleTypes) {
+      val selected = runCatching { player.getSelectedTrack(type) }.getOrDefault(-1)
+      if (selected >= 0) return selected
+    }
+    return -1
+  }
+
+  private fun selectSubtitle(player: MediaPlayer, track: Int, args: JSONObject): Boolean {
+    val cues = if (track < -1) {
+      val values = args.optJSONArray("cues") ?: return false
+      if (values.length() == 0) return false
+      List(values.length()) { index ->
+        val cue = values.getJSONObject(index)
+        Cue(cue.getLong("start"), cue.getLong("end"), cue.getString("text"))
+      }
+    } else emptyList()
+    val type = if (track >= 0) {
+      val kind = player.trackInfo.getOrNull(track)?.trackType ?: return false
+      if (kind !in subtitleTypes) return false
+      kind
+    } else null
+    if (type != null && player.getSelectedTrack(type) != track) {
+      player.selectTrack(track)
+      if (player.getSelectedTrack(type) != track) return false
+    }
+    // MediaPlayer replaces a previous track of the same type automatically.
+    for (oldType in subtitleTypes) {
+      if (oldType == type) continue
+      val selected = player.getSelectedTrack(oldType)
+      if (selected >= 0) player.deselectTrack(selected)
+    }
+    externalTrack = if (track < -1) track else -1
+    captions = cues
+    showCaption(null)
+    return true
+  }
 
   private fun showCaption(text: String?) {
     captionView?.let { view ->
@@ -312,25 +359,18 @@ class NativePlayback(private val owner: MainActivity) {
         "play" -> if(ready) { ended=false;player?.start();v?.play() }
         "volume" -> { val percent = a.getInt("value").coerceIn(0,100); val gain = percent / 100f; player?.setVolume(gain,gain); v?.setVolume(percent) }
         "seek" -> if(ready) {val ms=(a.getDouble("value")*1000).toLong();player?.seekTo(ms.coerceIn(0,Int.MAX_VALUE.toLong()).toInt());v?.time=ms;ended=false}
-        "audio","subtitle" -> if(ready) {
-          val track=a.getInt("value")
-          if(v!=null){ if(op=="audio") v.audioTrack=track else v.spuTrack=track }
-          else if (player != null && op == "subtitle") {
-            val cues = if (track < -1) a.getJSONArray("cues").let { values ->
-              List(values.length()) { index ->
-                val cue = values.getJSONObject(index)
-                Cue(cue.getLong("start"), cue.getLong("end"), cue.getString("text"))
-              }
-            } else emptyList()
-            if (track < -1 && cues.isEmpty()) return result.put("error", "Subtitle")
-            for (type in listOf(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE, MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT)) {
-              val selected = player.getSelectedTrack(type)
-              if (selected >= 0) player.deselectTrack(selected)
+        "audio","subtitle" -> {
+          val changed = ready && runCatching {
+            val track = a.getInt("value")
+            if (op == "audio") {
+              if (v != null) v.audioTrack == track || v.setAudioTrack(track)
+              else player != null && selectAudio(player, track)
+            } else {
+              if (v != null) v.spuTrack == track || v.setSpuTrack(track)
+              else player != null && selectSubtitle(player, track, a)
             }
-            externalTrack = if (track < -1) track else -1
-            captions = cues; showCaption(null)
-            if (track >= 0) player.selectTrack(track)
-          } else if (player != null && track >= 0) player.selectTrack(track)
+          }.getOrDefault(false)
+          if (!changed) return result.put("trackFailed", true)
         }
       }
       if(error.isNotEmpty()) return result.put("error",error)
@@ -350,7 +390,7 @@ class NativePlayback(private val owner: MainActivity) {
         result.put("renderers",screens).put("selectedRenderer",selectedDevice)
         devicesDirty = false
       }
-      if (ready && tracksDirty) {
+      if (ready && tracksDirty && (op == "read" || op == "start")) {
         val audio=JSONArray();val subtitles=JSONArray()
         fun add(list:JSONArray,id:Int,name:String){list.put(JSONObject().put("id",id).put("name",name))}
         if(v!=null) { v.audioTracks?.forEach {add(audio,it.id,it.name)};v.spuTracks?.forEach {add(subtitles,it.id,it.name)} }
@@ -366,7 +406,11 @@ class NativePlayback(private val owner: MainActivity) {
         .put("paused",!(ready && (player?.isPlaying ?: v?.isPlaying ?: false))).put("ready",ready)
         .put("ended",ended)
         .put("selectedAudio",if(ready) (v?.audioTrack ?: player?.getSelectedTrack(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) ?: -1) else -1)
-        .put("selectedSubtitle",if(ready) (v?.spuTrack ?: (if (externalTrack < -1) externalTrack else player?.getSelectedTrack(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT)?.takeIf { it >= 0 } ?: player?.getSelectedTrack(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE)) ?: -1) else -1)
-    } catch (_:Exception) { if(op=="start")close();return result.put("error","Playback") }
+        .put("selectedSubtitle",if(ready) (v?.spuTrack ?: (if (externalTrack < -1) externalTrack else player?.let(::selectedSubtitle)) ?: -1) else -1)
+    } catch (_:Exception) {
+      if (op == "audio" || op == "subtitle") return result.put("trackFailed", true)
+      if (op == "start") close()
+      return result.put("error", "Playback")
+    }
   }
 }

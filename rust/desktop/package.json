@@ -1,7 +1,7 @@
 {
   "name": "umd-desktop",
   "private": true,
-  "version": "0.1.26",
+  "version": "0.1.27",
   "type": "module",
   "scripts": {
     "predev": "node prepare-pdf.mjs",

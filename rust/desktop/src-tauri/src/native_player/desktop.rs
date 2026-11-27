@@ -256,10 +256,13 @@ impl Player {
                 } else {
                     b"libvlc_video_set_spu"
                 };
-                symbol::<unsafe extern "C" fn(Handle, c_int) -> c_int>(&self.lib, name)?(
+                let changed = symbol::<unsafe extern "C" fn(Handle, c_int) -> c_int>(&self.lib, name)?(
                     self.player,
                     number as i32,
                 );
+                if changed != 0 {
+                    return Ok(json!({"trackFailed":true}));
+                }
             }
             _ => {}
         }

@@ -160,7 +160,7 @@ pub async fn native_playback(
                 .map_err(|_| "Descarga inválida.")?;
             crate::torrent_stream::native_url(window.app_handle(), token).await?
         } else if let Some(referer) = args["referer"].as_str() {
-            crate::hls_proxy::start(id, address, referer, args["hls"] == true, &[])
+            crate::hls_proxy::start(id, address, Some(referer), args["hls"] == true, &[])
                 .await?
                 .url
         } else {
@@ -185,7 +185,15 @@ pub async fn native_playback(
                         .await
                         .map_err(|e| e.to_string())?
                 } else {
-                    crate::streams::get_public(url, timeout).await?
+                    let page = args["referer"].as_str()
+                        .and_then(|value| reqwest::Url::parse(value).ok())
+                        .filter(umd_core::public_url::web_url);
+                    tokio::time::timeout(
+                        timeout,
+                        crate::streams::fetch_media(url, timeout, page.as_ref(), None, page.as_ref()),
+                    )
+                    .await
+                    .map_err(|_| "No se pudo descargar el subtítulo.")??
                 };
             if !response.status().is_success() {
                 return Err("No se pudo descargar el subtítulo.".into());

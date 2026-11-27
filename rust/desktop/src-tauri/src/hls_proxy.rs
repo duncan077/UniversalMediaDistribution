@@ -21,9 +21,12 @@ use uuid::Uuid;
 type ActiveRelays = HashMap<String, (Uuid, oneshot::Sender<()>)>;
 static ACTIVE: LazyLock<Mutex<ActiveRelays>> = LazyLock::new(Default::default);
 static URI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\bURI="([^"]*)""#).unwrap());
+static SRT_TIMING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\d{2,}:\d{2}:\d{2})[,.](\d{3})\s+-->\s+(\d{2,}:\d{2}:\d{2})[,.](\d{3})(?:\s.*)?$").unwrap()
+});
 #[derive(Clone)]
 struct Relay {
-    page: Url,
+    page: Option<Url>,
     token: Uuid,
     origin: String,
     resources: Arc<Mutex<HashMap<Uuid, Resource>>>,
@@ -148,7 +151,7 @@ fn end_token(id: &str, token: Uuid) {
 pub async fn start(
     id: Uuid,
     address: &str,
-    referer: &str,
+    referer: Option<&str>,
     hls: bool,
     tracks: &[String],
 ) -> CommandResult<Source> {
@@ -158,8 +161,7 @@ pub async fn start(
             .filter(umd_core::public_url::web_url)
             .ok_or("Fuente HLS pública inválida.")
     };
-    let page = parse(referer)?;
-    let url = parse(address)?;
+    let page = referer.map(parse).transpose()?;
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|e| e.to_string())?;
@@ -174,7 +176,11 @@ pub async fn start(
         permits: Arc::new(Semaphore::new(6)),
     };
     let token = relay.token;
-    let root = relay.link(url, if hls { Kind::Hls } else { Kind::Auto })?;
+    let root = if relay.page.is_some() {
+        relay.link(parse(address)?, if hls { Kind::Hls } else { Kind::Auto })?
+    } else {
+        address.to_owned()
+    };
     let tracks = tracks
         .iter()
         .take(100)
@@ -216,14 +222,37 @@ pub async fn web_stream_relay(
     window: tauri::WebviewWindow,
     id: Uuid,
     address: String,
-    referer: String,
+    referer: Option<String>,
     hls: bool,
     tracks: Vec<String>,
 ) -> CommandResult<Source> {
     if window.label() != "main" {
         return Err("Acción reservada a la biblioteca.".into());
     }
-    start(id, &address, &referer, hls, &tracks).await
+    start(id, &address, referer.as_deref(), hls, &tracks).await
+}
+
+fn subtitle_vtt(text: String) -> Option<String> {
+    let text = text.trim_start_matches('\u{feff}');
+    if text.lines().next().is_some_and(|line| {
+        line == "WEBVTT" || line.starts_with("WEBVTT ") || line.starts_with("WEBVTT\t")
+    }) {
+        return Some(text.to_owned());
+    }
+    let mut out = String::from("WEBVTT\n\n");
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(timing) = SRT_TIMING.captures(line.trim()) else {
+            continue;
+        };
+        out.push_str(&format!("{}.{} --> {}.{}\n", &timing[1], &timing[2], &timing[3], &timing[4]));
+        while lines.peek().is_some_and(|line| !line.trim().is_empty()) {
+            out.push_str(lines.next().unwrap());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    (out.len() > "WEBVTT\n\n".len()).then_some(out)
 }
 
 #[tauri::command]
@@ -288,11 +317,12 @@ async fn resource(
         .get(header::RANGE)
         .and_then(|s| s.to_str().ok())
         .filter(|s| {
-            s.len() <= 80
+            resource.kind != Kind::Subtitle
+                && s.len() <= 80
                 && s.strip_prefix("bytes=")
                     .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
         });
-    let Ok(res) = crate::streams::relay_media(resource.url, &relay.page, range).await else {
+    let Ok(res) = crate::streams::relay_media(resource.url, relay.page.as_ref(), range).await else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let mime = res
@@ -322,6 +352,22 @@ async fn resource(
                 "Content-Range, Accept-Ranges, Content-Length",
             );
     }
+    if resource.kind == Kind::Subtitle {
+        if !res.status().is_success() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let Ok(Ok(text)) = tokio::time::timeout(
+            Duration::from_secs(12),
+            crate::streams::bounded_text(res, 1024 * 1024),
+        ).await else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        let Some(text) = subtitle_vtt(text) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        return builder.header(header::CONTENT_TYPE, "text/vtt; charset=utf-8")
+            .body(text.into()).unwrap();
+    }
     if is_list {
         let Ok(text) = crate::streams::bounded_text(res, 2 << 20).await else {
             return StatusCode::BAD_GATEWAY.into_response();
@@ -343,9 +389,7 @@ async fn resource(
             builder = builder.header(key, v);
         }
     }
-    let mime = if resource.kind == Kind::Subtitle {
-        "text/vtt"
-    } else if mime.starts_with("video/") || mime.starts_with("audio/") {
+    let mime = if mime.starts_with("video/") || mime.starts_with("audio/") {
         &mime
     } else {
         "application/octet-stream"
@@ -368,11 +412,21 @@ async fn resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_srt_sidecars_and_preserves_existing_webvtt() {
+        let srt = "\u{feff}1\r\n00:00:38,208 --> 00:00:44,700\r\n<i>Prueba</i>\r\n\r\n2\r\n00:01:00,000 --> 00:01:02,000\r\nDos\r\n";
+        let vtt = "WEBVTT\n\n00:00:38.208 --> 00:00:44.700\n<i>Prueba</i>\n\n00:01:00.000 --> 00:01:02.000\nDos\n\n";
+        assert_eq!(subtitle_vtt(srt.into()).as_deref(), Some(vtt));
+        assert_eq!(subtitle_vtt(vtt.into()).as_deref(), Some(vtt));
+        assert_eq!(subtitle_vtt("invalid subtitle".into()), None);
+    }
+
     #[test]
     fn manifest_rewrites_variants_fragments_and_inline_attributes() {
         let base = Url::parse("https://media.example.org/a/master.m3u8").unwrap();
         let relay = Relay {
-            page: base.clone(),
+            page: Some(base.clone()),
             token: Uuid::new_v4(),
             origin: "http://127.0.0.1:8181".into(),
             resources: Default::default(),

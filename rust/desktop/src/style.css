@@ -2227,6 +2227,49 @@
   width: 19px;
   height: 19px;
 }
+.television .has-playback-overlay .native-bar {
+  display: grid;
+}
+.television .has-playback-overlay :is(.native-transport, .native-settings) {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-inline: 0;
+  gap: 10px;
+}
+.television .has-playback-overlay .native-hud .native-seek {
+  min-height: 30px;
+}
+.television .has-playback-overlay .native-cast[open] {
+  flex-wrap: wrap;
+}
+.playback-tv-options {
+  position: absolute;
+  z-index: 2;
+  inset: auto var(--playback-gutter) calc(100% - 16px) auto;
+  width: min(450px, 90%);
+  padding: 16px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: #131b2b;
+  color: var(--paper);
+}
+.playback-tv-option-list {
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+  max-height: 30vh;
+  padding: 6px;
+  margin-top: 8px;
+}
+.playback-tv-option-list button {
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+.playback-tv-option-list button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
 @media (max-width: 740px) {
   .player-dialog.media-player-dialog {
     padding: 6px;

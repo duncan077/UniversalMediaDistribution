@@ -323,6 +323,7 @@ impl Provider {
                 common = subtitles(&tracks);
             }
         }
+        let common = preferred_subtitles(common);
         let mut options = Vec::new();
         let mut seen = HashSet::new();
         for row in body["sources"].as_array().into_iter().flatten().take(100) {
@@ -343,17 +344,7 @@ impl Provider {
             if !dash && !hls && row["type"] != "mp4" && !url.path().ends_with(".mp4") {
                 continue;
             }
-            let mut track_urls = HashSet::new();
-            let tracks: Vec<_> = subtitles(row)
-                .into_iter()
-                .chain(common.iter().cloned())
-                .filter(|t| {
-                    t["url"]
-                        .as_str()
-                        .is_some_and(|u| track_urls.insert(u.to_owned()))
-                })
-                .take(100)
-                .collect();
+            let tracks = preferred_subtitles(subtitles(row).into_iter().chain(common.iter().cloned()));
             options.push(json!({"url":url.to_string(),"dash":dash,"tracks":tracks,"hls":hls,"label":format!("{} · {}",row["server"].as_str().unwrap_or("FramexTV"),row["quality"].as_str().unwrap_or("Auto"))}));
         }
         options.push(web);
@@ -362,10 +353,55 @@ impl Provider {
 }
 
 fn subtitles(v: &Value) -> Vec<Value> {
-    v["subtitles"].as_array().into_iter().flatten().take(100).filter_map(|r|{
-        let url=Url::parse(r["url"].as_str()?).ok().filter(|u|u.scheme()=="https"&&umd_core::public_url::web_url(u))?;
-        let language=r["lang"].as_str().or(r["language"].as_str()).filter(|s|s.len()<=80).unwrap_or("und");
-        let label=r["label"].as_str().unwrap_or(language).chars().take(200).collect::<String>();
-        Some(json!({"url":url.to_string(),"language":language,"label":label,"default":r["isDefault"]==true}))
+    v["subtitles"].as_array().into_iter().flatten().take(1000).filter_map(|row| {
+        let url = Url::parse(row["url"].as_str()?).ok()
+            .filter(|u| u.scheme() == "https" && umd_core::public_url::web_url(u))?;
+        let language = row["lang"].as_str().or(row["language"].as_str()).map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 80).unwrap_or("und").to_ascii_lowercase();
+        let language = match language.as_str() {
+            "eng" => "en",
+            "spa" => "es",
+            "por" => "pt",
+            "pob" => "pt-br",
+            other => other,
+        };
+        let label = row["label"].as_str().unwrap_or(language).chars().take(200).collect::<String>();
+        Some(json!({"url":url.to_string(),"language":language,"label":label,"default":row["isDefault"]==true}))
     }).collect()
+}
+
+fn preferred_subtitles(tracks: impl IntoIterator<Item = Value>) -> Vec<Value> {
+    let mut urls = HashSet::new();
+    let mut languages = HashSet::new();
+    let (mut first, rest): (Vec<_>, Vec<_>) = tracks.into_iter()
+        .filter(|track| urls.insert(track["url"].as_str().unwrap_or_default().to_owned()))
+        .partition(|track| languages.insert(track["language"].as_str().unwrap_or_default().to_owned()));
+    let language_host = |track: &Value| {
+        let host = track["url"].as_str().and_then(|value| Url::parse(value).ok())
+            .and_then(|url| url.host_str().map(str::to_owned)).unwrap_or_default();
+        (track["language"].as_str().unwrap_or_default().to_owned(), host)
+    };
+    // Keep an option from another subtitle host ahead of repeat releases from the same host.
+    let mut hosts: HashSet<_> = first.iter().map(language_host).collect();
+    let (other_hosts, mut others): (Vec<_>, Vec<_>) = rest.into_iter()
+        .partition(|track| hosts.insert(language_host(track)));
+    others.sort_by_key(|track| track["default"] != true);
+    first.extend(other_hosts.into_iter().chain(others).take(100usize.saturating_sub(first.len())));
+    first.truncate(100);
+    first
+}
+
+#[cfg(test)]
+#[test]
+fn late_languages_survive_duplicate_subtitles() {
+    let mut tracks: Vec<_> = (0..112)
+        .map(|i| json!({"lang":"eng","url":format!("https://subs.example/{i}.srt")}))
+        .collect();
+    tracks.push(json!({"lang":"spa","url":"https://subs.example/es.srt"}));
+    tracks.push(json!({"lang":"en","url":"https://other.example/en.srt"}));
+    let selected = preferred_subtitles(subtitles(&json!({"subtitles":tracks})));
+    assert_eq!(selected.len(), 100);
+    assert_eq!(selected[0]["language"], "en");
+    assert_eq!(selected[1]["language"], "es");
+    assert_eq!(selected[2]["url"], "https://other.example/en.srt");
 }
