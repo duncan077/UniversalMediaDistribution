@@ -19,6 +19,7 @@ import {artworkSource} from "./artwork";
 import {attachPartyPlayer, samePartyUnit, type ContentUnit} from "./party";
 import {isPageActive} from "./router";
 import {catalogGroup} from "./catalog-types";
+import {bindDevicePlayback, receivingTitle, type IncomingPlayback, type VideoReference} from "./device-playback";
 
 export interface Target { itemId: string; unitKind: string | null; displayNumber: string | null; seasonNumber: number | null }
 export interface OpenedMedia { streaming?:boolean; kind: "audio" | "video" | "pdf" | "images" | "epub"; paths: string[] }
@@ -35,13 +36,18 @@ interface Entry {
   seasonNumber: number | null;
   seasonLabel: string;
   sources: Record<string, unknown>[];
+  transfer?: VideoReference;
+  providerLinks?: Record<string,string>;
+  incoming?: IncomingPlayback;
 }
+type PlaybackEntry = Pick<Entry,"label" | "transfer" | "incoming" | "providerLinks"> & {target:Target | null};
 export interface PlayableItem {
   onlineProviders?: Record<string, string>;
   subtype?: string;
   syncId: string;
   name: string;
   mediaType: string;
+  releaseYear?: number | null;
   units?: unknown[];
   seasons?: unknown[];
   sources?: unknown[];
@@ -57,6 +63,7 @@ export interface ContentControlsOptions {
   signal?: AbortSignal;
   view?: EntryListView;
   scrollToHighlight?: boolean;
+  serverId?: string;
 }
 export interface EntryListView {
   season?: number | "all";
@@ -143,7 +150,7 @@ function progressBadgeText(p: Progress | undefined, isBook: boolean): { text: st
   return { text: "", kind: "none" };
 }
 
-function entries(item: PlayableItem): Entry[] {
+function entries(item: PlayableItem, serverId?: string): Entry[] {
   const baseTarget: Target = { itemId: item.syncId, unitKind: null, displayNumber: null, seasonNumber: null };
   const result: Entry[] = [];
   const pushUnits = (values: unknown, seasonNumber: number | null, seasonTitle?: string) => {
@@ -189,6 +196,16 @@ function entries(item: PlayableItem): Entry[] {
     });
     result.forEach((entry, idx) => { entry.index = idx; });
   }
+  if (item.mediaType.toLowerCase() === "movie") {
+    for (const entry of result) {
+      const {itemId,displayNumber,seasonNumber} = entry.target;
+      const unitKind = entry.target.unitKind?.toLowerCase() ?? null;
+      if (unitKind !== null && unitKind !== "episode") continue;
+      entry.transfer = {itemId,serverId,name:item.name,subtype:item.subtype ?? "movie",
+        releaseYear:item.releaseYear ?? undefined,unitKind,displayNumber,seasonNumber};
+      entry.providerLinks = item.onlineProviders;
+    }
+  }
   return result;
 }
 
@@ -200,14 +217,16 @@ function persist(target: Target, position: number, kind: string, completed: bool
 
 async function openProviderSession(
   address: string,
-  entry: { label: string; target: Target },
+  entry: PlaybackEntry & {target:Target},
   report: (message: string, error?: boolean) => void,
   chapterNav?: ChapterNav,
   choices?: PlaybackChoices,
 ) {
   await flushProgress();
   const saved = await invokeProfile<Progress | null>("get_progress", {target: entry.target});
-  const resume = choices?.transport?.position ?? (saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0);
+  if (entry.incoming?.signal.aborted) return;
+  const resume = choices?.transport?.position ?? entry.incoming?.offer.positionSeconds ??
+    (saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0);
   await followProvider(
     address,
     entry.target,
@@ -227,6 +246,8 @@ async function openProviderSession(
     },
     {
       chapterNav,
+      reference: transferReference(entry, choices),
+      incoming: entry.incoming,
       sources: choices?.sources.map((s, i) => ({ label: s.label || ui("Servidor {0}", i + 1) })),
       sourceIndex: choices?.index ?? 0,
       resolveSource: choices && choices.sources.length > 1 ? async (nextIndex, currentPosition) => {
@@ -316,10 +337,10 @@ export function contentControls(
   report: (message: string, error?: boolean) => void,
   highlightUnit?: ContentUnit,
   options: ContentControlsOptions = {},
-): HTMLElement {
+): HTMLElement & {playFromDevice: (request: IncomingPlayback) => Promise<boolean>} {
   const isBook = item.mediaType.toLowerCase() === "book";
   const isAudio = item.mediaType.toLowerCase() === "audio";
-  const available = entries(item);
+  const available = entries(item, options.serverId);
   const hasUnits = available.some(e => e.target.unitKind !== null);
   const progressMap = new Map<number, Progress>();
   const television = document.documentElement.classList.contains("television");
@@ -558,6 +579,7 @@ export function contentControls(
   }
 
   async function openEntry(entry: Entry, preferred?: string): Promise<boolean> {
+    if (entry.incoming?.signal.aborted) return false;
     const nav = makeChapterNav(entry, preferred);
     const prov = primaryProviderFor(entry);
     const number = entry.target.displayNumber;
@@ -596,13 +618,17 @@ export function contentControls(
         listStatus.textContent = "";
       }
     }
-    // 3. Direct catalog source URL
-    for (const source of entry.sources) {
-      const url = remoteUrl(source.filePath);
-      if (!url) continue;
-      if (await openCatalogSource(entry, source, url, nav)) return true;
+    async function openDirect() {
+      for (const source of entry.sources) {
+        const url = remoteUrl(source.filePath);
+        if (url && await openCatalogSource(entry, source, url, nav)) return true;
+      }
+      return false;
     }
-    if (television && canFindVideo && (entry.target.unitKind === "episode" || entry.target.unitKind === null && !hasUnits)) {
+    const fromDevice = !!entry.incoming || receivingTitle(item.syncId);
+    const providerFirst = fromDevice && !!preferred;
+    if (!providerFirst && await openDirect()) return true;
+    if ((television || fromDevice) && canFindVideo && (entry.target.unitKind?.toLowerCase() === "episode" || entry.target.unitKind === null && !hasUnits)) {
       const mediaNumber = number ?? (hasUnits ? null : "1");
       const favored = profileId ? preferredProvidersForProfile(profileId) : [];
       const candidates = [...new Set([preferred, ...favored, ...PROVIDERS.map(([id]) => id)])]
@@ -611,7 +637,7 @@ export function contentControls(
       try {
         if (mediaNumber) {
           for (const site of candidates) {
-            if (!isAlive()) return false;
+          if (!isAlive() || entry.incoming?.signal.aborted) return false;
             try {
               const sources = await invoke<VideoChoice[]>("provider_unit", {
                 site, id: item.syncId, number: mediaNumber, season: entry.target.seasonNumber,
@@ -620,12 +646,15 @@ export function contentControls(
             } catch { /* Try the next linked provider. */ }
           }
         }
+        if (providerFirst && await openDirect()) return true;
         return await openDiscoveredSource(entry, preferred,
           (site, content) => openProviderVideos(entry, content as VideoChoice[], site, report, isAlive));
       } finally {
         if (isAlive()) report("");
       }
     }
+    if (providerFirst && await openDirect()) return true;
+    if (fromDevice) return false;
     if ((television || preferred) && illustrated && entry.target.unitKind === "chapter") return false;
     // 4. Video provider -> trigger inline picker on card or scroll card into view
     if (prov && !prov.reader || canFindChapter || canFindVideo) {
@@ -642,6 +671,7 @@ export function contentControls(
   }
 
   async function openCatalogSource(entry: Entry, source: Record<string, unknown>, url: string, nav?: ChapterNav) {
+    if (entry.incoming?.signal.aborted) return false;
     const format = isBook ? bookArchive(url, source.mimeType) : null;
     const kind = source.mimeType === "application/pdf" || new URL(url).pathname.toLowerCase().endsWith(".pdf")
       ? "pdf"
@@ -655,7 +685,7 @@ export function contentControls(
         listStatus.textContent = ui("Abriendo libro…");
         const opened = await invoke<OpenedMedia>("open_catalog_book", { address: url, format });
         listStatus.textContent = "";
-        if (!isAlive()) return false;
+        if (!isAlive() || entry.incoming?.signal.aborted) return false;
         await play(entry, opened.kind, opened.paths.map(p => convertFileSrc(p, opened.streaming ? "umdstream" : "asset")), report, false, undefined, nav);
       } else if (kind === "video" && isEmbeddedSource(source)) {
         listStatus.textContent = ui("Buscando video…");
@@ -699,7 +729,7 @@ export function contentControls(
   }
 
   function makeChapterNav(entry: Entry, preferred?: string): ChapterNav | undefined {
-    if (available.length <= 1) return undefined;
+    if (entry.index < 0 || available.length <= 1) return undefined;
     const prevEntry = entry.index > 0 ? available[entry.index - 1] : null;
     const nextEntry = entry.index + 1 < available.length ? available[entry.index + 1] : null;
     return {
@@ -828,13 +858,13 @@ export function contentControls(
     const nav = makeChapterNav(entry, provider);
     let failure: unknown;
     for (const [index, source] of choices.entries()) {
-      if (!isCurrent()) return false;
+      if (!isCurrent() || entry.incoming?.signal.aborted) return false;
       attempted.add(index);
       try {
         const media = source.external || source.embed
           ? await invoke<VideoResolution>("resolve_video", { address: source.url, provider, webFallback: true })
           : source;
-        if (!isCurrent()) return false;
+        if (!isCurrent() || entry.incoming?.signal.aborted) return false;
         const playback: PlaybackChoices = {sources: choices, index, attempted};
         feedback("");
         if ("providerPlayer" in media) {
@@ -1392,7 +1422,22 @@ export function contentControls(
       .catch(() => {});
   }
 
-  return section;
+  return Object.assign(section, {
+    async playFromDevice(request: IncomingPlayback) {
+      if (!isAlive() || request.signal.aborted || item.mediaType.toLowerCase() !== "movie") return false;
+      const unit = request.offer.item;
+      const existing = available.find(entry => samePartyUnit(entry.target, unit));
+      const entry = existing ?? {
+        index:-1, label:[displayTitle(item),unit.displayNumber].filter(Boolean).join(" · "),
+        unitName:"", unitHeading:unit.displayNumber ?? displayTitle(item), seasonLabel:"",
+        seasonNumber:unit.seasonNumber,
+        target:{itemId:item.syncId,unitKind:unit.unitKind,displayNumber:unit.displayNumber,seasonNumber:unit.seasonNumber},
+        sources:[],
+        transfer:{...unit,itemId:item.syncId,serverId:options.serverId ?? unit.serverId},
+      };
+      return openEntry({...entry,incoming:request}, unit.provider);
+    },
+  });
 }
 
 interface Subtitle { url: string; language: string; label: string; default: boolean }
@@ -1400,6 +1445,17 @@ type VideoChoice = Stream & { label: string; embed?: boolean; provider?: string 
 interface PlaybackTransport {position:number; paused:boolean}
 interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; triedEngines?: Set<string>; engine?:string; dialog?:HTMLDialogElement; transport?:PlaybackTransport; discover?:boolean }
 export interface Stream { referer?:string;live?:boolean; url: string; hls: boolean; dash?: boolean; external?: boolean; tracks?: Subtitle[] }
+
+function transferReference(entry: PlaybackEntry, choices?: PlaybackChoices) {
+  if (!entry.transfer) return undefined;
+  const linked = entry.providerLinks ?? {};
+  const provider = choices?.sources[choices.index]?.provider ?? entry.transfer.provider ??
+    Object.keys(linked).find(site => !READER_PROVIDERS.has(site) && PROVIDERS.some(([id]) => id === site));
+  const candidate = provider ? linked[provider] ?? entry.transfer.providerRef : undefined;
+  const providerRef = candidate && candidate.length <= 1024 && candidate.replace(/\/+$/, "").split("/")
+    .every(part => part !== "." && part !== ".." && /^[a-z0-9._-]+$/i.test(part)) ? candidate : undefined;
+  return {...entry.transfer,provider,providerRef};
+}
 
 export function playDownload(name: string, media: OpenedMedia, target: Target | null, report: (message: string, error?: boolean) => void) {
   return play({ label: name, target }, media.kind, media.paths.map(p => convertFileSrc(p, media.streaming ? "umdstream" : "asset")), report);
@@ -1522,7 +1578,7 @@ function webVideoOverlay(
 }
 
 async function play(
-  entry: { label: string; target: Target | null },
+  entry: PlaybackEntry,
   kind: OpenedMedia["kind"],
   urls: string[],
   report: (message: string, error?: boolean) => void,
@@ -1543,7 +1599,10 @@ async function play(
   await writes;
   const profileId = (await windowProfile().catch(() => null))?.activeId ?? activeProfileId();
   const saved = entry.target ? await invokeProfile<Progress | null>("get_progress", { target: entry.target }) : null;
-  const resume = choices?.transport?.position ?? (saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0);
+  if (entry.incoming?.signal.aborted) return;
+  const detached = choices?.transport?.paused ?? entry.incoming?.offer.paused;
+  const resume = choices?.transport?.position ?? entry.incoming?.offer.positionSeconds ??
+    (saved?.positionKind === "seconds" && !saved.isCompleted ? saved.position : 0);
 
   if (choices?.dialog && !choices.dialog.open) return;
   const dialog = choices?.dialog ?? node("dialog", undefined, "player-dialog");
@@ -1589,6 +1648,9 @@ async function play(
   close.addEventListener("click", () => dialog.close());
 
   // Prev / Next Episode or Chapter buttons right in the Player/Reader chrome (Avalonia parity!)
+  let preserveTransmission = () => {};
+  let previousEpisode: (() => void) | undefined;
+  let nextEpisode: (() => void) | undefined;
   if (chapterNav) {
     const navGroup = node("div", undefined, "player-ep-group");
     const prevUnit = node("button", "⏮ " + ui("Anterior"), "player-nav-btn");
@@ -1596,6 +1658,7 @@ async function play(
     prevUnit.disabled = !chapterNav.hasPrev;
     prevUnit.title = chapterNav.prevLabel || ui("Anterior");
     prevUnit.onclick = () => {
+      preserveTransmission();
       dialog.addEventListener("close", () => chapterNav.openPrev(), { once: true });
       dialog.close();
     };
@@ -1604,10 +1667,13 @@ async function play(
     nextUnit.disabled = !chapterNav.hasNext;
     nextUnit.title = chapterNav.nextLabel || ui("Siguiente");
     nextUnit.onclick = () => {
+      preserveTransmission();
       dialog.addEventListener("close", () => chapterNav.openNext(), { once: true });
       dialog.close();
     };
     navGroup.append(prevUnit, nextUnit);
+    if (chapterNav.hasPrev) previousEpisode = () => prevUnit.click();
+    if (chapterNav.hasNext) nextEpisode = () => nextUnit.click();
     headerEnd.append(navGroup);
   }
 
@@ -1640,6 +1706,9 @@ async function play(
 
   if (kind === "video" || kind === "audio") {
     const primaryUrl = safeUrls[0];
+    const publicStream = remoteUrl(primaryUrl) && !new URL(primaryUrl).hostname.endsWith(".localhost");
+    const reference = kind === "video" && publicStream ? transferReference(entry,choices) : undefined;
+    const followRoom = !entry.incoming && !(entry.target && receivingTitle(entry.target.itemId));
     const engines = node("select") as HTMLSelectElement;
     engines.setAttribute("aria-label", ui("Motor de reproducción"));
     const android = /Android/i.test(navigator.userAgent);
@@ -1743,23 +1812,33 @@ async function play(
       if (android) dialog.classList.add("has-native-video-plane");
       else {
         titleGroup.append(node("span", "VLC", "player-engine-badge"));
-        fsBtn.setAttribute("aria-pressed", String(dialog.classList.contains("is-playback-fullscreen")));
-        fsBtn.onclick = () => {
-          const active = dialog.classList.toggle("is-playback-fullscreen");
-          fsBtn.setAttribute("aria-pressed", String(active));
-          void getCurrentWindow().setFullscreen(active).catch(error);
-        };
+        if (!windows) {
+          fsBtn.setAttribute("aria-pressed", String(dialog.classList.contains("is-playback-fullscreen")));
+          fsBtn.onclick = () => {
+            const active = dialog.classList.toggle("is-playback-fullscreen");
+            fsBtn.setAttribute("aria-pressed", String(active));
+            void getCurrentWindow().setFullscreen(active).catch(error);
+          };
+        }
       }
       const player = nativePlayer(
         engines.value, primaryUrl, viewport, headerEnd, output, entry.label, entry.target, validTracks,
         resume,
         (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, isDash ? undefined : stream?.referer, hlsHint,
-        {engines,servers,wireless,fullscreenButton:fsBtn,initiallyPaused:choices?.transport?.paused ?? false, discover:playback.discover,
+        {engines,servers,wireless,fullscreenButton:fsBtn,initiallyPaused:detached ?? false, discover:playback.discover,followRoom,
           startCast:()=>{if(!switching){switching=true;void switchTo(currentStream, playback.index, "vlc", true);}}},
       );
+      const device = bindDevicePlayback(entry.label,reference,entry.incoming,{
+        read:player.deviceStatus,play:player.play,pause:player.pause,seek:player.seek,
+        previous:previousEpisode,next:nextEpisode,
+      },() => dialog.close());
+      preserveTransmission = device.preserve;
+      if (device.cast) player.addDeviceCast(device.cast);
       cleanup = preserveFullscreen => {
+        if (preserveFullscreen) device.preserve();
+        device.detach();
         player.close(preserveFullscreen);
-        if (!android && !preserveFullscreen && dialog.classList.contains("is-playback-fullscreen")) {
+        if (!android && !windows && !preserveFullscreen && dialog.classList.contains("is-playback-fullscreen")) {
           void getCurrentWindow().setFullscreen(false).catch(() => {});
         }
       };
@@ -1807,12 +1886,15 @@ async function play(
     media.controls = kind === "audio";
     if (media instanceof HTMLVideoElement) media.playsInline = true;
     const remote = (media as HTMLVideoElement & {remote?:{prompt:()=>Promise<void>}}).remote;
+    const castMenu = node("details",undefined,"native-cast");
+    const castTools = node("div",undefined,"native-cast-tools");
+    castMenu.append(node("summary",ui("Transmitir")),castTools);
     if(remote && typeof remote.prompt==="function"){
-      const cast=node("button",ui("Transmitir"),"quiet-btn");
+      const cast=node("button","Chromecast","quiet-btn");
       cast.type="button";
       cast.title=ui("Transmitir a una pantalla");
       cast.onclick=()=>void remote.prompt().catch(error);
-      webControls.append(cast);
+      castTools.append(cast);
     }
     media.preload = "metadata";
     media.setAttribute("aria-label", entry.label);
@@ -1836,7 +1918,7 @@ async function play(
         ready = true;
         lastSave = Date.now();
       }
-      if (choices?.transport?.paused === false) void media.play().catch(() => {});
+      if (detached === false) void media.play().catch(() => {});
     }, { once: true });
     media.addEventListener("timeupdate", () => { if (Date.now() - lastSave > 10_000) { lastSave = Date.now(); save(); } });
     media.addEventListener("pause", save);
@@ -1849,8 +1931,21 @@ async function play(
       ? webVideoOverlay(dialog, viewport, media, fsBtn, webControls, error) : () => {};
     const background = () => { if (document.hidden) save(); };
     document.addEventListener("visibilitychange", background);
-    const detachParty = entry.target ? attachPartyPlayer(media, entry.target, entry.label, headerEnd, output) : () => {};
+    const detachParty = entry.target && followRoom ? attachPartyPlayer(media, entry.target, entry.label, headerEnd, output) : () => {};
+    const device = bindDevicePlayback(entry.label,reference,entry.incoming,{
+      read:() => !ready || media.readyState < 2 || media.seeking || media.ended ? null : {
+        positionSeconds:media.currentTime,durationSeconds:Number.isFinite(media.duration) ? media.duration : null,paused:media.paused,
+      },
+      play:() => media.play(),pause:() => media.pause(),
+      seek:position => { if (Number.isFinite(media.duration)) media.currentTime = Math.min(position,media.duration); },
+      previous:previousEpisode,next:nextEpisode,
+    },() => dialog.close());
+    preserveTransmission = device.preserve;
+    if (device.cast) castTools.prepend(device.cast);
+    if (castTools.childElementCount) webControls.append(castMenu);
     cleanup = preserveFullscreen => {
+      if (preserveFullscreen) device.preserve();
+      device.detach();
       stopOverlay(preserveFullscreen);
       detachParty();
       document.removeEventListener("visibilitychange", background);
@@ -2149,13 +2244,17 @@ async function play(
     };
 
     const atPageEnd = () => viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 2;
+    let recorded: {page: number; completed: boolean} | undefined;
     const update = (value: number, completed = value === pages && atPageEnd()) => {
       page = shownPage = value;
       position.value = String(page);
       if (chapterSelect) chapterSelect.value = String(page);
       prev.disabled = page <= 1;
       next.disabled = page >= pages;
-      if (entry.target) persist(entry.target, page, "page", completed, error);
+      if (entry.target && (recorded?.page !== page || recorded.completed !== completed)) {
+        recorded = {page, completed};
+        persist(entry.target, page, "page", completed, error);
+      }
     };
 
     const render = async () => {
@@ -2192,9 +2291,10 @@ async function play(
 
     let changingChapter = false;
     const nextChapter = () => {
-      if (closed || !dialog.open || changingChapter || !chapterNav?.hasNext) return false;
+      if (closed || !dialog.open || changingChapter) return false;
+      update(pages, true);
+      if (!chapterNav?.hasNext) return false;
       changingChapter = true;
-      if (entry.target) persist(entry.target, pages, "page", true, error);
       dialog.addEventListener("close", () => chapterNav.openNext(), {once:true});
       dialog.close();
       return true;
@@ -2209,6 +2309,9 @@ async function play(
     };
     readerEnd = () => { if (continuous) turnDown(); };
     viewport.addEventListener("scroll", () => {
+      if (!closed && !rendering && readingMode === "paged" && shownPage === pages && page === pages && atPageEnd()) {
+        update(pages, true);
+      }
       if (continuous && performance.now() <= downwardUntil && continuous.atEnd()) nextChapter();
     }, {passive:true});
     let lastWheel = -Infinity;

@@ -1008,6 +1008,10 @@ impl CatalogStore {
                         rusqlite::params_from_iter(&args),
                     )?;
                 }
+                tx.execute(
+                    "UPDATE OR IGNORE rust_remote_titles SET local_id=?1 WHERE local_id=?2",
+                    rusqlite::params_from_iter(&args),
+                )?;
                 tx.execute("DELETE FROM rust_catalog WHERE id=?1", [old.to_string()])?;
             }
             tx.execute(

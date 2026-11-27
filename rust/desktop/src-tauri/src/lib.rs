@@ -569,20 +569,22 @@ async fn search_remote_catalog(
     Ok((page.items, page.next))
 }
 
-pub(crate) async fn remote_item_document(
-    store: &CatalogStore,
-    id: Uuid,
-    hide_adult: bool,
-    server: Option<&str>,
-) -> CommandResult<CatalogDocument> {
+fn checked_catalog_base(store: &CatalogStore, server: Option<&str>) -> CommandResult<reqwest::Url> {
     let base = catalog_base(store)?;
     if server.is_some_and(|expected| expected != base.as_str()) {
         return Err("Cambió el servidor. Volvé a buscar el título.".into());
     }
-    let (mut doc, _) = catalog_document(
-        catalog_response(&base, &format!("api/v1/catalog/items/{id}"), &[]).await?,
-    )
-    .await?;
+    Ok(base)
+}
+
+async fn fetch_remote_title(
+    base: &reqwest::Url, id: Uuid, hide_adult: bool,
+) -> CommandResult<Option<umd_core::CatalogItem>> {
+    let response = catalog_response(base, &format!("api/v1/catalog/items/{id}"), &[]).await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let (mut doc, _) = catalog_document(response).await?;
     if doc.items.len() != 1 || doc.items[0].sync_id != Some(id) {
         return Err("El servidor devolvió otro título.".into());
     }
@@ -595,7 +597,84 @@ pub(crate) async fn remote_item_document(
                 && external.as_str().is_some_and(umd_core::provider_reference)
         });
     }
-    Ok(doc)
+    Ok(doc.items.pop())
+}
+
+async fn save_remote_title(
+    store: CatalogStore, base: reqwest::Url, incoming: umd_core::CatalogItem, local_id: Option<Uuid>,
+) -> CommandResult<umd_core::CatalogItem> {
+    work(move || {
+        let remote_id = incoming.id().map_err(|e| e.to_string())?;
+        store.merge_remote_item_from(Some(base.as_str()), remote_id, incoming, local_id)
+            .map(|(item, _)| item).map_err(|e| e.to_string())
+    }).await
+}
+
+async fn find_previous_remote_title(
+    store: &CatalogStore,
+    base: &reqwest::Url,
+    item: &umd_core::CatalogItem,
+    local: Uuid,
+    hide_adult: bool,
+) -> CommandResult<Option<Uuid>> {
+    let mut query = CatalogQuery {
+        q: item.name.clone(),
+        media_type: Some(item.media_type.clone()),
+        ..Default::default()
+    };
+    let mut visited = std::collections::HashSet::new();
+    let mut candidate = None;
+    loop {
+        let page = online_page_at(base, query.clone(), false, hide_adult).await?;
+        let db = store.clone();
+        let origin = base.to_string();
+        let matches = work(move || {
+            db.matching_catalog_summaries_for(Some(&origin), &page.items)
+                .map_err(|e| e.to_string())
+        }).await?;
+        for (id, title) in matches {
+            if title.sync_id != Some(local) {
+                continue;
+            }
+            if candidate.is_some_and(|previous| previous != id) {
+                return Err("Hay varias ediciones compatibles en el servidor.".into());
+            }
+            candidate = Some(id);
+        }
+        let Some(next) = page.next else { return Ok(candidate) };
+        if !visited.insert(next.clone()) {
+            return Err("El servidor repitió una página de resultados.".into());
+        }
+        query.cursor = Some(next);
+    }
+}
+
+async fn refresh_server_title(
+    store: &CatalogStore, item: &umd_core::CatalogItem, remote_id: Option<Uuid>,
+    server: Option<&str>, hide_adult: bool,
+) -> CommandResult<umd_core::CatalogItem> {
+    let local = item.id().map_err(|e| e.to_string())?;
+    let reader = store.clone();
+    let expected_server = server.map(str::to_owned);
+    let (base, bound) = work(move || {
+        let base = checked_catalog_base(&reader, expected_server.as_deref())?;
+        let bound = reader.remote_title_id(base.as_str(), local).map_err(|e| e.to_string())?;
+        Ok((base, bound))
+    }).await?;
+    let known = bound.or(remote_id);
+    let mut incoming = fetch_remote_title(&base, known.unwrap_or(local), hide_adult).await?;
+    // Earlier releases kept the server ID only while the detail page was open.
+    if incoming.is_none() && known.is_none() {
+        let id = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            find_previous_remote_title(store, &base, item, local, hide_adult),
+        ).await.map_err(|_| "El servidor tardó demasiado en responder.")??;
+        if let Some(id) = id {
+            incoming = fetch_remote_title(&base, id, hide_adult).await?;
+        }
+    }
+    let incoming = incoming.ok_or("El título no está en el catálogo del servidor.")?;
+    save_remote_title(store.clone(), base, incoming, Some(local)).await
 }
 
 #[tauri::command]
@@ -605,21 +684,11 @@ async fn import_remote_item(
     hide_adult: Option<bool>,
     server: Option<String>,
 ) -> CommandResult<umd_core::CatalogItem> {
-    let doc =
-        remote_item_document(&store, id, hide_adult.unwrap_or(false), server.as_deref()).await?;
-    let incoming = doc
-        .items
-        .into_iter()
-        .next()
-        .ok_or("El servidor devolvió una ficha vacía.")?;
-    let store = store.inner().clone();
-    work(move || {
-        let (merged, _) = store
-            .merge_remote_item(id, incoming)
-            .map_err(|e| e.to_string())?;
-        Ok(merged)
-    })
-    .await
+    let reader = store.inner().clone();
+    let base = work(move || checked_catalog_base(&reader, server.as_deref())).await?;
+    let incoming = fetch_remote_title(&base, id, hide_adult.unwrap_or(false)).await?
+        .ok_or("El título no está en el catálogo del servidor.")?;
+    save_remote_title(store.inner().clone(), base, incoming, None).await
 }
 
 async fn check_catalog_address(address: &str) -> CommandResult<reqwest::Url> {
@@ -663,11 +732,20 @@ async fn online_page(
 ) -> CommandResult<OnlinePage> {
     let reader = store.clone();
     let base = work(move || catalog_base(&reader)).await?;
+    online_page_at(&base, query, recent, hide_adult).await
+}
+
+async fn online_page_at(
+    base: &reqwest::Url,
+    query: CatalogQuery,
+    recent: bool,
+    hide_adult: bool,
+) -> CommandResult<OnlinePage> {
     let result = if recent {
         let params = [("hideAdult", "true")];
-        let mut response = catalog_response(&base, "api/v1/catalog/recent", if hide_adult { &params } else { &[] }).await?;
+        let mut response = catalog_response(base, "api/v1/catalog/recent", if hide_adult { &params } else { &[] }).await?;
         if hide_adult && response.status() == reqwest::StatusCode::BAD_REQUEST {
-            response = catalog_response(&base, "api/v1/catalog/recent", &[]).await?;
+            response = catalog_response(base, "api/v1/catalog/recent", &[]).await?;
         }
         if matches!(
             response.status(),
@@ -709,10 +787,10 @@ async fn online_page(
                 params.push((key, v));
             }
         }
-        let mut response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+        let mut response = catalog_response(base, "api/v1/catalog/search", &params).await?;
         if hide_adult && response.status() == reqwest::StatusCode::BAD_REQUEST {
             params.retain(|(name, _)| *name != "hideAdult");
-            response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+            response = catalog_response(base, "api/v1/catalog/search", &params).await?;
         }
         if response.status() == reqwest::StatusCode::BAD_REQUEST
             && f.subtype_group.as_deref()
@@ -723,7 +801,7 @@ async fn online_page(
             if query.media_type.is_none() {
                 params.push(("mediaType", "book"));
             }
-            response = catalog_response(&base, "api/v1/catalog/search", &params).await?;
+            response = catalog_response(base, "api/v1/catalog/search", &params).await?;
         }
         catalog_document(response).await?
     };
@@ -755,15 +833,17 @@ async fn browse_online_catalog(
     hide_adult: bool,
 ) -> CommandResult<OnlinePage> {
     let store = reader.0.get();
+    let settings = store.clone();
+    let base = work(move || catalog_base(&settings)).await?;
     let mut page = tokio::time::timeout(
         std::time::Duration::from_secs(6),
-        online_page(&store, query, recent, hide_adult),
+        online_page_at(&base, query, recent, hide_adult),
     )
     .await
     .map_err(|_| "El servidor tardó demasiado en responder.")??;
     work(move || {
         page.local_matches = store
-            .matching_catalog_summaries(&page.items)
+            .matching_catalog_summaries_for(Some(base.as_str()), &page.items)
             .map_err(|e| e.to_string())?;
         Ok(page)
     })
@@ -836,6 +916,9 @@ pub fn run() {
             remote::party::party_action,
             remote::party::party_connect,
             remote::party::party_send,
+            remote::device_playback::device_playback_connect,
+            remote::device_playback::device_playback_send,
+            remote::device_playback::device_playback_disconnect,
             party_titles,
             remote::shared_lists::published_lists,
             remote::shared_lists::publish_list,
@@ -954,6 +1037,57 @@ mod online_catalog_tests {
         collections::HashMap,
         sync::{Arc, Mutex},
     };
+    #[tokio::test]
+    async fn old_favorite_recovers_server_id_once_and_refreshes_after_restart() {
+        use axum::response::IntoResponse;
+        let local = Uuid::from_u128(1);
+        let remote = Uuid::from_u128(2);
+        let title = |id| serde_json::json!({
+            "syncId":id,"name":"Dune","mediaType":"movie","subtype":"movie","releaseYear":1984,
+        });
+        let doc = CatalogDocument::new(vec![serde_json::from_value(title(remote)).unwrap()]);
+        let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = searches.clone();
+        let ambiguous = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let same_year = ambiguous.clone();
+        let summary = doc.clone();
+        let router = Router::new()
+            .route("/api/v1/catalog/search", get(move |Query(params): Query<HashMap<String, String>>| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(params["q"], "Dune");
+                let response = if params.contains_key("cursor") {
+                    assert_eq!(params["cursor"], "second");
+                    Json(summary.clone()).into_response()
+                } else {
+                    let mut remake = summary.clone();
+                    remake.items[0].sync_id = Some(Uuid::from_u128(3));
+                    if !same_year.load(std::sync::atomic::Ordering::Relaxed) {
+                        remake.items[0].metadata.insert("releaseYear".into(), 2021.into());
+                    }
+                    ([("x-umd-next-cursor", "second")], Json(remake)).into_response()
+                };
+                std::future::ready(response)
+            }))
+            .route(&format!("/api/v1/catalog/items/{remote}"), get(move || std::future::ready(Json(doc.clone()))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.db");
+        let store = CatalogStore::open(&path).unwrap();
+        let item: umd_core::CatalogItem = serde_json::from_value(title(local)).unwrap();
+        store.import(&CatalogDocument::new(vec![item.clone()]), false).unwrap();
+        store.set_setting("server_url", &base).unwrap();
+        assert!(refresh_server_title(&store, &item, None, None, true).await.is_err());
+        assert_eq!(store.remote_title_id(&base, local).unwrap(), None);
+        ambiguous.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(refresh_server_title(&store, &item, None, None, true).await.unwrap().sync_id, Some(local));
+        drop(store);
+        let restored = CatalogStore::open(&path).unwrap();
+        assert_eq!(refresh_server_title(&restored, &item, None, None, true).await.unwrap().sync_id, Some(local));
+        assert_eq!(searches.load(std::sync::atomic::Ordering::Relaxed), 4);
+        task.abort();
+    }
     #[tokio::test]
     async fn connecting_and_browsing_leave_the_catalog_local() {
         let calls = Arc::new(Mutex::new(Vec::new()));

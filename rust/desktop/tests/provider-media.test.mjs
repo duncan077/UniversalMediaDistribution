@@ -79,6 +79,13 @@ test("handoff recognizes the active JW Player HLS source without a file extensio
   const sample = runInNewContext(script, {document: doc, URL, self: window, top: window});
   assert.deepEqual([...sample("public-source").addresses], [file, fallback]);
   assert.deepEqual([...sample("frame-source").addresses], [file, fallback]);
+  selected.file = "/stream?id=x";
+  assert.equal(sample("public-source").addresses[0], "https://nupload.my/stream?id=x");
+  doc.baseURI = "https://media.example.org/playlist/";
+  selected.file = "stream?id=x";
+  assert.equal(sample("frame-source").addresses[0], "https://media.example.org/playlist/stream?id=x");
+  selected.file = "//user:password@media.example.org/file";
+  assert.deepEqual([...sample("public-source").addresses], [fallback]);
   selected.drm = {widevine: {url: "https://license.example.org"}};
   assert.equal(sample("public-source"), null);
 });

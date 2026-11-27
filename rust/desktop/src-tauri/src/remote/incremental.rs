@@ -235,6 +235,8 @@ mod tests {
             gzip: false,
             delta_base: Some(1),
             party_socket: None,
+            device_socket: None,
+            device_name: None,
             etag: None,
             last_sync: None,
         };

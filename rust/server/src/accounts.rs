@@ -19,6 +19,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+mod device_playback;
 mod friends;
 mod incremental;
 mod parties;
@@ -26,6 +27,7 @@ mod shared_lists;
 
 #[derive(Clone)]
 pub struct AccountStore {
+    device_playback: device_playback::Registry,
     db: Arc<Mutex<Connection>>,
     readers: Arc<Readers>,
     pub(crate) limits: crate::Limits,
@@ -95,6 +97,7 @@ impl AccountStore {
             }
         }
         Ok(Self {
+            device_playback: Default::default(),
             db: Arc::new(Mutex::new(db)),
             readers: Arc::new(Readers {
                 connections,
@@ -604,18 +607,20 @@ async fn me(State(state): State<ServerState>, headers: HeaderMap) -> ApiResult {
 }
 async fn logout(State(state): State<ServerState>, headers: HeaderMap) -> ApiResult {
     let token = bearer(&headers)?;
-    state
+    let hash = hash_token(&token);
+    let owner = state
         .accounts
         .work(move |db| {
             let db = db.lock()?;
-            authenticated(&db, &token)?;
+            let owner = authenticated(&db, &token)?;
             db.execute(
                 "DELETE FROM sessions WHERE token_hash=?1",
                 [hash_token(&token)],
             )?;
-            Ok(())
+            Ok(owner)
         })
         .await?;
+    state.accounts.device_playback.revoke(&owner, &hash).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 #[derive(Deserialize)]
@@ -855,6 +860,7 @@ pub(crate) fn routes(state: &ServerState) -> Router<ServerState> {
         .layer(axum::extract::DefaultBodyLimit::max(8192))
         .merge(friends::routes().layer(axum::extract::DefaultBodyLimit::max(256 << 10)))
         .merge(parties::routes())
+        .merge(device_playback::routes())
         .merge(sync)
 }
 

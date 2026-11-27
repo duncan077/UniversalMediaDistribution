@@ -168,6 +168,10 @@ impl CatalogStore {
             "CREATE INDEX IF NOT EXISTS rust_catalog_name ON rust_catalog(name_key);
              CREATE INDEX IF NOT EXISTS rust_catalog_media ON rust_catalog(media_type,id);
              CREATE TABLE IF NOT EXISTS rust_catalog_arrivals(id TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS rust_remote_titles(
+               server TEXT NOT NULL, remote_id TEXT NOT NULL,
+               local_id TEXT NOT NULL REFERENCES rust_catalog(id) ON DELETE CASCADE,
+               PRIMARY KEY(server,remote_id), UNIQUE(server,local_id));
              CREATE TABLE IF NOT EXISTS rust_catalog_changes(id TEXT PRIMARY KEY REFERENCES rust_catalog(id) ON DELETE CASCADE, changed_at TEXT NOT NULL);
              DROP TRIGGER IF EXISTS rust_catalog_arrival;
              INSERT INTO rust_catalog_arrivals SELECT id FROM rust_catalog
@@ -910,11 +914,19 @@ impl CatalogStore {
         &self,
         titles: &[CatalogItem],
     ) -> Result<BTreeMap<Uuid, CatalogItem>> {
+        self.matching_catalog_summaries_for(None, titles)
+    }
+
+    pub fn matching_catalog_summaries_for(
+        &self,
+        server: Option<&str>,
+        titles: &[CatalogItem],
+    ) -> Result<BTreeMap<Uuid, CatalogItem>> {
         let connection = self.0.lock().map_err(|_| Error::Lock)?;
         let mut matches = BTreeMap::new();
         for title in titles {
             if let Some(id) = title.sync_id {
-                if let Some(local) = Self::matching_summary_from(&connection, id, title)? {
+                if let Some(local) = Self::matching_summary_from(&connection, server, id, title)? {
                     matches.insert(id, local);
                 }
             }
@@ -924,9 +936,19 @@ impl CatalogStore {
 
     pub(crate) fn matching_summary_from(
         connection: &Connection,
+        server: Option<&str>,
         id: Uuid,
         title: &CatalogItem,
     ) -> Result<Option<CatalogItem>> {
+        if let Some(server) = server {
+            let stored: Option<String> = connection.prepare_cached(
+                "SELECT s.summary FROM rust_remote_titles r JOIN rust_catalog_summary s ON s.id=r.local_id
+                 WHERE r.server=?1 AND r.remote_id=?2",
+            )?.query_row(params![server, id.to_string()], |row| row.get(0)).optional()?;
+            if let Some(stored) = stored {
+                return Ok(Some(serde_json::from_str(&stored)?));
+            }
+        }
         if let Some(exact) = Self::summary_from(connection, id)? {
             return Ok(Some(exact));
         }
@@ -938,41 +960,55 @@ impl CatalogStore {
                 .filter(|year| (1800..=2200).contains(year))
         }
         let mut query = connection.prepare_cached(
-            "SELECT s.summary FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE c.name_key=?1",
+            "SELECT s.summary FROM rust_catalog c JOIN rust_catalog_summary s ON s.id=c.id WHERE c.name_key=?1
+             AND NOT EXISTS(SELECT 1 FROM rust_remote_titles r WHERE r.server=?2 AND r.local_id=c.id)",
         )?;
-        let mut rows = query.query([title.key()])?;
+        let mut rows = query.query(params![title.key(), server])?;
         let incoming_year = year(title);
         let incoming_providers = title
             .metadata
             .get("onlineProviders")
             .and_then(Value::as_object);
         let mut matched = None;
-        while let Some(row) = rows.next()? {
+        let mut best_rank = 0;
+        'candidate: while let Some(row) = rows.next()? {
             let local: CatalogItem = serde_json::from_slice(raw_text(row, 0)?)?;
-            if year(&local)
-                .zip(incoming_year)
-                .is_some_and(|(a, b)| a != b)
-            {
+            let years = year(&local).zip(incoming_year);
+            if years.is_some_and(|(a, b)| a != b) {
                 continue;
             }
+            let mut shared_provider = false;
             if let (Some(local_providers), Some(incoming_providers)) = (
                 local.metadata.get("onlineProviders").and_then(Value::as_object),
                 incoming_providers,
             ) {
-                if local_providers.iter().any(|(site, value)| {
-                    value.as_str()
-                        .zip(incoming_providers.get(site).and_then(Value::as_str))
-                        .is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b))
-                }) {
-                    continue;
+                for (site, value) in local_providers {
+                    let Some((a, b)) = value.as_str().zip(incoming_providers.get(site).and_then(Value::as_str)) else {
+                        continue;
+                    };
+                    if a != b {
+                        continue 'candidate;
+                    }
+                    shared_provider |= crate::provider_reference(a);
                 }
             }
-            if matched.is_some() {
-                return Ok(None);
+            let rank = if shared_provider { 2 } else if years.is_some() { 1 } else { continue };
+            if rank == best_rank {
+                matched = None;
+            } else if rank > best_rank {
+                best_rank = rank;
+                matched = Some(local);
             }
-            matched = Some(local);
         }
         Ok(matched)
+    }
+
+    pub fn remote_title_id(&self, server: &str, local: Uuid) -> Result<Option<Uuid>> {
+        let connection = self.0.lock().map_err(|_| Error::Lock)?;
+        let stored: Option<String> = connection.prepare_cached(
+            "SELECT remote_id FROM rust_remote_titles WHERE server=?1 AND local_id=?2",
+        )?.query_row(params![server, local.to_string()], |row| row.get(0)).optional()?;
+        stored.map(|id| Uuid::parse_str(&id).map_err(|_| Error::Invalid("Identidad de catálogo inválida.".into()))).transpose()
     }
 
     pub fn summaries(&self, ids: &[Uuid]) -> Result<Vec<CatalogItem>> {

@@ -88,7 +88,7 @@ async fn capabilities(State(state): State<ServerState>) -> Json<Value> {
         "apiVersion": 1, "onlineCatalog": true,
         "accounts": true, "accountRegistration": state.allow_registration, "backupSync": true,
         "sharedLists": true, "friends": true, "progressPatch": true,
-        "deltaSync": true, "watchParties": true, "gzipSyncRequests": true,
+        "deltaSync": true, "watchParties": true, "devicePlayback": true, "gzipSyncRequests": true,
         "releaseNotifications": true, "releaseUploads": state.admin_token.is_some(),
         "syncProtocolVersion": 4, "maximumSyncBytes": state.accounts.limits.json
     }))

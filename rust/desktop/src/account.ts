@@ -103,7 +103,8 @@ export function setupAccount(
       const password = field(form, ui("Contraseña"), "password", 256); password.autocomplete = "current-password"; password.minLength = 1;
       const display = field(form, ui("Nombre visible"), "text", 100); display.required = false; display.parentElement!.hidden = true;
       const device = field(form, ui("Nombre del dispositivo"), "text", 100); device.required = false;
-      device.placeholder = /Android/i.test(navigator.userAgent) ? "UMD Android" : "UMD Desktop";
+      device.placeholder = document.documentElement.classList.contains("television") ? "Android TV"
+        : /Android/i.test(navigator.userAgent) ? "Android" : /Windows/i.test(navigator.userAgent) ? "Windows" : "UMD Linux";
       const option = el("label"); option.className = "toggle-row";
       const register = el("input"); register.type = "checkbox";
       option.append(register, el("span", ui("Crear una cuenta"))); form.append(option);

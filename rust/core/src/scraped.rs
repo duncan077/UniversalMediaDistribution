@@ -412,6 +412,16 @@ impl CatalogStore {
         incoming: CatalogItem,
         expected_local_id: Option<Uuid>,
     ) -> Result<(CatalogItem, bool)> {
+        self.merge_remote_item_from(None, remote_id, incoming, expected_local_id)
+    }
+
+    pub fn merge_remote_item_from(
+        &self,
+        server: Option<&str>,
+        remote_id: Uuid,
+        incoming: CatalogItem,
+        expected_local_id: Option<Uuid>,
+    ) -> Result<(CatalogItem, bool)> {
         if incoming.deleted {
             return Err(Error::Invalid("Título eliminado".into()));
         }
@@ -468,7 +478,7 @@ impl CatalogStore {
         clean.validate()?;
         let mut db = self.0.lock().map_err(|_| Error::Lock)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id = Self::matching_summary_from(&tx, remote_id, &identity)?
+        let id = Self::matching_summary_from(&tx, server, remote_id, &identity)?
             .and_then(|item| item.sync_id)
             .unwrap_or(remote_id);
         if expected_local_id.is_some_and(|expected| expected != id) {
@@ -518,6 +528,13 @@ impl CatalogStore {
         let changed = previous.as_ref() != Some(&merged);
         if changed {
             Self::import_into(&tx, &CatalogDocument::new(vec![merged.clone()]), false)?;
+        }
+        if let Some(server) = server {
+            tx.execute(
+                "INSERT INTO rust_remote_titles(server,remote_id,local_id) VALUES(?1,?2,?3)
+                 ON CONFLICT(server,remote_id) DO NOTHING",
+                params![server, remote_id.to_string(), id.to_string()],
+            )?;
         }
         tx.commit()?;
         Ok((merged, changed))
@@ -679,6 +696,44 @@ impl CatalogStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remakes_need_edition_evidence_and_keep_server_identity_after_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("library.db");
+        let store = CatalogStore::open(&path).unwrap();
+        let make = |id: u128, year: Option<i64>, links: Value| -> CatalogItem {
+            serde_json::from_value(json!({
+                "syncId": Uuid::from_u128(id), "mediaType":"movie", "subtype":"movie",
+                "name":"Dune", "releaseYear":year, "onlineProviders":links,
+            })).unwrap()
+        };
+        let first = make(2, Some(1984), json!({"cinema":"dune-1984"}));
+        let remake = make(3, Some(2021), json!({"cinema":"dune-2021"}));
+        let local = Uuid::from_u128(1);
+        store.import(&CatalogDocument::new(vec![make(1, None, json!({}))]), false).unwrap();
+        store.set_favorite(local, true).unwrap();
+        let origin = "https://catalog.example/";
+        let page = [first.clone(), remake.clone()];
+        assert!(store.matching_catalog_summaries_for(Some(origin), &page).unwrap().is_empty());
+        assert!(store.merge_remote_item_from(Some(origin), remake.id().unwrap(), remake.clone(), Some(local)).is_err());
+        store.import(&CatalogDocument::new(vec![make(1, None, json!({"cinema":"dune-1984"}))]), false).unwrap();
+        let matches = store.matching_catalog_summaries_for(Some(origin), &page).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[&first.id().unwrap()].sync_id, Some(local));
+        let first_id = first.id().unwrap();
+        store.merge_remote_item_from(Some(origin), first_id, first, Some(local)).unwrap();
+        store.merge_remote_item_from(Some(origin), remake.id().unwrap(), remake, None).unwrap();
+        drop(store);
+
+        let store = CatalogStore::open(&path).unwrap();
+        assert_eq!(store.remote_title_id(origin, local).unwrap(), Some(first_id));
+        assert_eq!(store.remote_title_id("https://other.example/", local).unwrap(), None);
+        assert_eq!(store.favorite_ids(false).unwrap(), vec![local]);
+        assert_eq!(store.page(&Default::default()).unwrap().total, 2);
+        store.delete_item(local).unwrap();
+        assert_eq!(store.remote_title_id(origin, local).unwrap(), None);
+    }
 
     #[test]
     fn browsing_equivalent_titles_reuses_local_identity_and_keeps_other_editions() {

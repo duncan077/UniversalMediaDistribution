@@ -245,9 +245,14 @@ pub struct FilteredProviderHit {
 #[tauri::command]
 pub async fn filtered_provider_page(
     site: String,
-    query: CatalogQuery,
+    mut query: CatalogQuery,
     hide_adult: bool,
 ) -> CommandResult<(Vec<FilteredProviderHit>, Option<String>)> {
+    // Provider cursors can be page numbers, section:page, or opaque JSON API tokens.
+    let cursor = query.cursor.take();
+    if cursor.as_ref().is_some_and(|value| value.len() > 4096) {
+        return Err("Cursor de proveedor inválido.".into());
+    }
     query.validate().map_err(|e| e.to_string())?;
     let filters = &query.filters;
     if query.favorites_only || filters.list_id.is_some() || filters.genre.is_none() && filters.year.is_none() {
@@ -270,7 +275,7 @@ pub async fn filtered_provider_page(
             ("category", filters.category.as_deref()),
             ("status", filters.status.as_deref()),
             ("provider", filters.provider.as_deref()),
-            ("cursor", query.cursor.as_deref()),
+            ("cursor", cursor.as_deref()),
         ] {
             if let Some(value) = value.filter(|text| !text.is_empty()) { url.query_pairs_mut().append_pair(key, value); }
         }
@@ -293,7 +298,7 @@ pub async fn filtered_provider_page(
         return Ok((vec![], None));
     }
     let page = open(&site).await?.search_metadata(
-        &query.q, filters.genre.as_deref(), filters.year.map(|year| year as u16), query.cursor.as_deref(),
+        &query.q, filters.genre.as_deref(), filters.year.map(|year| year as u16), cursor.as_deref(),
     ).await.map_err(explain)?;
     let items = page.items.into_iter().filter_map(|entry| {
         let mut item: CatalogItem = serde_json::from_value(entry.preview.clone()).ok()?;
@@ -811,24 +816,10 @@ pub async fn refresh_item(
         .flatten()
         .is_some_and(|s| !s.trim().is_empty())
     {
-        let remote_id = remote_id.unwrap_or(id);
-        match crate::remote_item_document(&store, remote_id, hide_adult, server.as_deref()).await {
-            Ok(doc) => {
-                if let Some(incoming) = doc.items.into_iter().next() {
-                    let db = store.inner().clone();
-                    match work(move || {
-                        db.merge_remote_item_for(remote_id, incoming, Some(id))
-                            .map_err(|e| e.to_string())
-                    })
-                    .await
-                    {
-                        Ok((merged, _)) => {
-                            item = merged;
-                            sources_checked.push("server".into());
-                        }
-                        Err(err) => errors.push(format!("server: {err}")),
-                    }
-                }
+        match crate::refresh_server_title(&store, &item, remote_id, server.as_deref(), hide_adult).await {
+            Ok(merged) => {
+                item = merged;
+                sources_checked.push("server".into());
             }
             Err(err) => errors.push(format!("server: {err}")),
         }
@@ -1081,6 +1072,35 @@ mod tests {
         routing::get,
         Router,
     };
+
+    #[tokio::test]
+    async fn filtered_jk_command_follows_the_page_returned_by_the_provider() {
+        let router = Router::new().route("/directorio", get(|axum::extract::Query(args): axum::extract::Query<HashMap<String, String>>| async move {
+            if args.is_empty() { return r#"<select name="genero"><option value="accion">Acción</option></select>"#.to_owned(); }
+            assert_eq!(args["genero"], "accion");
+            assert_eq!(args["fecha"], "2024");
+            format!(r#"<script>var animes = {{"data":[{{"slug":"serie-{}","title":"Serie"}}],"last_page":2}};</script>"#, args["p"])
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base = reqwest::Url::parse(&format!("http://fixture.example:{}/", address.port())).unwrap();
+        let client = umd_providers::browser_http::client_builder().no_proxy().resolve("fixture.example", address).build().unwrap();
+        let provider = Provider::new(Site::Jk, base, client, std::time::Duration::ZERO);
+        let now = std::time::Instant::now();
+        PROVIDERS.lock().unwrap().clients.insert("jkanime".into(), Cached {
+            provider: Arc::new(tokio::sync::Mutex::new(provider)), session: None, created: now, used: now,
+        });
+        let mut query: CatalogQuery = serde_json::from_value(serde_json::json!({"genre":"action","year":2024})).unwrap();
+        let (_, next) = filtered_provider_page("jkanime".into(), query.clone(), true).await.unwrap();
+        assert_eq!(next.as_deref(), Some("2"));
+        query.cursor = next;
+        let (second, end) = filtered_provider_page("jkanime".into(), query, true).await.unwrap();
+        assert_eq!(second[0].entry.as_ref().unwrap().external_id, "serie-2");
+        assert!(end.is_none());
+        PROVIDERS.lock().unwrap().clients.remove("jkanime");
+        task.abort();
+    }
 
     #[tokio::test]
     async fn cookies_survive_a_rebuilt_client_and_stay_with_their_provider() {

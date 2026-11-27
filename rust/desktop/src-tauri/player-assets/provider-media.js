@@ -21,10 +21,10 @@
     const owner = best.ownerDocument.defaultView;
     const host = owner?.location?.hostname ?? "";
     if (/(^|\.)mega\.(nz|co\.nz)$/i.test(host)) return [];
-    const secure = value => {
-      if (typeof value !== "string" || value.length > 16_384) return null;
+    const secure = (value, base) => {
+      if (typeof value !== "string" || !value.trim() || value.length > 16_384) return null;
       try {
-        const url = new URL(value);
+        const url = new URL(value, base);
         if (url.protocol === "https:" && !url.username && !url.password) return url.href;
       } catch {}
       return null;
@@ -39,7 +39,8 @@
         const item = owner.jwplayer(player.id).getPlaylistItem();
         const source = item?.sources?.[0];
         if (item?.drm || source?.drm) return [];
-        activeSource = secure(source?.file ?? item?.file);
+        const base = best.ownerDocument.baseURI || best.ownerDocument.URL;
+        activeSource = secure(source?.file, base) ?? secure(item?.file, base);
       } catch {}
     }
     try {

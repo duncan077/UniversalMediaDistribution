@@ -2,6 +2,7 @@ import {ui} from "./locale";
 import {invoke} from "./bridge";
 import {attachPartyPlayer} from "./party";
 import {formatTime, toggleFullscreen, type ChapterNav, type Stream, type Target} from "./player";
+import {bindDevicePlayback, receivingTitle, type IncomingPlayback, type VideoReference} from "./device-playback";
 
 interface Sample {position:number; duration:number|null; paused:boolean; ended:boolean; ready:number; seeking:boolean; seekable:boolean; plays:number; pauses:number; seeks:number}
 interface Report {closed:boolean; media:Sample|null}
@@ -12,6 +13,8 @@ export interface ProviderSessionOptions {
   sourceIndex?: number;
   resolveSource?: (index: number, currentPosition: number) => Promise<() => Promise<void>>;
   live?: boolean;
+  reference?: VideoReference;
+  incoming?: IncomingPlayback;
 }
 type Action = "read" | "seek" | "pause" | "play" | "close";
 
@@ -114,7 +117,7 @@ export async function followProvider(
     prevUnit.textContent="⏮ "+ui("Anterior");
     prevUnit.disabled=!nav.hasPrev;
     prevUnit.title=nav.prevLabel || ui("Anterior");
-    prevUnit.onclick=()=>void closePanel(()=>nav.openPrev());
+    prevUnit.onclick=()=>{transmission.preserve();void closePanel(()=>nav.openPrev());};
 
     const nextUnit=document.createElement("button");
     nextUnit.type="button";
@@ -122,7 +125,7 @@ export async function followProvider(
     nextUnit.textContent=ui("Siguiente")+" ⏭";
     nextUnit.disabled=!nav.hasNext;
     nextUnit.title=nav.nextLabel || ui("Siguiente");
-    nextUnit.onclick=()=>void closePanel(()=>nav.openNext());
+    nextUnit.onclick=()=>{transmission.preserve();void closePanel(()=>nav.openNext());};
 
     navGroup.append(prevUnit,nextUnit);
     headerEnd.append(navGroup);
@@ -336,6 +339,30 @@ export async function followProvider(
   let closed=false, restored=false, timer:ReturnType<typeof setTimeout>, queue=Promise.resolve();
   let detach:(()=>void)|undefined, lastSave=0, previous="", readySince=0;
   const media=new ProviderMedia(control);
+  const followRoom = !options.incoming && !(target && receivingTitle(target.itemId));
+  let applyIncoming = !!options.incoming;
+  const nav = options.chapterNav;
+  const transmission = bindDevicePlayback(label,options.reference,options.incoming,{
+    read:() => restored && !media.ended && media.readyState >= 2 && !media.seeking ? {
+      positionSeconds:media.currentTime,
+      durationSeconds:Number.isFinite(media.duration) ? media.duration : null,
+      paused:media.paused,
+    } : null,
+    play:()=>control("play"),pause:()=>control("pause"),seek:position=>control("seek",Math.min(position,media.duration)),
+    previous:nav?.hasPrev ? ()=>{transmission.preserve();void closePanel(nav.openPrev);} : undefined,
+    next:nav?.hasNext ? ()=>{transmission.preserve();void closePanel(nav.openNext);} : undefined,
+  },() => panel.close());
+  if (transmission.cast) {
+    const cast = document.createElement("details");
+    cast.className = "native-cast";
+    const summary = document.createElement("summary");
+    summary.textContent = ui("Transmitir");
+    const tools = document.createElement("div");
+    tools.className = "native-cast-tools";
+    tools.append(transmission.cast);
+    cast.append(summary,tools);
+    headerEnd.prepend(cast);
+  }
 
   function refreshStatusText() {
     out.classList.toggle("is-error",statusError && !providerFocused);
@@ -387,6 +414,7 @@ export async function followProvider(
       closed = true;
       await request("close");
       session = undefined;
+      transmission.preserve();
       panel.close();
       await openStream(captured);
     } catch (e) {
@@ -414,6 +442,7 @@ export async function followProvider(
           await request("close").catch(() => {});
           session = undefined;
         }
+        transmission.preserve();
         panel.close();
         await openNext();
       } catch (e) {
@@ -433,7 +462,7 @@ export async function followProvider(
       const result=await request("read");
       if (closed) return;
       if (result.closed) {panel.close();return;}
-      const sample=result.media;
+      let sample=result.media;
       if(!sample){
         if (media.sample) {persist(true);detach?.();detach=undefined;}
         media.update(null);
@@ -450,7 +479,17 @@ export async function followProvider(
           const positioned=await request("seek",resume);
           if(closed)return;
           if(positioned.closed){panel.close();return;}
-          if(positioned.media) sample.position=positioned.media.position;
+          if(positioned.media) sample=positioned.media;
+        }
+        if(applyIncoming && sample.ready>=2) {
+          applyIncoming=false;
+          const paused=options.incoming!.offer.paused;
+          if (sample.paused !== paused) {
+            const applied=await request(paused?"pause":"play");
+            if(closed)return;
+            if(applied.closed){panel.close();return;}
+            if(applied.media) sample=applied.media;
+          }
         }
         restored=true;
         const changed=media.sample?.paused!==sample.paused || sample.ended;
@@ -465,7 +504,7 @@ export async function followProvider(
         if (immersiveState.textContent !== timePart) immersiveState.textContent = timePart;
         handoff.classList.add("is-ready");
         immersiveHandoff.classList.add("is-ready");
-        if(!detach && target){
+        if(!detach && target && followRoom){
           detach=attachPartyPlayer(media,target,label,headerEnd,out);
         }
         refreshStatusText();
@@ -500,6 +539,7 @@ export async function followProvider(
   immersiveClose.onclick=()=>void closePanel();
 
   panel.addEventListener("close",()=>{
+    transmission.detach();
     closed=true;clearTimeout(timer);detach?.();persist(true);
     if (document.fullscreenElement===panel) void document.exitFullscreen().catch(()=>{});
     events.abort();resize.disconnect();

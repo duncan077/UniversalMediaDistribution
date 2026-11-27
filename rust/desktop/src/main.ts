@@ -18,6 +18,7 @@ import {setupStreams} from "./streams";
 import {inlineListMembership, setupLists, type MediaList} from "./lists";
 import {inlineFriendActivity, setupFriends} from "./friends";
 import {setupParty, type ContentUnit} from "./party";
+import {setupDevicePlayback, type IncomingPlayback} from "./device-playback";
 import {setupProfiles} from "./profiles";
 import {setupUpdates} from "./updates";
 import {activePage, goBack, isPageActive, navigateTo, onPageLeave, setCatalogNavId} from "./router";
@@ -1020,7 +1021,7 @@ function render() {
 /**
  * Full-page Item Detail view (Avalonia parity — replaces the old #detail-dialog modal!).
  */
-async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnline = false, source?: CatalogServerTitle) {
+async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnline = false, source?: CatalogServerTitle, incoming?: IncomingPlayback) {
   if (hiddenTitle(initialItem)) {
     status(ui("El filtro +18 ocultó esta ficha."), true);
     return;
@@ -1045,7 +1046,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnl
       /* Fall back to initialItem if item was just removed */
     }
   }
-  if (seq !== detailSequence || signal.aborted || !isPageActive(origin)) return;
+  if (seq !== detailSequence || signal.aborted || incoming?.signal.aborted || !isPageActive(origin)) return;
   if (hiddenTitle(item)) {
     status(ui("El filtro +18 ocultó esta ficha."), true);
     return;
@@ -1274,6 +1275,7 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnl
     unit,
     {
       signal,
+      serverId: remote?.id,
       view: entryView,
       scrollToHighlight: !sameDetail || newHighlight,
       onContinueReady: (cta) => {
@@ -1359,6 +1361,8 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnl
     more.hidden = description.scrollHeight <= description.clientHeight + 1;
   });
 
+  if (incoming) return controls.playFromDevice(incoming);
+
   const lastRefresh = itemRefreshTimes.get(item.syncId) ?? 0;
   const hasProviders = providerNames.length > 0;
   const needsArtwork = !safeImage(item.thumbnailRef);
@@ -1388,6 +1392,49 @@ async function showDetails(initialItem: CatalogItem, unit?: ContentUnit, fromOnl
       if (fromOnline && !signal.aborted) feedback.textContent = ui("No se pudo actualizar la ficha.");
     });
   }
+}
+
+async function openDeviceVideo(request: IncomingPlayback): Promise<boolean> {
+  const reference = request.offer.item;
+  const normalized = (name: string) => name.normalize("NFKC").trim().toLocaleLowerCase();
+  const subtype = (value: string) => value.toLowerCase().replace(/^movie\./, "").replace(/[- ]/g, "_");
+  const eligible = (item: CatalogItem | null) => item?.mediaType.toLowerCase() === "movie"
+    && !hiddenTitle(item) && subtype(item.subtype) === subtype(reference.subtype);
+  const sameEdition = (item: CatalogItem) => eligible(item) && normalized(item.name) === normalized(reference.name)
+    && (reference.releaseYear == null || item.releaseYear === reference.releaseYear);
+  const read = (id: string) => invoke<CatalogItem>("library_item",{id}).catch(() => null);
+  const open = async (item: CatalogItem, remoteId?: string) => {
+    if (request.signal.aborted) return false;
+    const source = remoteId && serverAddress ? {id:remoteId,server:serverAddress} : undefined;
+    return (await showDetails(item,reference,false,source,request)) === true;
+  };
+  const local = await read(reference.itemId);
+  if (local && eligible(local) && await open(local,reference.serverId)) return true;
+  if (request.signal.aborted) return false;
+  const ids = await invoke<string[]>("party_titles",{mediaType:"movie",name:reference.name}).catch(() => []);
+  const matches = ids.length ? (await invoke<CatalogItem[]>("library_summaries",{ids}).catch(() => [])).filter(sameEdition) : [];
+  if (matches.length === 1 && matches[0].syncId !== local?.syncId && await open(matches[0],reference.serverId)) return true;
+  const importTitle = (id: string) => invoke<CatalogItem>("import_remote_item",{id,hideAdult:hideAdult()}).catch(() => null);
+  if (request.signal.aborted) return false;
+  const sourceId = reference.serverId ?? reference.itemId;
+  const direct = await importTitle(sourceId);
+  if (direct && eligible(direct) && await open(direct,sourceId)) return true;
+  if (request.signal.aborted) return false;
+  if (reference.provider && reference.providerRef && providerEnabled(activeProfileId(),reference.provider)) {
+    const provided = await invoke<CatalogItem>("provider_add",{
+      site:reference.provider, hideAdult:hideAdult(),
+      entry:{externalId:reference.providerRef,preview:{name:reference.name,mediaType:"movie",subtype:reference.subtype}},
+    }).catch(() => null);
+    if (provided && eligible(provided) && await open(provided,reference.serverId)) return true;
+    if (request.signal.aborted) return false;
+  }
+  const [items] = await invoke<[CatalogItem[],string | null]>("search_remote_catalog",{
+    query:reference.name,mediaType:"movie",hideAdult:hideAdult(),
+  }).catch(() => [[],null] as [CatalogItem[],null]);
+  const remote = items.filter(sameEdition);
+  if (request.signal.aborted || remote.length !== 1 || remote[0].syncId === sourceId) return false;
+  const item = await importTitle(remote[0].syncId);
+  return !!item && eligible(item) && open(item,remote[0].syncId);
 }
 
 async function importCatalog() {
@@ -1625,6 +1672,7 @@ const openProviderSearch = setupProvider(async (item, openDetails) => {
 });
 setupFriends(openProviderSearch);
 setupParty((item, unit) => void showDetails(item, unit));
+setupDevicePlayback(openDeviceVideo, status);
 setupStreams(status);
 setupDownloads((name, mediaItem, target) => playDownload(name, mediaItem, target, status));
 const openListsPage = setupLists(

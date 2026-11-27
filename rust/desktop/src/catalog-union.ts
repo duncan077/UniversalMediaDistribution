@@ -31,20 +31,23 @@ export function unifyCatalog(
   localMatches: Readonly<Record<string, CatalogItem>>,
 ): Map<string, CatalogTitle> {
   const titles = new Map(library.map(item => [item.syncId, {item, local:true} as CatalogTitle]));
-  const seenRemote = new Set<string>();
+  const remoteIds = new Set(online.map(item => item.syncId));
+  const matchCounts = new Map<string, number>();
+  for (const id of remoteIds) {
+    const localId = titles.get(id)?.item.syncId ?? localMatches[id]?.syncId;
+    if (localId) matchCounts.set(localId, (matchCounts.get(localId) ?? 0) + 1);
+  }
   for (const remote of online) {
     const remoteId = remote.syncId;
-    if (seenRemote.has(remoteId)) continue;
-    seenRemote.add(remoteId);
-    const local = titles.get(remoteId)?.item ?? localMatches[remoteId];
-    if (!local) {
+    if (!remoteIds.delete(remoteId)) continue;
+    const existing = titles.get(remoteId);
+    const local = existing?.local ? existing.item : localMatches[remoteId];
+    if (!local || (local.syncId !== remoteId && (matchCounts.get(local.syncId) ?? 0) > 1)) {
       titles.set(remoteId, {item:remote, local:false, remoteId});
       continue;
     }
-    const id = local.syncId;
-    const previous = titles.get(id);
-    const preferredRemote = remoteId === id ? remoteId : previous?.remoteId ?? remoteId;
-    titles.set(id, {item:complement(previous?.item ?? local,remote), local:true, remoteId:preferredRemote});
+    const item = titles.get(local.syncId)?.item ?? local;
+    titles.set(local.syncId, {item:complement(item,remote), local:true, remoteId});
   }
   return titles;
 }

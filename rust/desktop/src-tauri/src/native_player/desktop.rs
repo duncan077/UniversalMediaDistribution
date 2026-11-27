@@ -279,9 +279,13 @@ impl Player {
         if state == 7 {
             return Ok(json!({"error":"VLC"}));
         }
+        #[cfg(windows)]
+        let pointer_moved = op == "read" && self.viewport.pointer_moved();
+        #[cfg(not(windows))]
+        let pointer_moved = false;
         Ok(
             json!({"renderers":self.discovery.as_ref().map(|d|d.list()),"selectedRenderer":self.selected,"position":seconds(b"libvlc_media_player_get_time")?,"duration":seconds(b"libvlc_media_player_get_length")?,
-          "ready":matches!(state,3|4|6),"ended":state==6,"paused":state!=3,
+          "ready":matches!(state,3|4|6),"ended":state==6,"paused":state!=3,"pointerMoved":pointer_moved,
           "audio":self.tracks(b"libvlc_audio_get_track_description")?,"subtitle":self.tracks(b"libvlc_video_get_spu_description")?,
           "selectedAudio":read(b"libvlc_audio_get_track")?,"selectedSubtitle":read(b"libvlc_video_get_spu")?}),
         )

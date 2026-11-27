@@ -2106,6 +2106,16 @@
   font-size: 12px;
   color: var(--mist);
 }
+.device-playback-dialog {
+  width: min(100% - 2rem, 30rem);
+}
+.device-playback-dialog .button-row {
+  flex-wrap: wrap;
+  margin-block: 0.75rem;
+}
+.device-playback-dialog input[type="range"] {
+  width: 100%;
+}
 .native-hud button,
 .native-hud select {
   min-height: 34px;

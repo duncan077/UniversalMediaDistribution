@@ -68,6 +68,24 @@ test("combined catalog uses local IDs and complements them with the server data"
   assert.equal(titleMap.get("later").local,true);
 });
 
+test("two server editions mapped to one local title keep their own artwork and release year", () => {
+  const local = {syncId:"local", name:"Dune", mediaType:"movie", subtype:"movie"};
+  const original = {...local, syncId:"original", releaseYear:1984, thumbnailRef:"/1984.webp"};
+  const remake = {...local, syncId:"remake", releaseYear:2021, thumbnailRef:"/2021.webp"};
+  const matches = {original:local, remake:local};
+  for (const editions of [[original, remake], [remake, original]]) {
+    const results = unifyCatalog([], editions, matches);
+    assert.equal(results.size, 2);
+    assert.deepEqual(results.get("original").item, original);
+    assert.deepEqual(results.get("remake").item, remake);
+  }
+  const exact = {...original, syncId:"local"};
+  const results = unifyCatalog([local], [remake, exact], matches);
+  assert.equal(results.get("local").local, true);
+  assert.equal(results.get("local").item.thumbnailRef, original.thumbnailRef);
+  assert.equal(results.get("remake").remoteId, "remake");
+});
+
 test("remoteUrl rejects credentials and non-HTTP(S) schemes", () => {
   assert.equal(remoteUrl("https://example.com/poster.jpg"), "https://example.com/poster.jpg");
   assert.equal(remoteUrl("http://127.0.0.1:9005/a.png"), "http://127.0.0.1:9005/a.png");

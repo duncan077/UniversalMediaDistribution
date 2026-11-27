@@ -7,12 +7,12 @@ import {nativeSourceUrl} from "./safety";
 import type {Target} from "./player";
 
 type Track = {id:number;name:string};
-interface State {closed?:boolean;error?:string;ready?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
+interface State {closed?:boolean;error?:string;ready?:boolean;pointerMoved?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
   audio?:Track[];subtitle?:Track[];selectedAudio:number;selectedSubtitle:number;renderers?:Track[];selectedRenderer?:number;rendererFailed?:boolean}
 interface PlayerOptions {
   engines:HTMLSelectElement; servers?:HTMLSelectElement; wireless?:HTMLButtonElement;
   fullscreenButton:HTMLButtonElement;
-  initiallyPaused:boolean; discover?:boolean; startCast:()=>void;
+  initiallyPaused:boolean; discover?:boolean; followRoom:boolean; startCast:()=>void;
 }
 
 export function formatMediaTime(seconds: number): string {
@@ -207,8 +207,18 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   }
   function box() {
     const r=view.getBoundingClientRect();
+    // Windows draws VLC in a child window above the WebView. Leave the visible
+    // controls accessible without resizing or moving the underlying video.
+    const cutouts = /Windows/i.test(navigator.userAgent)
+      ? Array.from(dialog.querySelectorAll<HTMLElement>(":scope > .player-topbar, :scope > .native-hud, :scope > .playback-center, :scope > .player-status-banner"))
+        .filter(el => !el.inert && el.getClientRects().length > 0)
+        .map(el => {
+          const rect = el.getBoundingClientRect();
+          return {left:rect.left-r.left, top:rect.top-r.top, right:rect.right-r.left, bottom:rect.bottom-r.top,
+            round:el.classList.contains("playback-center")};
+        }) : undefined;
     return {x:r.x,y:r.y,width:r.width,height:r.height,pageWidth:window.innerWidth,
-      visible:!document.hidden && dialog.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))};
+      cutouts,visible:!document.hidden && dialog.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))};
   }
   const call=(op:string,extra:Record<string,unknown>={})=>invoke<State>("native_playback",{operation:op,args:{id,...extra}});
 
@@ -227,6 +237,8 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   const resizeObserver=new ResizeObserver(scheduleLayout);
   resizeObserver.observe(dialog);
   resizeObserver.observe(view);
+  resizeObserver.observe(controls);
+  resizeObserver.observe(header.closest(".player-topbar")!);
   window.addEventListener("resize",scheduleLayout,eventOpts);
   document.addEventListener("fullscreenchange",scheduleLayout,eventOpts);
 
@@ -240,10 +252,11 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     void request(state.paused?"play":"pause").catch(fail);
   };
   toggle.onclick=togglePlayPause;
-  // The Android video plane can be composed behind the WebView. Desktop VLC uses a separate native surface.
-  const overlay=dialog.classList.contains("has-native-video-plane")
+  const overlay=embedded
     ? attachPlaybackOverlay(dialog,view,controls,options.fullscreenButton,toggle,togglePlayPause)
     : undefined;
+  const chromeObserver = new MutationObserver(scheduleLayout);
+  if (/Windows/i.test(navigator.userAgent)) chromeObserver.observe(dialog, {subtree:true, attributes:true, attributeFilter:["inert"]});
 
   // Keyboard & TV remote media shortcuts
   dialog.addEventListener("keydown",event=>{
@@ -287,7 +300,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   },eventOpts);
 
   const media=new ProviderMedia(request);
-  const detach=target?attachPartyPlayer(media,target,label,header,out):()=>{};
+  const detach=target && options.followRoom?attachPartyPlayer(media,target,label,header,out):()=>{};
   function list(el:HTMLSelectElement, rows:Track[]|undefined, selected:number, empty:string) {
     if (rows) {
       const key=JSON.stringify(rows);
@@ -316,6 +329,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     }
     if (s.rendererFailed) castStatus.textContent = ui("No se pudo cambiar de pantalla.");
     if(!s.ready)return;
+    if(s.pointerMoved) overlay?.wake();
     stagePlaceholder.hidden = true;
     stateChip.hidden = true;
     if(previousPaused===undefined){
@@ -395,10 +409,18 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   })();
   return {
     transport:()=>restored && state?.ready ? {position:state.position,paused:state.paused} : undefined,
+    deviceStatus:()=>restored && !fatal && state?.ready && !state.ended
+      ? {positionSeconds:state.position, durationSeconds:state.duration || null, paused:state.paused}
+      : null,
+    play:()=>request("play"),
+    pause:()=>request("pause"),
+    seek:(position:number)=>request("seek",Math.min(position,state?.duration || position)),
+    addDeviceCast:(button:HTMLButtonElement)=>castTools.prepend(button),
     close:(preserveFullscreen=false)=>{
       closed=true;
       cancelAnimationFrame(layoutFrame);
       resizeObserver.disconnect();
+      chromeObserver.disconnect();
       events.abort();
       clearTimeout(timer);
       detach();

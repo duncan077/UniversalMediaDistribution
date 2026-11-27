@@ -2,6 +2,7 @@ use crate::{private_files::PrivateFiles, work, CommandResult};
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, State};
 use umd_core::{CatalogStore, MAX_DOCUMENT_BYTES};
+pub(crate) mod device_playback;
 pub(crate) mod friends;
 mod incremental;
 pub(crate) mod party;
@@ -22,6 +23,8 @@ struct Session {
     gzip: bool,
     delta_base: Option<i64>,
     party_socket: Option<party::Connection>,
+    device_socket: Option<device_playback::Connection>,
+    device_name: Option<String>,
     etag: Option<(i64, reqwest::header::HeaderValue)>,
     last_sync: Option<(i64, (u64, i64))>,
 }
@@ -186,6 +189,8 @@ struct SavedSession {
     incremental: bool,
     gzip: bool,
     automatic: bool,
+    #[serde(default)]
+    device_name: Option<String>,
 }
 impl SavedSession {
     fn is_current(&self) -> bool {
@@ -259,6 +264,8 @@ pub async fn account_login(
         gzip,
         delta_base: None,
         party_socket: None,
+        device_socket: None,
+        device_name,
         etag: None,
         last_sync: None,
     };
@@ -283,6 +290,7 @@ pub async fn account_login(
                 incremental,
                 gzip,
                 automatic: session.automatic,
+                device_name: session.device_name.clone(),
             },
         )?;
     } else {
@@ -506,6 +514,8 @@ pub async fn account_current(
             delta_base: None,
             etag: None,
             party_socket: None,
+            device_socket: None,
+            device_name: saved.device_name,
             pending: None,
             last_sync: None,
         };
@@ -842,6 +852,8 @@ mod tests {
             gzip: false,
             delta_base: None,
             party_socket: None,
+            device_socket: None,
+            device_name: None,
             etag: None,
             last_sync: None,
         };
@@ -898,6 +910,8 @@ mod tests {
                 gzip: false,
                 delta_base: None,
                 party_socket: None,
+                device_socket: None,
+                device_name: None,
                 etag: None,
                 last_sync: None,
             };
@@ -959,6 +973,7 @@ mod tests {
             incremental: false,
             gzip: false,
             automatic: false,
+            device_name: None,
         };
         files.save(active, "session", &previous).unwrap();
         reuse_legacy_server(&store, &files).unwrap();

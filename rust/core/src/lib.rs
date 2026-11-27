@@ -17,6 +17,7 @@ mod store;
 mod user_state;
 mod watch_party;
 pub use watch_party::{PartyCommand, PartyContent};
+pub mod device_playback;
 
 pub use catalog::*;
 pub use delta::*;

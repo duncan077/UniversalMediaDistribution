@@ -1,4 +1,7 @@
 {
+  "Iniciá sesión para transmitir a otro dispositivo.": "Sign in to play on another device.",
+  "La conexión de dispositivos se cerró.": "The device connection closed.",
+  "La conexión de dispositivos se cerró o está ocupada.": "The device connection is closed or busy.",
   "Esta edición no usa un lector de páginas ilustradas.": "This edition does not use an illustrated-page reader.",
   "La actualización no se pudo iniciar. UMD restauró la versión anterior.": "The update did not start. UMD restored the previous version.",
   "La aplicación debe ejecutarse desde una carpeta portable de UMD.": "Run the app from a UMD portable installation folder.",
@@ -21,6 +24,10 @@
   "Audio, video, PDF o cómic": "Audio, video, PDF or comic",
   "Biblioteca UMD o SQLite de .NET": "UMD library or .NET SQLite backup",
   "Cambió el servidor. Volvé a buscar la actualización.": "The server changed. Check for updates again.",
+  "Cambió el servidor. Volvé a buscar el título.": "The server changed. Search for the title again.",
+  "Hay varias ediciones compatibles en el servidor.": "Several editions on the server match this title.",
+  "El servidor repitió una página de resultados.": "The server returned the same results page twice.",
+  "El título no está en el catálogo del servidor.": "The title could not be found in the server catalog.",
   "Campo de metadatos desconocido.": "Unknown metadata field.",
   "CapibaraTraductor respondió HTTP {}.": "CapibaraTraductor returned HTTP {0}.",
   "Capítulo EPUB inválido.": "Invalid EPUB chapter.",
