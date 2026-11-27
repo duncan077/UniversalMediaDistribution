@@ -3,6 +3,7 @@ import {invoke} from "./bridge";
 import {attachPartyPlayer} from "./party";
 import {formatTime, toggleFullscreen, type ChapterNav, type Stream, type Target} from "./player";
 import {bindDevicePlayback, receivingTitle, type IncomingPlayback, type VideoReference} from "./device-playback";
+import {tvExitConfirmation} from "./playback-overlay";
 
 interface Sample {position:number; duration:number|null; paused:boolean; ended:boolean; ready:number; seeking:boolean; seekable:boolean; plays:number; pauses:number; seeks:number}
 interface Report {closed:boolean; media:Sample|null}
@@ -247,6 +248,7 @@ export async function followProvider(
 
   const trigger=document.activeElement;
   panel.append(header,immersiveBar,view,toolbar);
+  const exit = document.documentElement.classList.contains("television") ? tvExitConfirmation(panel) : undefined;
   document.body.append(panel);
   if (!panel.open) panel.showModal();
 
@@ -312,6 +314,7 @@ export async function followProvider(
     syncFocusUi();
     enter.focus({preventScroll:true});
   },eventOptions);
+  if (exit) document.addEventListener("umd-provider-back", () => exit.confirm(), eventOptions);
   panel.addEventListener("focusin",()=>{
     if (providerFocused && !/Android/i.test(navigator.userAgent)) {
       providerFocused=false;
@@ -321,13 +324,17 @@ export async function followProvider(
 
   panel.addEventListener("cancel",event=>{
     // One TV Back press can reach both the native view and the library WebView.
-    if (providerFocused || performance.now()-lastFocusReturn<300) {
+    if (providerFocused || performance.now()-lastFocusReturn<(exit ? 160 : 300)) {
       event.preventDefault();
       if (providerFocused) {
         providerFocused=false;
         syncFocusUi();
         void layout(false).catch(e=>setNotice(String(e),true));
       }
+      return;
+    }
+    if (exit) {
+      if (!exit.confirm()) event.preventDefault();
       return;
     }
     if (immersive) {
@@ -542,6 +549,7 @@ export async function followProvider(
     transmission.detach();
     closed=true;clearTimeout(timer);detach?.();persist(true);
     if (document.fullscreenElement===panel) void document.exitFullscreen().catch(()=>{});
+    exit?.close();
     events.abort();resize.disconnect();
     if(session) void request("close").catch(()=>{});
     panel.remove();

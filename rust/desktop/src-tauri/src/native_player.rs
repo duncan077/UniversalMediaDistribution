@@ -152,20 +152,36 @@ pub async fn native_playback(
         let download = reqwest::Url::parse(address)
             .ok()
             .filter(|u| u.scheme() == "umdstream" || u.host_str() == Some("umdstream.localhost"));
-        let playback = if let Some(url) = download {
+        let referer = download.is_none().then(|| args["referer"].as_str()).flatten();
+        let mut playback = if let Some(url) = download {
             let token = url
                 .path()
                 .trim_start_matches('/')
                 .parse()
                 .map_err(|_| "Descarga inválida.")?;
             crate::torrent_stream::native_url(window.app_handle(), token).await?
-        } else if let Some(referer) = args["referer"].as_str() {
-            crate::hls_proxy::start(id, address, Some(referer), args["hls"] == true, &[])
-                .await?
-                .url
+        } else if referer.is_some() {
+            address.to_owned()
         } else {
             source(&window, address)?
         };
+        if args["engine"] == "vlc" && args["tracks"].as_array().is_some_and(|tracks| !tracks.is_empty()) {
+            let tracks = args["tracks"].as_array().unwrap();
+            match crate::hls_proxy::start_vlc(id, &playback, referer, args["hls"] == true, tracks).await {
+                Ok(relay) => {
+                    playback = relay.url;
+                    if let Some(tracks) = args["tracks"].as_array_mut() {
+                        for (track, url) in tracks.iter_mut().zip(relay.tracks) {
+                            if !url.is_empty() { track["url"] = Value::String(url); }
+                        }
+                    }
+                }
+                Err(error) if referer.is_some() => return Err(error),
+                Err(_) => {}
+            }
+        } else if let Some(referer) = referer {
+            playback = crate::hls_proxy::start(id, &playback, Some(referer), args["hls"] == true, &[]).await?.url;
+        }
         args["source"] = Value::String(playback);
     }
     #[cfg(target_os = "android")]

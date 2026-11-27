@@ -2,6 +2,7 @@ use crate::CommandResult;
 use libloading::Library;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     ffi::{c_char, c_int, c_void, CStr, CString},
     sync::Mutex,
 };
@@ -12,6 +13,20 @@ struct Track {
     id: c_int,
     name: *const c_char,
     next: *const Track,
+}
+// libvlc_media_track_t in LibVLC 3.
+#[repr(C)]
+struct MediaTrack {
+    codec: u32,
+    original_fourcc: u32,
+    id: c_int,
+    kind: c_int,
+    profile: c_int,
+    level: c_int,
+    details: *const c_void,
+    bitrate: u32,
+    language: *const c_char,
+    description: *const c_char,
 }
 struct Player {
     #[cfg(windows)]
@@ -166,7 +181,40 @@ impl Player {
         }
         Ok(owner)
     }
-    unsafe fn tracks(&self, name: &[u8]) -> CommandResult<Vec<Value>> {
+    unsafe fn track_languages(&self) -> CommandResult<HashMap<(c_int, c_int), String>> {
+        let get_media: unsafe extern "C" fn(Handle) -> Handle =
+            symbol(&self.lib, b"libvlc_media_player_get_media")?;
+        let release_media: unsafe extern "C" fn(Handle) =
+            symbol(&self.lib, b"libvlc_media_release")?;
+        type TrackArray = *mut *const MediaTrack;
+        let get: unsafe extern "C" fn(Handle, *mut TrackArray) -> u32 =
+            symbol(&self.lib, b"libvlc_media_tracks_get")?;
+        let release: unsafe extern "C" fn(TrackArray, u32) =
+            symbol(&self.lib, b"libvlc_media_tracks_release")?;
+        let media = get_media(self.player);
+        let mut languages = HashMap::new();
+        if !media.is_null() {
+            let mut array = std::ptr::null_mut();
+            let count = get(media, &mut array);
+            if !array.is_null() {
+                for &track in std::slice::from_raw_parts(array, count.min(256) as usize) {
+                    if let Some(track) = track.as_ref().filter(|track| !track.language.is_null()) {
+                        let language = CStr::from_ptr(track.language).to_string_lossy().into_owned();
+                        languages.insert((track.kind, track.id), language);
+                    }
+                }
+                release(array, count);
+            }
+            release_media(media);
+        }
+        Ok(languages)
+    }
+    unsafe fn tracks(
+        &self,
+        name: &[u8],
+        kind: c_int,
+        languages: &HashMap<(c_int, c_int), String>,
+    ) -> CommandResult<Vec<Value>> {
         let get: unsafe extern "C" fn(Handle) -> *const Track = symbol(&self.lib, name)?;
         let free: unsafe extern "C" fn(*const Track) =
             symbol(&self.lib, b"libvlc_track_description_list_release")?;
@@ -180,7 +228,7 @@ impl Player {
             } else {
                 CStr::from_ptr(track.name).to_string_lossy().into_owned()
             };
-            rows.push(json!({"id":track.id,"name":name}));
+            rows.push(json!({"id":track.id,"name":name,"language":languages.get(&(kind, track.id))}));
             current = track.next;
         }
         if !head.is_null() {
@@ -286,10 +334,15 @@ impl Player {
         let pointer_moved = op == "read" && self.viewport.pointer_moved();
         #[cfg(not(windows))]
         let pointer_moved = false;
+        let languages = if matches!(state, 3 | 4 | 6) {
+            self.track_languages().unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         Ok(
             json!({"renderers":self.discovery.as_ref().map(|d|d.list()),"selectedRenderer":self.selected,"position":seconds(b"libvlc_media_player_get_time")?,"duration":seconds(b"libvlc_media_player_get_length")?,
           "ready":matches!(state,3|4|6),"ended":state==6,"paused":state!=3,"pointerMoved":pointer_moved,
-          "audio":self.tracks(b"libvlc_audio_get_track_description")?,"subtitle":self.tracks(b"libvlc_video_get_spu_description")?,
+          "audio":self.tracks(b"libvlc_audio_get_track_description",0,&languages)?,"subtitle":self.tracks(b"libvlc_video_get_spu_description",2,&languages)?,
           "selectedAudio":read(b"libvlc_audio_get_track")?,"selectedSubtitle":read(b"libvlc_video_get_spu")?}),
         )
     }

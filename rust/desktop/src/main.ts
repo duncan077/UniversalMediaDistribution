@@ -24,6 +24,7 @@ import {setupUpdates} from "./updates";
 import {activePage, goBack, isPageActive, navigateTo, onPageLeave, setCatalogNavId} from "./router";
 import {groupMedia} from "./catalog-types";
 import {unifyCatalog, type CatalogTitle} from "./catalog-union";
+import {subtitleLanguageKey, subtitleLanguages} from "./subtitle-language";
 
 export interface CatalogItem {
   syncId: string;
@@ -1574,10 +1575,14 @@ adultToggle.onchange = () => {
 window.addEventListener("storage", event => {
   if (event.key === adultFilterKey || event.key === null) refreshContentFilter();
 });
+const subtitleLanguage = element<HTMLSelectElement>("automatic-subtitles");
+subtitleLanguage.onchange = () => void writeProfilePref(subtitleLanguageKey, subtitleLanguage.value);
 element("settings-open").onclick = async () => {
   const profile = await windowProfile();
   onlineToggle.checked = getProfilePref(profile.activeId, "online-catalog") !== "off";
   adultToggle.checked = hideAdult();
+  const saved = getProfilePref(profile.activeId, subtitleLanguageKey);
+  subtitleLanguage.value = saved === "off" || (saved && subtitleLanguages.includes(saved)) ? saved : "system";
   if (!settings.open) settings.showModal();
 };
 document.querySelectorAll<HTMLElement>("[data-open]").forEach(button => {
@@ -1649,6 +1654,10 @@ document.addEventListener("keydown", event => {
 });
 
 setupLanguage(flushProgress);
+const languageNames = new Intl.DisplayNames(document.documentElement.lang, {type: "language"});
+const subtitleOptions = subtitleLanguages.map(tag => new Option(languageNames.of(tag) ?? tag, tag));
+subtitleOptions.sort((a, b) => a.text.localeCompare(b.text, document.documentElement.lang));
+subtitleLanguage.append(...subtitleOptions);
 const startAccount = setupAccount(async () => {
   await refreshListFilterOptions();
   await load();

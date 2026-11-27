@@ -24,6 +24,9 @@ static URI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\bURI="([^"]*)""#).
 static SRT_TIMING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\d{2,}:\d{2}:\d{2})[,.](\d{3})\s+-->\s+(\d{2,}:\d{2}:\d{2})[,.](\d{3})(?:\s.*)?$").unwrap()
 });
+static VTT_TIMING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^((?:\d{2,}:)?\d{2}:\d{2})\.(\d{3})\s+-->\s+((?:\d{2,}:)?\d{2}:\d{2})\.(\d{3})(?:\s.*)?$").unwrap()
+});
 #[derive(Clone)]
 struct Relay {
     page: Option<Url>,
@@ -38,6 +41,7 @@ enum Kind {
     Auto,
     Hls,
     Subtitle,
+    VlcSubtitle,
 }
 
 #[derive(Clone)]
@@ -68,6 +72,7 @@ impl Relay {
         let name = match kind {
             Kind::Hls => "stream.m3u8",
             Kind::Subtitle => "track.vtt",
+            Kind::VlcSubtitle => "track.srt",
             Kind::Auto if url.path().to_ascii_lowercase().ends_with(".mp4") => "video.mp4",
             Kind::Auto => "media",
         };
@@ -155,6 +160,28 @@ pub async fn start(
     hls: bool,
     tracks: &[String],
 ) -> CommandResult<Source> {
+    start_relay(id, address, referer, hls, tracks.iter().map(|url| (url.as_str(), None))).await
+}
+
+pub async fn start_vlc(
+    id: Uuid,
+    address: &str,
+    referer: Option<&str>,
+    hls: bool,
+    tracks: &[serde_json::Value],
+) -> CommandResult<Source> {
+    start_relay(id, address, referer, hls, tracks.iter().map(|track| {
+        (track["url"].as_str().unwrap_or_default(), Some(track["language"].as_str().unwrap_or_default()))
+    })).await
+}
+
+async fn start_relay<'a>(
+    id: Uuid,
+    address: &str,
+    referer: Option<&str>,
+    hls: bool,
+    tracks: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> CommandResult<Source> {
     let parse = |s: &str| {
         Url::parse(s)
             .ok()
@@ -181,14 +208,17 @@ pub async fn start(
     } else {
         address.to_owned()
     };
-    let tracks = tracks
-        .iter()
-        .take(100)
-        .map(|s| {
-            parse(s)
-                .ok()
-                .and_then(|url| relay.link(url, Kind::Subtitle).ok())
-                .unwrap_or_default()
+    let tracks = tracks.take(100).map(|(address, language)| {
+        if let Some(language) = language {
+            if language.is_empty() || language.len() > 48 || !language.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return String::new();
+            }
+            // VLC reads the language of external SubRip tracks from their filenames.
+            return parse(address).ok().and_then(|url| relay.link(url, Kind::VlcSubtitle).ok())
+                .map(|url| url.trim_end_matches(".srt").to_owned() + "." + language + ".srt")
+                .unwrap_or_default();
+        }
+        parse(address).ok().and_then(|url| relay.link(url, Kind::Subtitle).ok()).unwrap_or_default()
         })
         .collect();
     let id = id.to_string();
@@ -255,6 +285,30 @@ fn subtitle_vtt(text: String) -> Option<String> {
     (out.len() > "WEBVTT\n\n".len()).then_some(out)
 }
 
+fn subtitle_srt(text: String) -> Option<String> {
+    let text = text.trim_start_matches('\u{feff}');
+    if !text.starts_with("WEBVTT") {
+        return text.lines().any(|line| SRT_TIMING.is_match(line.trim())).then(|| text.to_owned());
+    }
+    let mut out = String::new();
+    let mut lines = text.lines().peekable();
+    let mut index = 1;
+    while let Some(line) = lines.next() {
+        let Some(timing) = VTT_TIMING.captures(line.trim()) else { continue };
+        let start = &timing[1];
+        let end = &timing[3];
+        let hours = |time: &str| if time.len() == 5 { "00:" } else { "" };
+        out.push_str(&format!("{index}\n{}{start},{} --> {}{end},{}\n", hours(start), &timing[2], hours(end), &timing[4]));
+        while lines.peek().is_some_and(|line| !line.trim().is_empty()) {
+            out.push_str(lines.next().unwrap());
+            out.push('\n');
+        }
+        out.push('\n');
+        index += 1;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 #[tauri::command]
 pub fn close_stream_relay(window: tauri::WebviewWindow, id: Uuid) {
     if window.label() == "main" {
@@ -313,11 +367,12 @@ async fn resource(
     let Ok(permit) = relay.permits.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let subtitle = matches!(resource.kind, Kind::Subtitle | Kind::VlcSubtitle);
     let range = headers
         .get(header::RANGE)
         .and_then(|s| s.to_str().ok())
         .filter(|s| {
-            resource.kind != Kind::Subtitle
+            !subtitle
                 && s.len() <= 80
                 && s.strip_prefix("bytes=")
                     .is_some_and(|v| v.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
@@ -352,7 +407,7 @@ async fn resource(
                 "Content-Range, Accept-Ranges, Content-Length",
             );
     }
-    if resource.kind == Kind::Subtitle {
+    if subtitle {
         if !res.status().is_success() {
             return StatusCode::BAD_GATEWAY.into_response();
         }
@@ -362,10 +417,15 @@ async fn resource(
         ).await else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
-        let Some(text) = subtitle_vtt(text) else {
+        let (text, mime) = if resource.kind == Kind::VlcSubtitle {
+            (subtitle_srt(text), "application/x-subrip; charset=utf-8")
+        } else {
+            (subtitle_vtt(text), "text/vtt; charset=utf-8")
+        };
+        let Some(text) = text else {
             return StatusCode::BAD_GATEWAY.into_response();
         };
-        return builder.header(header::CONTENT_TYPE, "text/vtt; charset=utf-8")
+        return builder.header(header::CONTENT_TYPE, mime)
             .body(text.into()).unwrap();
     }
     if is_list {
@@ -420,6 +480,9 @@ mod tests {
         assert_eq!(subtitle_vtt(srt.into()).as_deref(), Some(vtt));
         assert_eq!(subtitle_vtt(vtt.into()).as_deref(), Some(vtt));
         assert_eq!(subtitle_vtt("invalid subtitle".into()), None);
+        let short_vtt = "WEBVTT\n\n00:38.208 --> 00:44.700 align:start\n<i>Prueba</i>\n";
+        assert_eq!(subtitle_srt(short_vtt.into()).as_deref(), Some("1\n00:00:38,208 --> 00:00:44,700\n<i>Prueba</i>\n\n"));
+        assert_eq!(subtitle_srt(srt.into()).as_deref(), Some(srt.trim_start_matches('\u{feff}')));
     }
 
     #[test]

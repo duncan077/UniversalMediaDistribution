@@ -4,16 +4,18 @@ import {ProviderMedia} from "./provider-playback";
 import {attachPartyPlayer} from "./party";
 import {attachPlaybackOverlay} from "./playback-overlay";
 import {nativeSourceUrl} from "./safety";
+import {automaticSubtitle, manualSubtitle, trackLanguage, type SubtitleSelection} from "./subtitle-language";
 import type {Target} from "./player";
 
-type Track = {id:number;name:string};
+type Track = {id:number;name:string;language?:string;url?:string};
 type TrackKind = "audio" | "subtitle";
-interface State {closed?:boolean;error?:string;trackFailed?:boolean;ready?:boolean;pointerMoved?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
+interface State {closed?:boolean;error?:string;trackFailed?:boolean;ready?:boolean;initialPositionHandled?:boolean;pointerMoved?:boolean;paused:boolean;ended:boolean;duration:number;position:number;
   audio?:Track[];subtitle?:Track[];selectedAudio:number;selectedSubtitle:number;renderers?:Track[];selectedRenderer?:number;rendererFailed?:boolean}
 interface PlayerOptions {
   engines:HTMLSelectElement; servers?:HTMLSelectElement; wireless?:HTMLButtonElement;
   fullscreenButton:HTMLButtonElement;
   initiallyPaused:boolean; discover?:boolean; followRoom:boolean; startCast:()=>void;
+  subtitleLanguage?:string; audioLanguage?:string; subtitleSelection?:SubtitleSelection;
 }
 
 export function formatMediaTime(seconds: number): string {
@@ -28,7 +30,7 @@ export function formatMediaTime(seconds: number): string {
 
 export function nativePlayer(engine:string, address:string, view:HTMLElement, header:HTMLElement, out:HTMLElement,
     label:string,target:Target|null,sidecars:{url:string;language:string;label:string;default:boolean}[],resume:number,save:(position:number,ended:boolean)=>void, onFatal:(message:string)=>void, referer:string|undefined, hls:boolean, options:PlayerOptions) {
-  const id=crypto.randomUUID(), embedded=/Android|Windows/i.test(navigator.userAgent);
+  const id=crypto.randomUUID(), android=/Android/i.test(navigator.userAgent), embedded=android || /Windows/i.test(navigator.userAgent);
   const tv = document.documentElement.classList.contains("television");
   const events=new AbortController(), eventOpts={signal:events.signal};
   const dialog=header.closest("dialog")!;
@@ -87,7 +89,16 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     const el=document.createElement("select");el.setAttribute("aria-label",trackLabel);
     el.disabled = true;
     el.add(new Option(ui("Cargando…"), ""));
-    el.onchange=()=>void selectTrack(kind,Number(el.value));
+    el.onchange=()=>{
+      if (kind === "subtitle") {
+        manualHere = true;
+        const selected = subtitleRows.find(row => row.id !== -1 && row.id === Number(el.value));
+        selection.manual = selected ? {label:selected.name,language:selected.language,url:selected.url} : null;
+        policyKey = "";
+        lastAttempt = "";
+      }
+      void selectTrack(kind,Number(el.value));
+    };
     return el;
   };
   function skip(seconds: number) {
@@ -140,8 +151,8 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
 
   const audio=tracks(ui("Audio"),"audio"),subs=tracks(ui("Subtítulos"),"subtitle");
   subs.dataset.tvPrimary = "";
-  const externalCaptions = engine === "android"
-    ? sidecars.slice(0,100).map((track,i) => ({id:-2-i,name:track.label || track.language || ui("Subtítulos")})) : [];
+  const externalCaptions = android
+    ? sidecars.slice(0,100).map((track,i) => ({id:-2-i,name:track.label || track.language || ui("Subtítulos"),language:track.language,url:track.url})) : [];
   const audioField = field(ui("Audio"), audio), subtitleField = field(ui("Subtítulos"), subs);
   if (tv) settings.append(subtitleField, audioField);
   if(options.servers && options.servers.options.length > 1) settings.append(field(ui("Servidor"), options.servers));
@@ -153,10 +164,15 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
   let pauseAfterSwitch = options.initiallyPaused;
   let polling = false;
   let layoutFrame = 0;
-  const trackChanges = {
+  const trackChanges: Record<TrackKind, {pending:boolean;revision:number;next?:number}> = {
     audio: {pending:false,revision:0},
     subtitle: {pending:false,revision:0},
   };
+  const selection = options.subtitleSelection ?? {};
+  let manualHere = false, initialStart = true;
+  let resumeTarget: number | undefined, startupDeadline = performance.now() + 20_000;
+  let audioRows: Track[] = [], subtitleRows: Track[] = [];
+  let policyKey = "", preferredSubtitle = -1, lastAttempt = "";
   const trackRevisions = () => ({audio:trackChanges.audio.revision,subtitle:trackChanges.subtitle.revision});
 
   const captionsAvailable = ui("Sin subtítulos");
@@ -194,6 +210,8 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
         const found = await call("renderer", {value: Number(devices.value)});
         if (found.error) throw Error(ui("No se pudo cambiar de pantalla."));
         resume = position; restoring = false; restored = false; pauseAfterSwitch = paused;
+        resumeTarget = undefined;
+        startupDeadline = performance.now() + 20_000;
         update(found);
       } catch (e) { fail(e); } finally { devices.disabled = false; }
     };
@@ -267,7 +285,7 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     return task;
   }
 
-  async function selectTrack(kind: TrackKind, value: number) {
+  async function selectTrack(kind: TrackKind, value: number, automatic = false) {
     if (closed || fatal || !state?.ready) return;
     const change = trackChanges[kind];
     const [control, field, empty, message] = kind === "audio"
@@ -275,13 +293,14 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       : [subs, "selectedSubtitle", captionsAvailable, ui("No se pudo cambiar el subtítulo.")] as const;
     let selected = state[field];
     if (change.pending) {
+      change.next = value;
       list(control, undefined, selected, empty);
       return;
     }
     change.pending = true;
     control.setAttribute("aria-busy", "true");
     try {
-      const sidecar = kind === "subtitle" && engine === "android" && value < -1 ? sidecars[-value-2] : undefined;
+      const sidecar = kind === "subtitle" && android && value < -1 ? sidecars[-value-2] : undefined;
       const result = await call(kind, {value,address:sidecar?.url,referer:sidecar ? referer : undefined});
       if (closed || result.closed) return;
       if (result.trackFailed || result.error || !result.ready) throw Error(message);
@@ -293,11 +312,14 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
         out.classList.remove("is-error");
       }
     } catch {
-      fail(message);
+      if (!automatic) fail(message);
     } finally {
       change.pending = false;
       control.removeAttribute("aria-busy");
       if (!closed) list(control, undefined, selected, empty);
+      const next = change.next;
+      change.next = undefined;
+      if (next !== undefined && next !== selected) void selectTrack(kind, next);
     }
   }
 
@@ -367,6 +389,27 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     const value=String(selected);
     if(el.value!==value && [...el.options].some(option=>option.value===value)) el.value=value;
   }
+  function syncSubtitle(s: State) {
+    if (manualHere || trackChanges.audio.pending || trackChanges.subtitle.pending || !subtitleRows.some(row => row.id !== -1)) return;
+    const key = JSON.stringify([s.selectedAudio, audio.dataset.rows, subs.dataset.rows]);
+    if (key !== policyKey) {
+      policyKey = key;
+      const active = audioRows.find(row => row.id >= 0 && row.id === s.selectedAudio);
+      const audioLanguage = trackLanguage(active?.language, active?.name) ?? options.audioLanguage;
+      const captions = subtitleRows.filter(row => row.id !== -1).map(row => ({...row, label:row.name}));
+      const track = selection.manual === undefined ? automaticSubtitle(captions, audioLanguage, options.subtitleLanguage)
+        : manualSubtitle(captions, selection.manual);
+      preferredSubtitle = track?.id ?? -1;
+    }
+    if (preferredSubtitle === s.selectedSubtitle) {
+      lastAttempt = "";
+      return;
+    }
+    const attempt = `${key}:${s.selectedSubtitle}:${preferredSubtitle}`;
+    if (attempt === lastAttempt) return;
+    lastAttempt = attempt;
+    void selectTrack("subtitle", preferredSubtitle, true);
+  }
   function update(s:State, revisions = trackRevisions()) {
     if(closed)return;
     if(s.closed || s.error){fatal=true;onFatal(ui("No se pudo reproducir con este motor."));return;}
@@ -386,7 +429,27 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       devices.value = String(s.selectedRenderer ?? 0);
     }
     if (s.rendererFailed) castStatus.textContent = ui("No se pudo cambiar de pantalla.");
-    if(!s.ready)return;
+    if (!s.ready) return;
+    if (!restored) {
+      if (initialStart && hls && resume > 0 && !s.duration) return;
+      if (resumeTarget !== undefined && Math.abs(s.position - resumeTarget) > 6) return;
+      if (initialStart && s.initialPositionHandled) {
+        if (resume > 0 && (!s.duration || resume < s.duration) && Math.abs(s.position - resume) > 6) return;
+        pauseAfterSwitch = false;
+      } else if (!restoring) {
+        restoring = true;
+        if (pauseAfterSwitch) {pauseAfterSwitch = false; void request("pause").catch(fail);}
+        if (resume > 0 && (!s.duration || resume < s.duration)) {
+          resumeTarget = resume;
+          void request("seek",resume).catch(fail);
+          return;
+        }
+      }
+      initialStart = false;
+      resumeTarget = undefined;
+      restored = true;
+      lastSave = Date.now();
+    }
     if(s.pointerMoved) overlay?.wake();
     stagePlaceholder.hidden = true;
     stateChip.hidden = true;
@@ -411,26 +474,14 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       const currentText = formatMediaTime(s.position);
       if(elapsedDisplay.textContent!==currentText)elapsedDisplay.textContent=currentText;
     }
+    if (s.audio) audioRows = s.audio;
     list(audio,s.audio,trackChanges.audio.pending ? undefined : s.selectedAudio,audioAvailable);
-    const captions=engine==="android" && s.subtitle ? [...s.subtitle,...externalCaptions] : s.subtitle;
-    list(subs,engine==="android" && captions?.length ? [{id:-1,name:ui("Desactivado")},...captions]:captions,
-      trackChanges.subtitle.pending ? undefined : s.selectedSubtitle,captionsAvailable);
-    if(!restored && !restoring){
-      restoring=true;
-      const preferred=sidecars.slice(0,100).findIndex(t=>t.default);
-      if(engine==="android" && preferred>=0)void selectTrack("subtitle",-2-preferred);
-      if (pauseAfterSwitch) {pauseAfterSwitch = false; void request("pause").catch(fail);}
-      if(resume>0 && (!s.duration || resume<s.duration)){
-        void request("seek",resume).then(()=>{
-          if(!closed){restored=true;lastSave=Date.now();}
-        }).catch(fail);
-        return;
-      }
-      restored=true;
-      lastSave=Date.now();
-      return;
+    if (s.subtitle) {
+      subtitleRows = [...s.subtitle, ...externalCaptions];
+      if (subtitleRows.length && !subtitleRows.some(row => row.id === -1)) subtitleRows.unshift({id:-1,name:ui("Desactivado")});
     }
-    if(!restored)return;
+    list(subs,s.subtitle && subtitleRows,trackChanges.subtitle.pending ? undefined : s.selectedSubtitle,captionsAvailable);
+    syncSubtitle(s);
     if(Date.now()-lastSave>5000){save(s.position,s.ended);lastSave=Date.now();}
   }
   async function poll() {
@@ -442,6 +493,10 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
       if(embedded && signature!==previousBox){await call("layout",{box:rect});previousBox=signature;}
       const revisions = trackRevisions();
       update(await call("read"), revisions);
+      if (!closed && !fatal && !restored && performance.now() >= startupDeadline) {
+        fatal = true;
+        onFatal(ui("No se pudo reproducir con este motor."));
+      }
       failures=0;
     }catch(e){failures++;fail(e);}
     finally {
@@ -458,7 +513,9 @@ export function nativePlayer(engine:string, address:string, view:HTMLElement, he
     try {
       const initialRect=box();
       previousBox=JSON.stringify(initialRect);
-      const result=await call("start",{engine,source:nativeSourceUrl(address),hls,referer,tracks:sidecars,box:initialRect});started=true;
+      const tracks = !android && engine === "vlc" ? sidecars.map(track => ({url:track.url,language:trackLanguage(track.language, track.label)})) : [];
+      const result=await call("start",{engine,source:nativeSourceUrl(address),hls,referer,tracks,box:initialRect,
+        resumePosition:resume,initiallyPaused:pauseAfterSwitch});started=true;
       if(closed){await call("close");return;}
       update(result);
       if(options.discover && supportsCast && !fatal) {cast.open=true;void scan(true);}

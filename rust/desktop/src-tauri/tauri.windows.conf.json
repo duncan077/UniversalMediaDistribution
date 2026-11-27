@@ -2,6 +2,18 @@
   "build": {
     "beforeBuildCommand": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File prepare-vlc.ps1"
   },
+  "app": {
+    "windows": [
+      {
+        "title": "Universal Media Distribution",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 800,
+        "minHeight": 600,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --enable-blink-features=AudioVideoTracks"
+      }
+    ]
+  },
   "bundle": {
     "resources": {
       "../../target/vlc-active/": "vlc/"

@@ -20,6 +20,7 @@ import {attachPartyPlayer, samePartyUnit, type ContentUnit} from "./party";
 import {isPageActive} from "./router";
 import {catalogGroup} from "./catalog-types";
 import {bindDevicePlayback, receivingTitle, type IncomingPlayback, type VideoReference} from "./device-playback";
+import {automaticSubtitle, manualSubtitle, preferredSubtitleLanguage, subtitleLanguageKey, trackLanguage, type SubtitleSelection} from "./subtitle-language";
 
 export interface Target { itemId: string; unitKind: string | null; displayNumber: string | null; seasonNumber: number | null }
 export interface OpenedMedia { streaming?:boolean; kind: "audio" | "video" | "pdf" | "images" | "epub"; paths: string[] }
@@ -279,7 +280,7 @@ async function openProviderSession(
           const trackUrl = remoteUrl(track.url);
           return trackUrl ? [{ ...track, url: trackUrl }] : [];
         });
-        return () => play(entry, "video", [safeUrl], report, resolved.hls, { ...resolved, url: safeUrl, tracks }, chapterNav, nextChoices);
+        return () => play(entry, "video", [safeUrl], report, resolved.hls, { ...resolved, url: safeUrl, tracks, audioLanguage: resolved.audioLanguage ?? choice.audioLanguage }, chapterNav, nextChoices);
       } : undefined,
     },
   );
@@ -323,7 +324,8 @@ function catalogVideoChoice(source: Record<string, unknown>, index: number): Vid
   const label = [source.label, source.videoQuality, source.distributor].find(value => typeof value === "string" && value);
   const pathname = new URL(url).pathname;
   return {url, label:typeof label === "string" ? label : ui("Servidor {0}",index+1), embed:isEmbeddedSource(source),
-    hls:/\.m3u8$/i.test(pathname), dash:/\.mpd$/i.test(pathname), tracks:catalogTracks(source)};
+    hls:/\.m3u8$/i.test(pathname), dash:/\.mpd$/i.test(pathname), tracks:catalogTracks(source),
+    audioLanguage:typeof source.audioLanguage === "string" ? source.audioLanguage : undefined};
 }
 
 function catalogPlayback(entry: Entry, url: string): PlaybackChoices | undefined {
@@ -702,7 +704,7 @@ export function contentControls(
           const trackUrl = remoteUrl(track.url);
           return trackUrl ? [{ ...track, url: trackUrl }] : [];
         });
-        await play(entry, kind, [safeUrl], report, stream.hls, { ...stream, url: safeUrl, tracks }, nav, choices);
+        await play(entry, kind, [safeUrl], report, stream.hls, { ...stream, url: safeUrl, tracks, audioLanguage: stream.audioLanguage ?? selected?.audioLanguage }, nav, choices);
       } else {
         const tracks = catalogTracks(source);
         const direct = selected ?? (tracks.length ? {url,hls:/\.m3u8$/i.test(new URL(url).pathname),tracks} : undefined);
@@ -874,7 +876,7 @@ export function contentControls(
         const safeUrl = remoteUrl(media.url);
         if (!safeUrl) throw new Error(ui("La fuente devolvió una dirección inválida."));
         const tracks = media.tracks?.length ? media.tracks : source.tracks;
-        await play(entry, "video", [safeUrl], feedback, media.hls, {...media, url: safeUrl, tracks}, nav, playback);
+        await play(entry, "video", [safeUrl], feedback, media.hls, {...media, url: safeUrl, tracks, audioLanguage: media.audioLanguage ?? source.audioLanguage}, nav, playback);
         return true;
       } catch (error) {
         failure = error;
@@ -1443,8 +1445,10 @@ export function contentControls(
 interface Subtitle { url: string; language: string; label: string; default: boolean }
 type VideoChoice = Stream & { label: string; embed?: boolean; provider?: string };
 interface PlaybackTransport {position:number; paused:boolean}
-interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; triedEngines?: Set<string>; engine?:string; dialog?:HTMLDialogElement; transport?:PlaybackTransport; discover?:boolean }
-export interface Stream { referer?:string;live?:boolean; url: string; hls: boolean; dash?: boolean; external?: boolean; tracks?: Subtitle[] }
+interface PlaybackChoices { sources:VideoChoice[]; index:number; attempted:Set<number>; triedEngines?: Set<string>; engine?:string; dialog?:HTMLDialogElement; transport?:PlaybackTransport; discover?:boolean; subtitleSelection?:SubtitleSelection }
+export interface Stream { referer?:string;live?:boolean; url: string; hls: boolean; dash?: boolean; external?: boolean; tracks?: Subtitle[]; audioLanguage?: string }
+
+type WebAudioTracks = EventTarget & ArrayLike<{enabled: boolean; language: string; label: string}>;
 
 function transferReference(entry: PlaybackEntry, choices?: PlaybackChoices) {
   if (!entry.transfer) return undefined;
@@ -1481,6 +1485,9 @@ export async function toggleFullscreen(el: HTMLElement, btn: HTMLButtonElement) 
 function webVideoOverlay(
   dialog: HTMLDialogElement, viewport: HTMLElement, media: HTMLVideoElement,
   fullscreen: HTMLButtonElement, settings: HTMLElement, error: (e: unknown) => void,
+  preferredLanguage: string | undefined, audioLanguage: () => string | undefined,
+  applyDashSubtitle: (track: TextTrack | undefined) => void,
+  selection: SubtitleSelection, trackUrls: WeakMap<TextTrack, string>,
 ) {
   const controls = node("div", undefined, "native-hud");
   const timeline = node("div", undefined, "native-timeline");
@@ -1560,14 +1567,45 @@ function webVideoOverlay(
     if (!scrubbing) { seek.value = String(media.currentTime); paintSeek(); }
   }
   const tracks = () => Array.from(media.textTracks).filter(track => ["captions", "subtitles"].includes(track.kind));
+  let manual = false;
+  let manualTrack: TextTrack | undefined;
+  let previousRows: TextTrack[] = [];
+  function applyCaptions(rows: TextTrack[], selected: TextTrack | undefined) {
+    if (!rows.length) return;
+    applyDashSubtitle(selected);
+    for (const track of rows) {
+      if (track === selected) {
+        if (track.mode !== "showing") track.mode = "showing";
+      } else if (track.mode === "showing") {
+        track.mode = "disabled";
+      }
+    }
+  }
   function updateCaptions() {
     const rows = tracks();
-    captions.hidden = rows.length === 0;
-    captions.replaceChildren(new Option(ui("Sin subtítulos"), "-1"), ...rows.map((track, index) =>
-      new Option(track.label || track.language || ui("Subtítulos"), String(index))));
+    if (rows.length !== previousRows.length || rows.some((track, index) => track !== previousRows[index])) {
+      captions.hidden = rows.length === 0;
+      captions.replaceChildren(new Option(ui("Sin subtítulos"), "-1"), ...rows.map((track, index) =>
+        new Option(track.label || track.language || ui("Subtítulos"), String(index))));
+      previousRows = rows;
+    }
+    if (manual || media.readyState >= 1) {
+      const selected = manual ? manualTrack : selection.manual === undefined
+        ? automaticSubtitle(rows, audioLanguage(), preferredLanguage)
+        : manualSubtitle(rows.map(track => ({track, language:track.language, label:track.label, url:trackUrls.get(track)})), selection.manual)?.track;
+      applyCaptions(rows, selected);
+    }
     captions.value = String(rows.findIndex(track => track.mode === "showing"));
   }
-  captions.onchange = () => tracks().forEach((track, index) => { track.mode = index === Number(captions.value) ? "showing" : "disabled"; });
+  captions.onchange = () => {
+    manual = true;
+    manualTrack = tracks()[Number(captions.value)];
+    selection.manual = manualTrack ? {language:manualTrack.language,label:manualTrack.label,url:trackUrls.get(manualTrack)} : null;
+    updateCaptions();
+  };
+  const audioTracks = (media as HTMLVideoElement & {audioTracks?: WebAudioTracks}).audioTracks;
+  for (const event of ["addtrack", "removetrack", "change"]) audioTracks?.addEventListener(event, updateCaptions, options);
+  media.addEventListener("loadedmetadata", updateCaptions, options);
   for (const event of ["addtrack", "removetrack", "change"]) media.textTracks.addEventListener(event, updateCaptions, options);
   for (const event of ["play", "pause", "ended"]) media.addEventListener(event, updatePlayback, options);
   for (const event of ["timeupdate", "durationchange", "loadedmetadata"]) media.addEventListener(event, updateTime, options);
@@ -1582,7 +1620,7 @@ function webVideoOverlay(
   updateTime();
   updateVolume();
   updatePlayback();
-  return (preserveFullscreen = false) => { events.abort(); overlay.close(preserveFullscreen); };
+  return {updateCaptions, close: (preserveFullscreen = false) => { events.abort(); overlay.close(preserveFullscreen); }};
 }
 
 async function play(
@@ -1713,6 +1751,8 @@ async function play(
   dialog.addEventListener("close", onClose, {once:true});
 
   if (kind === "video" || kind === "audio") {
+    const subtitleLanguage = kind === "video"
+      ? preferredSubtitleLanguage(getProfilePref(profileId, subtitleLanguageKey), navigator.language) : undefined;
     const primaryUrl = safeUrls[0];
     const publicStream = remoteUrl(primaryUrl) && !new URL(primaryUrl).hostname.endsWith(".localhost");
     const reference = kind === "video" && publicStream ? transferReference(entry,choices) : undefined;
@@ -1724,10 +1764,16 @@ async function play(
     if (android) engines.add(new Option("Android", "android"));
     engines.add(new Option("VLC", "vlc"));
     const playback: PlaybackChoices = choices ?? {sources:[],index:0,attempted:new Set()};
+    const subtitleSelection = playback.subtitleSelection ??= {};
     const windows = /Windows/i.test(navigator.userAgent);
-    const preferred = playback.engine || getProfilePref(profileId, "umd-video-engine");
-    const defaultEngine = android ? "android" : windows && stream?.live ? "vlc" : "web";
-    engines.value = preferred || defaultEngine;
+    const isDash = kind === "video" && (stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl));
+    const isHls = hlsHint || stream?.hls || /\.m3u8(?:\?|$)/i.test(primaryUrl);
+    const tvHls = android && document.documentElement.classList.contains("television") && isHls;
+    const preferred = getProfilePref(profileId, "umd-video-engine");
+    const framex = playback.sources[playback.index]?.provider === "framextv";
+    const defaultEngine = isDash || tvHls ? "web" : windows && stream?.live ? "vlc" : android ? "android" : "web";
+    // MediaPlayer rejects some fragmented HLS streams, and VLC can seek slowly in FramexTV multi-audio HLS.
+    engines.value = playback.engine || (tvHls && (preferred === "android" || framex) ? defaultEngine : preferred || defaultEngine);
     if (!engines.value) engines.value = defaultEngine;
     const triedEngines = playback.triedEngines ?? new Set<string>();
     triedEngines.add(engines.value);
@@ -1771,7 +1817,7 @@ async function play(
               }
               return;
             }
-            await switchTo({...next, tracks:next.tracks?.length? next.tracks : choice.tracks}, i, engines.value);return;
+            await switchTo({...next, tracks:next.tracks?.length ? next.tracks : choice.tracks, audioLanguage:next.audioLanguage ?? choice.audioLanguage}, i, engines.value);return;
           } catch(e) { if(!automatic)throw e; }
         }
         error(ui("No quedan servidores disponibles para este título."));
@@ -1779,8 +1825,9 @@ async function play(
     };
     const failed = (message:string) => {
       if(switching || !dialog.open || !header.isConnected)return;
-      const alternate = engines.value === "web" ? "vlc" : "web";
-      if (!triedEngines.has(alternate)) {
+      const alternates = (android && isHls) || isDash ? ["vlc", "web"] : ["web", "vlc"];
+      const alternate = alternates.find(engine => !triedEngines.has(engine));
+      if (alternate) {
         switching = true;
         void switchTo(currentStream, playback.index, alternate);
         return;
@@ -1814,7 +1861,6 @@ async function play(
       };
     }
     if(stream?.live) titleGroup.append(node("span","● " + ui("En vivo"),"live-pill"));
-    const isDash = kind === "video" && (stream?.dash || /\.mpd(?:\?|$)/i.test(primaryUrl));
     if (engines.value !== "web") {
       dialog.classList.add("is-native-player");
       if (android) dialog.classList.add("has-native-video-plane");
@@ -1832,8 +1878,9 @@ async function play(
       const player = nativePlayer(
         engines.value, primaryUrl, viewport, headerEnd, output, entry.label, entry.target, validTracks,
         resume,
-        (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, isDash ? undefined : stream?.referer, hlsHint,
+        (position, ended) => { if (entry.target) persist(entry.target, position, "seconds", ended, error); }, failed, isDash ? undefined : stream?.referer, Boolean(isHls),
         {engines,servers,wireless,fullscreenButton:fsBtn,initiallyPaused:detached ?? false, discover:playback.discover,followRoom,
+          subtitleLanguage,audioLanguage:stream?.audioLanguage,subtitleSelection,
           startCast:()=>{if(!switching){switching=true;void switchTo(currentStream, playback.index, "vlc", true);}}},
       );
       const device = bindDevicePlayback(entry.label,reference,entry.incoming,{
@@ -1866,7 +1913,9 @@ async function play(
     }
     const qualitySlot = node("span", undefined, "player-quality-slot");
     qualitySlot.hidden = true;
-    webControls.append(qualitySlot, pillField(ui("Motor"), engines));
+    const audioSlot = node("span");
+    audioSlot.hidden = true;
+    webControls.append(audioSlot, qualitySlot, pillField(ui("Motor"), engines));
     if (wireless) webControls.append(wireless);
     headerEnd.insertBefore(webControls, fsBtn);
 
@@ -1878,7 +1927,7 @@ async function play(
       const id = crypto.randomUUID();
       try {
         const relay = await invoke<{url: string; tracks: string[]}>("web_stream_relay", {
-          id, address: primaryUrl, referer: pageReferrer, hls: hlsHint, tracks: validTracks.map(track => track.url),
+          id, address: primaryUrl, referer: pageReferrer, hls: Boolean(isHls), tracks: validTracks.map(track => track.url),
         });
         closeRelay = () => { void invoke("close_stream_relay", {id}).catch(() => {}); };
         if (!dialog.open || !header.isConnected) { closeRelay(); return; }
@@ -1893,8 +1942,8 @@ async function play(
       }
     }
     const media = node(kind);
-    getTransport = () => media.readyState >= 1 ? {position:media.currentTime,paused:media.paused} : choices?.transport;
     media.controls = kind === "audio";
+    media.autoplay = Boolean(tvHls && detached !== true);
     if (media instanceof HTMLVideoElement) media.playsInline = true;
     const remote = (media as HTMLVideoElement & {remote?:{prompt:()=>Promise<void>}}).remote;
     const castMenu = node("details",undefined,"native-cast");
@@ -1911,6 +1960,7 @@ async function play(
     media.setAttribute("aria-label", entry.label);
     media.setAttribute("referrerpolicy", "no-referrer");
     let ready = false;
+    getTransport = () => ready && !media.seeking ? {position:media.currentTime,paused:media.paused} : choices?.transport;
     let lastSave = Date.now();
     let hls: HlsType | null = null;
     const save = () => {
@@ -1922,14 +1972,17 @@ async function play(
       output.textContent = "";
       output.classList.remove("is-error");
       const shouldResume = resume > 0 && (!Number.isFinite(media.duration) || resume < media.duration);
-      if (shouldResume && Math.abs(media.currentTime - resume) >= 0.01) {
-        media.addEventListener("seeked", () => { ready = true; lastSave = Date.now(); }, { once: true });
-        media.currentTime = resume;
-      } else {
+      const start = () => {
         ready = true;
         lastSave = Date.now();
+      };
+      if (shouldResume && Math.abs(media.currentTime - resume) >= 0.15) {
+        media.addEventListener("seeked", start, { once: true });
+        media.currentTime = resume;
+      } else {
+        start();
       }
-      if (detached === false) void media.play().catch(() => {});
+      if (detached !== true && (detached === false || shouldResume || tvHls)) void media.play().catch(() => {});
     }, { once: true });
     media.addEventListener("timeupdate", () => { if (Date.now() - lastSave > 10_000) { lastSave = Date.now(); save(); } });
     media.addEventListener("pause", save);
@@ -1937,9 +1990,25 @@ async function play(
     media.addEventListener("error", () => failed(ui("No se pudo reproducir esta fuente. El formato o códec puede no ser compatible con el reproductor del sistema.")));
 
     let dash: import("dashjs").MediaPlayerClass | undefined;
+    const trackUrls = new WeakMap<TextTrack, string>();
+    let dashTracks: import("dashjs").TextTrackInfo[] = [];
+    const audioLanguage = () => {
+      const audioTracks = (media as HTMLMediaElement & {audioTracks?: WebAudioTracks}).audioTracks;
+      const active = audioTracks && Array.from(audioTracks).find(track => track.enabled);
+      const rendition = hls?.audioTracks[hls.audioTrack];
+      const dashTrack = dash?.isReady() ? dash.getCurrentTrackFor("audio") : null;
+      return trackLanguage(active?.language, active?.label) ?? trackLanguage(rendition?.lang, rendition?.name)
+        ?? trackLanguage(dashTrack?.lang) ?? trackLanguage(stream?.audioLanguage);
+    };
+    const applyDashSubtitle = (track: TextTrack | undefined) => {
+      if (!dashTracks.length || !dash?.isReady()) return;
+      const idx = track ? dashTracks.findIndex(info => track.kind === info.kind && track.language === (info.lang ?? "") &&
+        track.label === String(info.id ?? info.lang ?? "")) : -1;
+      if (dash.getCurrentTextTrackIndex() !== idx) dash.setTextTrack(idx);
+    };
     viewport.append(media);
-    const stopOverlay = media instanceof HTMLVideoElement
-      ? webVideoOverlay(dialog, viewport, media, fsBtn, webControls, error) : () => {};
+    const overlay = media instanceof HTMLVideoElement
+      ? webVideoOverlay(dialog, viewport, media, fsBtn, webControls, error, subtitleLanguage, audioLanguage, applyDashSubtitle, subtitleSelection, trackUrls) : undefined;
     const background = () => { if (document.hidden) save(); };
     document.addEventListener("visibilitychange", background);
     const detachParty = entry.target && followRoom ? attachPartyPlayer(media, entry.target, entry.label, headerEnd, output) : () => {};
@@ -1957,7 +2026,7 @@ async function play(
     cleanup = preserveFullscreen => {
       if (preserveFullscreen) device.preserve();
       device.detach();
-      stopOverlay(preserveFullscreen);
+      overlay?.close(preserveFullscreen);
       detachParty();
       document.removeEventListener("visibilitychange", background);
       save();
@@ -1971,15 +2040,13 @@ async function play(
     };
     if (webTracks.length) {
       media.crossOrigin = "anonymous";
-      let hasDefault = false;
-      for (const track of webTracks) {
+      for (const [index, track] of webTracks.entries()) {
         const el = node("track");
         el.kind = "subtitles";
         el.src = track.url;
         el.srclang = track.language;
         el.label = track.label;
-        el.default = !hasDefault && track.default;
-        hasDefault ||= el.default;
+        trackUrls.set(el.track, validTracks[index].url);
         media.append(el);
       }
     }
@@ -1988,12 +2055,29 @@ async function play(
       if (!dialog.open || !viewport.isConnected) return;
       dash = MediaPlayer().create();
       dash.on(MediaPlayer.events.ERROR, () => failed(ui("La transmisión DASH se interrumpió.")));
+      dash.on(MediaPlayer.events.TEXT_TRACKS_ADDED, event => { dashTracks = event.tracks; overlay?.updateCaptions(); });
+      dash.on(MediaPlayer.events.TRACK_CHANGE_RENDERED, () => overlay?.updateCaptions());
+      dash.on(MediaPlayer.events.STREAM_INITIALIZED, () => overlay?.updateCaptions());
       dash.initialize(media as HTMLVideoElement, mediaAddress, false);
-    } else if ((hlsHint || /\.m3u8(?:\?|$)/i.test(primaryUrl)) && !media.canPlayType("application/vnd.apple.mpegurl")) {
+    } else if (isHls && (tvHls || !media.canPlayType("application/vnd.apple.mpegurl"))) {
       const {default: Hls} = await import("hls.js");
       if (!dialog.open || !viewport.isConnected) return;
       if (Hls.isSupported()) {
-        hls = new Hls();
+        hls = new Hls({startPosition: resume > 0 ? resume : -1});
+        const audio = node("select");
+        audio.setAttribute("aria-label", ui("Audio"));
+        audio.onchange = () => { if (hls) hls.audioTrack = Number(audio.value); };
+        audioSlot.append(pillField(ui("Audio"), audio));
+        hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, () => {
+          if (hls) audio.value = String(hls.audioTrack);
+          overlay?.updateCaptions();
+        });
+        hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, {audioTracks}) => {
+          audio.replaceChildren(...audioTracks.map((track, index) => new Option(track.name || track.lang || ui("Audio"), String(index))));
+          if (hls && hls.audioTrack >= 0) audio.value = String(hls.audioTrack);
+          audioSlot.hidden = audioTracks.length < 2;
+          overlay?.updateCaptions();
+        });
         hls.loadSource(mediaAddress);
         hls.attachMedia(media);
         hls.on(Hls.Events.MANIFEST_PARSED, () => {

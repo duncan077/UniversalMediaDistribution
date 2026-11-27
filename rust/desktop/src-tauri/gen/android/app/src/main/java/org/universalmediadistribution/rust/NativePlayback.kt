@@ -41,6 +41,7 @@ class NativePlayback(private val owner: MainActivity) {
   private var videoWeb: WebView? = null
   private var webBackground = Color.WHITE
   private var ready = false
+  private var initialPositionHandled = true
   private var ended = false
   private var error = ""
   private val ui = Handler(Looper.getMainLooper())
@@ -118,7 +119,7 @@ class NativePlayback(private val owner: MainActivity) {
     return -1
   }
 
-  private fun selectSubtitle(player: MediaPlayer, track: Int, args: JSONObject): Boolean {
+  private fun selectSubtitle(player: MediaPlayer?, v: VlcPlayer?, track: Int, args: JSONObject): Boolean {
     val cues = if (track < -1) {
       val values = args.optJSONArray("cues") ?: return false
       if (values.length() == 0) return false
@@ -127,24 +128,29 @@ class NativePlayback(private val owner: MainActivity) {
         Cue(cue.getLong("start"), cue.getLong("end"), cue.getString("text"))
       }
     } else emptyList()
-    val type = if (track >= 0) {
-      val kind = player.trackInfo.getOrNull(track)?.trackType ?: return false
-      if (kind !in subtitleTypes) return false
-      kind
-    } else null
-    if (type != null && player.getSelectedTrack(type) != track) {
-      player.selectTrack(track)
-      if (player.getSelectedTrack(type) != track) return false
-    }
-    // MediaPlayer replaces a previous track of the same type automatically.
-    for (oldType in subtitleTypes) {
-      if (oldType == type) continue
-      val selected = player.getSelectedTrack(oldType)
-      if (selected >= 0) player.deselectTrack(selected)
+    if (v != null) {
+      val nativeTrack = track.coerceAtLeast(-1)
+      if (v.spuTrack != nativeTrack && !v.setSpuTrack(nativeTrack)) return false
+    } else if (player != null) {
+      val type = if (track >= 0) {
+        val kind = player.trackInfo.getOrNull(track)?.trackType ?: return false
+        if (kind !in subtitleTypes) return false
+        kind
+      } else null
+      if (type != null && player.getSelectedTrack(type) != track) {
+        player.selectTrack(track)
+        if (player.getSelectedTrack(type) != track) return false
+      }
+      for (oldType in subtitleTypes) {
+        if (oldType == type) continue
+        val selected = player.getSelectedTrack(oldType)
+        if (selected >= 0) player.deselectTrack(selected)
+      }
     }
     externalTrack = if (track < -1) track else -1
     captions = cues
     showCaption(null)
+    updateCaptionClock()
     return true
   }
 
@@ -155,8 +161,27 @@ class NativePlayback(private val owner: MainActivity) {
     }
   }
 
+  private val captionTick = Runnable { updateCaptionClock() }
+
+  private fun updateCaptionClock() {
+    ui.removeCallbacks(captionTick)
+    if (externalTrack >= -1 || !ready) return
+    val player = system
+    val v = vlc
+    val now = (player?.currentPosition?.toLong() ?: v?.time ?: return).coerceAtLeast(0)
+    val index = captions.binarySearchBy(now) { it.start }
+    val previous = if (index >= 0) index else -index - 2
+    val cue = captions.getOrNull(previous)?.takeIf { now < it.end }
+    showCaption(cue?.text)
+    if (player?.isPlaying == true || v?.isPlaying == true) {
+      val next = minOf(cue?.end ?: Long.MAX_VALUE, captions.getOrNull(previous + 1)?.start ?: Long.MAX_VALUE)
+      ui.postDelayed(captionTick, (next - now).coerceIn(16L, 250L))
+    }
+  }
+
   fun close() {
     pendingStart = null
+    ui.removeCallbacks(captionTick)
     captions = emptyList(); externalTrack = -1; captionView = null
     val oldSystem = system; system = null
     val oldVlc = vlc; vlc = null
@@ -262,41 +287,37 @@ class NativePlayback(private val owner: MainActivity) {
     webBackground = (web.background as? ColorDrawable)?.color ?: Color.WHITE
     videoWeb = web
     web.setBackgroundColor(Color.TRANSPARENT)
-    if (a.getString("engine") == "vlc") {
-      val renderer = VLCVideoLayout(owner); view = renderer; root.addView(renderer, 0)
-      renderer.setBackgroundColor(Color.BLACK)
-      layout(web,a.getJSONObject("box"))
+    val initialResume = a.optDouble("resumePosition", 0.0).takeIf { it.isFinite() && it > 0 } ?: 0.0
+    val initiallyPaused = a.optBoolean("initiallyPaused")
+    val useVlc = a.getString("engine") == "vlc"
+    initialPositionHandled = !useVlc || !a.optBoolean("hls") || initialResume == 0.0
+    val frame = FrameLayout(owner)
+    frame.setBackgroundColor(Color.BLACK)
+    view = frame; root.addView(frame, 0); layout(web,a.getJSONObject("box"))
+    if (useVlc) {
+      val renderer = VLCVideoLayout(owner)
+      frame.addView(renderer, FrameLayout.LayoutParams(-1, -1))
       val core = LibVLC(owner, arrayListOf("--no-video-title-show")); library=core
       val player = VlcPlayer(core); vlc = player
-      player.attachViews(renderer,null,false,true)
+      player.attachViews(renderer,null,true,true)
       player.setEventListener { event -> if (vlc === player) when(event.type) {
-        VlcPlayer.Event.Playing -> { ready=true; ended=false; tracksDirty=true }
+        VlcPlayer.Event.Playing, VlcPlayer.Event.Paused -> { ready=true; ended=false; tracksDirty=true; updateCaptionClock() }
+        VlcPlayer.Event.Buffering -> if (event.buffering >= 100f) updateCaptionClock()
         VlcPlayer.Event.ESAdded, VlcPlayer.Event.ESDeleted, VlcPlayer.Event.ESSelected -> tracksDirty=true
-        VlcPlayer.Event.EndReached -> ended=true
+        VlcPlayer.Event.EndReached -> { ended=true; showCaption(null); ui.removeCallbacks(captionTick) }
         VlcPlayer.Event.EncounteredError -> error="VLC"
         else -> Unit
       } }
       val media=Media(core,uri)
       try {
-        a.optJSONArray("tracks")?.let { tracks -> for (i in 0 until tracks.length()) {
-          val track=tracks.getJSONObject(i)
-          media.addSlave(org.videolan.libvlc.interfaces.IMedia.Slave(0,if(track.optBoolean("default"))4 else 2,track.getString("url")))
-        } }
+        if (initialPositionHandled && initialResume > 0.0) media.addOption(":start-time=$initialResume")
+        if (initiallyPaused) media.addOption(":start-paused")
         player.media=media
       } finally { media.release() }
       player.play()
     } else {
-      val frame = FrameLayout(owner)
-      frame.setBackgroundColor(Color.BLACK)
-      view = frame; root.addView(frame, 0); layout(web, a.getJSONObject("box"))
       val renderer = TextureView(owner)
       frame.addView(renderer, FrameLayout.LayoutParams(-1, -1))
-      captionView = TextView(owner).also { text ->
-        text.setTextColor(android.graphics.Color.WHITE)
-        text.setBackgroundColor(0xB0000000.toInt()); text.gravity = Gravity.CENTER
-        text.isFocusable = false; text.visibility = View.GONE
-        frame.addView(text, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
-      }
       val player=MediaPlayer(); system=player
       fun fitVideo() {
         val width = renderer.width.toFloat()
@@ -318,14 +339,37 @@ class NativePlayback(private val owner: MainActivity) {
       }
       renderer.surfaceTexture?.let { attach(it) }
       player.setOnTimedTextListener { active, text -> if(system===active && externalTrack == -1) showCaption(text?.text) }
-      player.setOnPreparedListener { if(system===it) { ready=true; tracksDirty=true; it.start() } }
-      player.setOnCompletionListener { if(system===it) ended=true }
+      fun finishPreparing(active: MediaPlayer) {
+        ready=true; tracksDirty=true
+        if (!initiallyPaused) active.start()
+      }
+      player.setOnPreparedListener { active -> if(system===active) {
+        if (initialResume > 0 && initialResume * 1000 < active.duration) {
+          val millis = (initialResume * 1000).toLong()
+          if (android.os.Build.VERSION.SDK_INT >= 26) active.seekTo(millis, MediaPlayer.SEEK_CLOSEST)
+          else active.seekTo(millis.toInt())
+        } else finishPreparing(active)
+      } }
+      player.setOnSeekCompleteListener { active -> if (system === active) {
+        if (!ready) finishPreparing(active)
+        updateCaptionClock()
+      } }
+      player.setOnCompletionListener { if(system===it) { ended=true; showCaption(null); ui.removeCallbacks(captionTick) } }
       player.setOnErrorListener { active,_,_ -> if(system===active) error="Android"; true }
       player.setOnInfoListener { active,what,_ ->
         if(system===active && what==MediaPlayer.MEDIA_INFO_METADATA_UPDATE) tracksDirty=true
+        if(system===active && what==MediaPlayer.MEDIA_INFO_BUFFERING_END) updateCaptionClock()
         false
       }
       player.setDataSource(owner,uri); player.prepareAsync()
+    }
+    captionView = TextView(owner).also { text ->
+      text.setTextColor(Color.WHITE)
+      text.setBackgroundColor(0xB0000000.toInt()); text.gravity = Gravity.CENTER
+      text.isFocusable = false; text.visibility = View.GONE
+      frame.addView(text, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+        bottomMargin = (24 * owner.resources.displayMetrics.density).roundToInt()
+      })
     }
   }
 
@@ -355,10 +399,17 @@ class NativePlayback(private val owner: MainActivity) {
           return result.put("ready", false).put("paused", true)
         }
         "layout" -> layout(web,a.getJSONObject("box"))
-        "pause" -> if(ready) { player?.pause();v?.pause() }
-        "play" -> if(ready) { ended=false;player?.start();v?.play() }
+        "pause" -> if(ready) { player?.pause();v?.pause();updateCaptionClock() }
+        "play" -> if(ready) { ended=false;player?.start();v?.play();updateCaptionClock() }
         "volume" -> { val percent = a.getInt("value").coerceIn(0,100); val gain = percent / 100f; player?.setVolume(gain,gain); v?.setVolume(percent) }
-        "seek" -> if(ready) {val ms=(a.getDouble("value")*1000).toLong();player?.seekTo(ms.coerceIn(0,Int.MAX_VALUE.toLong()).toInt());v?.time=ms;ended=false}
+        "seek" -> if(ready) {
+          val ms=(a.getDouble("value")*1000).toLong().coerceAtLeast(0L)
+          showCaption(null); ui.removeCallbacks(captionTick)
+          if (android.os.Build.VERSION.SDK_INT >= 26) player?.seekTo(ms, MediaPlayer.SEEK_CLOSEST)
+          else player?.seekTo(ms.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+          v?.time=ms;ended=false
+          if (v != null && externalTrack < -1) ui.postDelayed(captionTick, 100)
+        }
         "audio","subtitle" -> {
           val changed = ready && runCatching {
             val track = a.getInt("value")
@@ -366,8 +417,7 @@ class NativePlayback(private val owner: MainActivity) {
               if (v != null) v.audioTrack == track || v.setAudioTrack(track)
               else player != null && selectAudio(player, track)
             } else {
-              if (v != null) v.spuTrack == track || v.setSpuTrack(track)
-              else player != null && selectSubtitle(player, track, a)
+              selectSubtitle(player, v, track, a)
             }
           }.getOrDefault(false)
           if (!changed) return result.put("trackFailed", true)
@@ -378,12 +428,6 @@ class NativePlayback(private val owner: MainActivity) {
         result.put("rendererFailed", true)
         rendererFailed = false
       }
-      if (ready && player != null && externalTrack < -1) {
-        val now = player.currentPosition.toLong()
-        val match = captions.binarySearchBy(now) { it.start }
-        val cue = captions.getOrNull(if (match >= 0) match else -match-2)
-        showCaption(cue?.takeIf { now < it.end }?.text)
-      }
       if (discovery != null && devicesDirty) {
         val screens = JSONArray()
         devices.forEach { (id,item) -> screens.put(JSONObject().put("id",id).put("name",item.displayName)) }
@@ -392,11 +436,25 @@ class NativePlayback(private val owner: MainActivity) {
       }
       if (ready && tracksDirty && (op == "read" || op == "start")) {
         val audio=JSONArray();val subtitles=JSONArray()
-        fun add(list:JSONArray,id:Int,name:String){list.put(JSONObject().put("id",id).put("name",name))}
-        if(v!=null) { v.audioTracks?.forEach {add(audio,it.id,it.name)};v.spuTracks?.forEach {add(subtitles,it.id,it.name)} }
+        fun add(list:JSONArray,id:Int,name:String,language:String?){
+          list.put(JSONObject().put("id",id).put("name",name).put("language",language))
+        }
+        if(v!=null) {
+          val languages = mutableMapOf<Int,String>()
+          v.media?.let { media ->
+            try {
+              for (i in 0 until media.trackCount.coerceAtMost(256)) {
+                val track = media.getTrack(i)
+                track?.language?.let { languages[track.id] = it }
+              }
+            } finally { media.release() }
+          }
+          v.audioTracks?.forEach { add(audio,it.id,it.name,languages[it.id]) }
+          v.spuTracks?.forEach { add(subtitles,it.id,it.name,languages[it.id]) }
+        }
         if(player!=null) player.trackInfo.forEachIndexed {i,t->
-          if(t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) add(audio,i,t.language)
-          if(t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE || t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT) add(subtitles,i,t.language)
+          if(t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) add(audio,i,t.language,t.language)
+          if(t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE || t.trackType==MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT) add(subtitles,i,t.language,t.language)
         }
         result.put("audio",audio).put("subtitle",subtitles)
         tracksDirty = false
@@ -404,9 +462,9 @@ class NativePlayback(private val owner: MainActivity) {
       return result.put("position",if(ready) ((player?.currentPosition?.toLong() ?: v?.time ?: 0L).coerceAtLeast(0)/1000.0) else 0)
         .put("duration",if(ready) ((player?.duration?.toLong() ?: v?.length ?: 0L).coerceAtLeast(0)/1000.0) else 0)
         .put("paused",!(ready && (player?.isPlaying ?: v?.isPlaying ?: false))).put("ready",ready)
-        .put("ended",ended)
+        .put("ended",ended).put("initialPositionHandled",initialPositionHandled)
         .put("selectedAudio",if(ready) (v?.audioTrack ?: player?.getSelectedTrack(MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_AUDIO) ?: -1) else -1)
-        .put("selectedSubtitle",if(ready) (v?.spuTrack ?: (if (externalTrack < -1) externalTrack else player?.let(::selectedSubtitle)) ?: -1) else -1)
+        .put("selectedSubtitle",if(ready) (if (externalTrack < -1) externalTrack else v?.spuTrack ?: player?.let(::selectedSubtitle) ?: -1) else -1)
     } catch (_:Exception) {
       if (op == "audio" || op == "subtitle") return result.put("trackFailed", true)
       if (op == "start") close()

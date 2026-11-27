@@ -25,7 +25,7 @@ class MainActivity : TauriActivity() {
     get() = (resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
   private var provider: Pair<String, WebView>? = null
   private val providerBack = object : OnBackPressedCallback(false) {
-    override fun handleOnBackPressed() = focusLibrary()
+    override fun handleOnBackPressed() = focusLibrary(true)
   }
 
   @androidx.annotation.Keep
@@ -100,7 +100,7 @@ class MainActivity : TauriActivity() {
     libraryWeb.requestFocus()
   }
 
-  private fun focusLibrary() {
+  private fun focusLibrary(fromBack: Boolean = false) {
     providerBack.isEnabled = false
     if (television) provider?.second?.let { player ->
       player.isFocusableInTouchMode = false
@@ -108,11 +108,12 @@ class MainActivity : TauriActivity() {
     }
     libraryWeb.requestFocus()
     libraryWeb.evaluateJavascript("document.dispatchEvent(new Event('umd-provider-focus'))", null)
+    if (fromBack && television) libraryWeb.evaluateJavascript("document.dispatchEvent(new Event('umd-provider-back'))", null)
   }
 
   override fun dispatchKeyEvent(event: KeyEvent): Boolean {
     if (event.keyCode == KeyEvent.KEYCODE_BACK && providerBack.isEnabled) {
-      if (event.action == KeyEvent.ACTION_UP) focusLibrary()
+      if (event.action == KeyEvent.ACTION_UP) focusLibrary(true)
       return true
     }
     return super.dispatchKeyEvent(event)

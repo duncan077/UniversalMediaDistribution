@@ -46,8 +46,11 @@ artifacts-*.xml
 *.key
 
 # Local publish scripts and profiles
+/eng/[Pp]ublish*
+/eng/New-ReleaseSigningKey.ps1
 **/[Pp]ublish*.ps1
 **/[Pp]ublish*.py
+**/[Pp]ublish*.sh
 **/PublishProfiles/
 
 # Rust and frontend build output

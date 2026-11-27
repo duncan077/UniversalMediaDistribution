@@ -4,6 +4,7 @@ import test from "node:test";
 import {catalogGroup, groupMedia} from "../src/catalog-types.ts";
 import {unifyCatalog} from "../src/catalog-union.ts";
 import {adultFilterKey, hideAdult, isAdultTitle} from "../src/content-filter.ts";
+import {automaticSubtitle, manualSubtitle, preferredSubtitleLanguage, trackLanguage} from "../src/subtitle-language.ts";
 import {
   isHttpsUrl,
   mediaUrl,
@@ -33,6 +34,40 @@ function memoryStorage(initial = {}) {
     snapshot() { return Object.fromEntries(map); },
   };
 }
+
+test("automatic subtitles use the configured language or the device locale", () => {
+  assert.equal(preferredSubtitleLanguage(null, "es-AR"), "es-AR");
+  assert.equal(preferredSubtitleLanguage("system", "fr-CA"), "fr-CA");
+  assert.equal(preferredSubtitleLanguage("en-GB", "es-AR"), "en-GB");
+  assert.equal(preferredSubtitleLanguage("off", "es-AR"), undefined);
+  assert.equal(trackLanguage("jpn"), "ja");
+  assert.equal(trackLanguage("und", "Track 2 - [Spanish]"), "es");
+});
+
+test("automatic subtitles require a different known audio language and a compatible track", () => {
+  const spanish = {language: "spa"};
+  const regional = {language: "es-AR"};
+  const english = {language: "eng"};
+  const tracks = [english, spanish, regional];
+  assert.equal(automaticSubtitle(tracks, "jpn", "es-AR"), regional);
+  assert.equal(automaticSubtitle(tracks, "eng", "es-MX"), spanish);
+  assert.equal(automaticSubtitle(tracks, "es-MX", "es-AR"), undefined);
+  assert.equal(automaticSubtitle(tracks, "und", "es"), undefined);
+  assert.equal(automaticSubtitle(tracks, "zzz", "es"), undefined);
+  assert.equal(automaticSubtitle(tracks, "eng", "de"), undefined);
+  assert.equal(automaticSubtitle(tracks, "eng", undefined), undefined);
+  assert.equal(automaticSubtitle([], "eng", "es"), undefined);
+  assert.equal(automaticSubtitle([{language: "zh-CN"}], "en", "zh-Hant"), undefined);
+});
+
+test("subtitle selection survives a playback engine changing track IDs", () => {
+  const picked = {url: "https://example.org/alternative.srt", language: "es", label: "Spanish (2)"};
+  const original = {id: 12, language: "spa", label: "Spanish"};
+  const alternative = {...picked, id: -9};
+  assert.equal(manualSubtitle([original, alternative], picked), alternative);
+  assert.equal(manualSubtitle([original], picked), original);
+  assert.equal(manualSubtitle([original], null), undefined);
+});
 
 test("catalog filters preserve the type when opening same-name books", () => {
   assert.equal(catalogGroup("book", "book.manga"), "manga");

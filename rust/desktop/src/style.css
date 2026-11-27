@@ -2335,6 +2335,20 @@
 .player-dialog.is-playback-fullscreen > .player-status-banner:not(.is-error) {
   display: none;
 }
+.playback-exit-hint {
+  position: absolute;
+  z-index: 12;
+  inset: 12% auto auto 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 80%;
+  padding: .65rem 1rem;
+  border-radius: .5rem;
+  background: #12141a;
+  color: #fff;
+  text-align: center;
+  pointer-events: none;
+}
 .player-dialog.has-playback-overlay .native-seek,
 .player-dialog.has-playback-overlay .native-volume {
   min-height: 22px;

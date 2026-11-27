@@ -4,6 +4,36 @@ import {ui} from "./locale";
 const idleDelay = 4000;
 const tvActions = "button:enabled, select:enabled, input[type=range]:enabled, summary, a[href]";
 
+export function tvExitConfirmation(dialog: HTMLDialogElement) {
+  const hint = document.createElement("div");
+  hint.className = "playback-exit-hint";
+  hint.setAttribute("role", "status");
+  hint.hidden = true;
+  dialog.append(hint);
+  let firstPress = -Infinity;
+  let timer = 0;
+  const reset = () => {
+    clearTimeout(timer);
+    firstPress = -Infinity;
+    hint.hidden = true;
+    hint.textContent = "";
+  };
+  return {
+    confirm() {
+      const now = performance.now();
+      if (now - firstPress < 160) return false;
+      if (now - firstPress < 2500) { reset(); return true; }
+      firstPress = now;
+      hint.hidden = false;
+      hint.textContent = ui("Volvé a presionar Atrás para salir del video.");
+      timer = window.setTimeout(reset, 2500);
+      return false;
+    },
+    reset,
+    close() { reset(); hint.remove(); },
+  };
+}
+
 export function attachPlaybackOverlay(
   dialog: HTMLDialogElement, viewport: HTMLElement, controls: HTMLElement,
   fullscreenButton: HTMLButtonElement, play: HTMLButtonElement, toggle: () => void,
@@ -12,6 +42,7 @@ export function attachPlaybackOverlay(
   const events = new AbortController();
   const options = {signal: events.signal};
   const tv = document.documentElement.classList.contains("television");
+  const exit = tv ? tvExitConfirmation(dialog) : undefined;
   const desktop = !/Android/i.test(navigator.userAgent);
   const minimal = document.createElement("button");
   minimal.type = "button";
@@ -142,8 +173,13 @@ export function attachPlaybackOverlay(
   dialog.addEventListener("cancel", event => {
     if (selectMenu) {
       event.preventDefault();
+      exit?.reset();
       closeSelection();
       wake();
+      return;
+    }
+    if (exit) {
+      if (!exit.confirm()) event.preventDefault();
       return;
     }
     if (!fullscreen) return;
@@ -161,9 +197,11 @@ export function attachPlaybackOverlay(
     const wasIdle = idle;
     wake();
     if (tv && target) {
-      if (selectMenu && ["Escape", "Backspace", "BrowserBack"].includes(event.key)) {
+      if (["Escape", "Backspace", "BrowserBack"].includes(event.key)) {
         event.preventDefault();
-        closeSelection();
+        if (event.repeat) return;
+        if (selectMenu) { exit?.reset(); closeSelection(); }
+        else if (exit?.confirm()) dialog.close();
         return;
       }
       const direction = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key);
@@ -220,6 +258,7 @@ export function attachPlaybackOverlay(
     close(preserveFullscreen = false) {
       events.abort();
       clearTimeout(timer);
+      exit?.close();
       closeSelection(false);
       minimal.remove();
       header.inert = controls.inert = false;
