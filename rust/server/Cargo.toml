@@ -1,6 +1,6 @@
 [package]
 name = "umd-server"
-version = "0.1.28"
+version = "0.1.29"
 edition.workspace = true
 rust-version.workspace = true
 
@@ -28,6 +28,7 @@ futures-util = "0.3"
 tempfile = "3"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli"] }
+image = { version = "0.25.9", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 tower = { version = "0.5", features = ["util"] }
 

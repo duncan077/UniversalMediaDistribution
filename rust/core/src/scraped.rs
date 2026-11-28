@@ -337,10 +337,18 @@ impl CatalogStore {
         if incoming.deleted {
             return Ok(false);
         }
-        // The public crawler publishes descriptions, not artwork: thumbnail and
-        // backdrop references are dropped at every level before the merge.
+        // Keep the title cover used in catalog listings. Nested images and
+        // backdrops are outside the public thumbnail cache.
         let mut incoming = incoming;
-        incoming.metadata.remove("thumbnailRef");
+        if !incoming
+            .metadata
+            .get("thumbnailRef")
+            .and_then(Value::as_str)
+            .and_then(|source| url::Url::parse(source.trim()).ok())
+            .is_some_and(|url| url.scheme() == "https" && crate::public_url::web_url(&url))
+        {
+            incoming.metadata.remove("thumbnailRef");
+        }
         incoming.metadata.remove("backdropRef");
         for value in incoming.metadata.values_mut() {
             without_artwork(value);

@@ -14,6 +14,7 @@ mod profiles;
 mod reconcile;
 mod reconcile_catalog;
 mod store;
+mod thumbnails;
 mod user_state;
 mod watch_party;
 pub use watch_party::{PartyCommand, PartyContent};
@@ -23,6 +24,7 @@ pub use catalog::*;
 pub use delta::*;
 pub use profiles::*;
 pub use store::*;
+pub use thumbnails::{CatalogThumbnailUrls, CATALOG_THUMBNAIL_PREFIX};
 pub use user_state::*;
 
 #[derive(Debug, thiserror::Error)]

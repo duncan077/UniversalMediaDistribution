@@ -6603,7 +6603,7 @@ dependencies = [
 
 [[package]]
 name = "umd-desktop"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "adblock",
  "axum",
@@ -6672,7 +6672,7 @@ dependencies = [
 
 [[package]]
 name = "umd-server"
-version = "0.1.28"
+version = "0.1.29"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6681,6 +6681,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
+ "image",
  "pbkdf2",
  "reqwest 0.12.28",
  "rusqlite",

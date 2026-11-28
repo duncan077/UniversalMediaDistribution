@@ -3,6 +3,7 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     path::Path,
     sync::{
@@ -415,6 +416,17 @@ impl CatalogStore {
         max: usize,
         hide_adult: bool,
     ) -> Result<EncodedCatalogPage> {
+        self.encode_public_page_with_thumbnails(query, search, max, hide_adult, None)
+    }
+
+    pub fn encode_public_page_with_thumbnails(
+        &self,
+        query: &CatalogQuery,
+        search: bool,
+        max: usize,
+        hide_adult: bool,
+        thumbnails: Option<&CatalogThumbnailUrls>,
+    ) -> Result<EncodedCatalogPage> {
         query.validate_limit(if search { 500 } else { 100 })?;
         let cursor = canonical_cursor(query)?;
         let count = query.limit.unwrap_or(50) as usize;
@@ -451,9 +463,12 @@ impl CatalogStore {
         let mut added = Vec::new();
         let mut more = false;
         while let Some(row) = rows.next()? {
-            let payload = raw_text(row, 1)?;
-            if added.len() == count
-                || body.len() + payload.len() + usize::from(!added.is_empty()) + min_footer > max
+            if added.len() == count {
+                more = true;
+                break;
+            }
+            let payload = public_payload(raw_text(row, 1)?, thumbnails)?;
+            if body.len() + payload.len() + usize::from(!added.is_empty()) + min_footer > max
             {
                 more = true;
                 break;
@@ -463,7 +478,7 @@ impl CatalogStore {
             if added.len() > 1 {
                 body.push(b',');
             }
-            body.extend_from_slice(payload);
+            body.extend_from_slice(&payload);
         }
         if more && !search {
             let extra = 34 - b"null".len();
@@ -615,16 +630,31 @@ impl CatalogStore {
         } else {
             let mut statement = tx.prepare("SELECT payload FROM rust_catalog ORDER BY id")?;
             let rows = statement.query([])?;
-            Some(encode_document(rows, &updated_at, source.as_deref(), max)?)
+            Some(encode_document(rows, &updated_at, source.as_deref(), max, None)?)
         };
         Ok((format!("W/{validator}"), document))
     }
 
     pub fn encode_recent(&self, max: usize, hide_adult: bool) -> Result<Vec<u8>> {
+        self.encode_recent_with_thumbnails(max, hide_adult, None)
+    }
+
+    pub fn encode_recent_with_thumbnails(
+        &self,
+        max: usize,
+        hide_adult: bool,
+        thumbnails: Option<&CatalogThumbnailUrls>,
+    ) -> Result<Vec<u8>> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
         let mut statement = db.prepare_cached(RECENT_ADDITIONS_SQL)?;
         let rows = statement.query([hide_adult])?;
-        encode_document(rows, &now(), Some("Universal Media Distribution"), max)
+        encode_document(
+            rows,
+            &now(),
+            Some("Universal Media Distribution"),
+            max,
+            thumbnails,
+        )
     }
 
     pub fn favorite_ids(&self, hide_adult: bool) -> Result<Vec<Uuid>> {
@@ -646,19 +676,39 @@ impl CatalogStore {
     }
 
     pub fn encode_public_item(&self, id: Uuid, max: usize) -> Result<Option<Vec<u8>>> {
+        self.encode_public_item_with_thumbnails(id, max, None)
+    }
+
+    pub fn thumbnail_source(&self, id: Uuid) -> Result<Option<String>> {
+        let db = self.0.lock().map_err(|_| Error::Lock)?;
+        let mut statement = db.prepare_cached(
+            "SELECT summary->>'$.thumbnailRef' FROM rust_catalog_summary
+             WHERE id=?1 AND json_type(summary,'$.thumbnailRef')='text'",
+        )?;
+        Ok(statement
+            .query_row([id.to_string()], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn encode_public_item_with_thumbnails(
+        &self,
+        id: Uuid,
+        max: usize,
+        thumbnails: Option<&CatalogThumbnailUrls>,
+    ) -> Result<Option<Vec<u8>>> {
         let db = self.0.lock().map_err(|_| Error::Lock)?;
         let mut statement = db.prepare_cached("SELECT payload FROM rust_catalog WHERE id=?1")?;
         let mut rows = statement.query([id.to_string()])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let payload = raw_text(row, 0)?;
+        let payload = public_payload(raw_text(row, 0)?, thumbnails)?;
         let mut body = Vec::with_capacity(payload.len().saturating_add(256).min(max));
         document_prefix(&mut body, &now(), Some("Universal Media Distribution"))?;
         if body.len() + payload.len() + 2 > max {
             return Err(Error::DocumentTooLarge(max));
         }
-        body.extend_from_slice(payload);
+        body.extend_from_slice(&payload);
         body.extend_from_slice(b"]}");
         Ok(Some(body))
     }
@@ -1181,11 +1231,19 @@ fn document_prefix(body: &mut Vec<u8>, stamp: &str, source: Option<&str>) -> Res
     Ok(())
 }
 
+fn public_payload<'a>(
+    payload: &'a [u8],
+    thumbnails: Option<&CatalogThumbnailUrls>,
+) -> Result<Cow<'a, [u8]>> {
+    thumbnails.map_or_else(|| Ok(Cow::Borrowed(payload)), |urls| urls.rewrite(payload))
+}
+
 fn encode_document(
     mut rows: rusqlite::Rows<'_>,
     stamp: &str,
     source: Option<&str>,
     max: usize,
+    thumbnails: Option<&CatalogThumbnailUrls>,
 ) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(max.min(64 << 10));
     document_prefix(&mut body, stamp, source)?;
@@ -1194,14 +1252,14 @@ fn encode_document(
     }
     let mut separator = 0;
     while let Some(row) = rows.next()? {
-        let data = raw_text(row, 0)?;
+        let data = public_payload(raw_text(row, 0)?, thumbnails)?;
         if body.len() + data.len() + separator + 2 > max {
             return Err(Error::DocumentTooLarge(max));
         }
         if separator != 0 {
             body.push(b',');
         }
-        body.extend_from_slice(data);
+        body.extend_from_slice(&data);
         separator = 1;
     }
     body.extend_from_slice(b"]}");

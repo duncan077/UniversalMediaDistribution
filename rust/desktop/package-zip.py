@@ -55,6 +55,7 @@ def package(binary, output, linux_vlc):
         archive_path = staging / final.name
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(binary, EXECUTABLE)
+            archive.write(WORKSPACE.parent / "LICENSE", "LICENSE")
             identity = {"product": CONFIG["identifier"], "version": version, "runtimeIdentifier": runtime}
             archive.writestr("umd-package.json", json.dumps(identity))
             if WINDOWS:

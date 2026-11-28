@@ -224,9 +224,11 @@ fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "No se encontró la sala.".into())
 }
 impl Rooms {
-    fn expire(&mut self) {
+    fn expire(&mut self, now: Instant) {
         self.rooms.retain(|_, r| {
-            if r.active.elapsed() < IDLE || r.members.iter().any(|m| !m.sockets.is_empty()) {
+            if now.saturating_duration_since(r.active) < IDLE
+                || r.members.iter().any(|m| !m.sockets.is_empty())
+            {
                 return true;
             }
             for member in &r.members {
@@ -354,7 +356,7 @@ async fn create(
 ) -> ApiResult {
     let actor = person(s, &h).await?;
     let mut rooms = reg.lock().await;
-    rooms.expire();
+    rooms.expire(Instant::now());
     Ok(Json(rooms.create(actor, input)?).into_response())
 }
 async fn join(
@@ -365,7 +367,7 @@ async fn join(
 ) -> ApiResult {
     let actor = person(s, &h).await?;
     let mut rooms = reg.lock().await;
-    rooms.expire();
+    rooms.expire(Instant::now());
     Ok(Json(rooms.join(actor, input.join_code)?).into_response())
 }
 async fn current(
@@ -375,7 +377,7 @@ async fn current(
 ) -> ApiResult {
     let actor = person(s, &h).await?;
     let mut rooms = reg.lock().await;
-    rooms.expire();
+    rooms.expire(Instant::now());
     Ok(Json(rooms.current(&actor.id)?.state()).into_response())
 }
 async fn leave(
@@ -395,7 +397,7 @@ async fn options(
 ) -> ApiResult {
     let actor = person(s, &h).await?;
     let mut rooms = reg.lock().await;
-    rooms.expire();
+    rooms.expire(Instant::now());
     let room = rooms.current(&actor.id)?;
     if room.host() != actor.id {
         return Err(ApiError(
@@ -418,7 +420,7 @@ async fn socket(
     let actor = person(s, &h).await?;
     let party = {
         let mut rooms = reg.lock().await;
-        rooms.expire();
+        rooms.expire(Instant::now());
         rooms.current(&actor.id)?.id
     };
     Ok(ws
@@ -606,9 +608,7 @@ mod tests {
         assert_eq!(rooms.current(&guest.id).unwrap().code, own);
         let room = rooms.current(&host.id).unwrap();
         attach(room, 0);
-        room.active = Instant::now() - IDLE;
-        rooms.current(&guest.id).unwrap().active = Instant::now() - IDLE;
-        rooms.expire();
+        rooms.expire(Instant::now() + IDLE);
         assert!(rooms.current(&guest.id).is_err());
         assert!(rooms.current(&host.id).is_ok());
     }

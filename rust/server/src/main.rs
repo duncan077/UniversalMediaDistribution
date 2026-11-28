@@ -2,7 +2,10 @@ mod maintenance;
 use axum::serve::ListenerExt;
 use std::{env, path::PathBuf};
 use umd_core::CatalogStore;
-use umd_server::{router, AccountStore, ReleaseStore, ServerState, DEFAULT_MAX_PACKAGE_BYTES};
+use umd_server::{
+    router_with_thumbnails, AccountStore, ReleaseStore, ServerState, ThumbnailCache,
+    DEFAULT_MAX_PACKAGE_BYTES,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -46,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok_or("UMD_SERVER_MAX_PACKAGE_BYTES must be a positive 64-bit integer")?,
         _ => DEFAULT_MAX_PACKAGE_BYTES,
     };
+    let thumbnails = ThumbnailCache::from_env(&directory)?;
     let address = env::var("UMD_RUST_SERVER_LISTEN").unwrap_or_else(|_| "127.0.0.1:9005".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!(address = %listener.local_addr()?, "UMD Rust catalog server started");
@@ -60,15 +64,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener.tap_io(|socket| {
             let _ = socket.set_nodelay(true);
         }),
-        router(ServerState {
-            admin: admin.clone(),
-            catalog,
-            admin_token,
-            releases: ReleaseStore::new(&directory, maximum_package_bytes),
-            accounts: AccountStore::open(directory.join("accounts.db"))?,
-            allow_registration: env::var("UMD_SERVER_ALLOW_REGISTRATION")
-                .is_ok_and(|v| v == "true"),
-        })
+        router_with_thumbnails(
+            ServerState {
+                admin: admin.clone(),
+                catalog,
+                admin_token,
+                releases: ReleaseStore::new(&directory, maximum_package_bytes),
+                accounts: AccountStore::open(directory.join("accounts.db"))?,
+                allow_registration: env::var("UMD_SERVER_ALLOW_REGISTRATION")
+                    .is_ok_and(|v| v == "true"),
+            },
+            thumbnails,
+        )
         // Login throttling counts failures per client address.
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )

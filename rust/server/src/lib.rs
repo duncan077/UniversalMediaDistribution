@@ -18,8 +18,10 @@ mod accounts;
 mod limits;
 use limits::Limits;
 mod releases;
+mod thumbnails;
 pub use accounts::AccountStore;
 pub use releases::{ReleaseStore, DEFAULT_MAX_PACKAGE_BYTES};
+pub use thumbnails::ThumbnailCache;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -32,14 +34,26 @@ pub struct ServerState {
 }
 
 pub fn router(state: ServerState) -> Router {
+    router_with_thumbnails(state, None)
+}
+
+pub fn router_with_thumbnails(state: ServerState, thumbnails: Option<ThumbnailCache>) -> Router {
     let limits = state.accounts.limits;
     let work = CatalogWork {
+        thumbnails,
         readers: state
             .catalog
             .readers(4)
             .map(Arc::new)
             .map_err(|error| tracing::warn!(%error, "Catalog readers unavailable"))
             .ok(),
+        ..CatalogWork::default()
+    };
+    // A burst of missing posters must not exhaust the search admission queue.
+    let thumbnail_work = CatalogWork {
+        readers: work.readers.clone(),
+        thumbnails: work.thumbnails.clone(),
+        admitted: Arc::new(Semaphore::new(thumbnails::MAX_REQUESTS)),
         ..CatalogWork::default()
     };
     Router::new()
@@ -49,9 +63,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/v1/catalog/items/{id}", get(item))
         .route("/api/v1/catalog/search", get(search))
         .route("/api/v1/catalog/recent", get(recent))
-        // Catalog pages are JSON that shrinks about tenfold. Release packages
-        // are merged after this layer: they are already compressed and must
-        // keep their byte ranges and Content-Length.
+        // Compress catalog JSON. Images and release packages are already
+        // compressed and keep their own headers and admission limits.
         .layer(
             tower_http::compression::CompressionLayer::new()
                 .gzip(true)
@@ -62,6 +75,11 @@ pub fn router(state: ServerState) -> Router {
             limits::catalog_rate,
         ))
         .layer(Extension(work))
+        .merge(
+            Router::new()
+                .route("/api/v1/catalog/thumbnails/{id}/{file}", get(thumbnails::serve))
+                .layer(Extension(thumbnail_work)),
+        )
         .merge(admin::routes(&state))
         .merge(
             accounts::routes(&state)
@@ -240,10 +258,13 @@ async fn items(
     Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
+    let thumbnails = work.thumbnails.clone();
     let hide_adult = query.hide_adult;
     let query = query.query()?;
     work.run(move || {
-        let page = catalog.encode_public_page(&query, false, 8 << 20, hide_adult)?;
+        let page = catalog.encode_public_page_with_thumbnails(
+            &query, false, 8 << 20, hide_adult, thumbnails.as_ref().map(ThumbnailCache::urls),
+        )?;
         Ok(limits::json_bytes(page.body))
     })
     .await
@@ -255,8 +276,14 @@ async fn recent(
     Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
-    work.run(move || Ok(limits::json_bytes(catalog.encode_recent(8 << 20, query.hide_adult)?)))
-        .await
+    let thumbnails = work.thumbnails.clone();
+    work.run(move || {
+        let body = catalog.encode_recent_with_thumbnails(
+            8 << 20, query.hide_adult, thumbnails.as_ref().map(ThumbnailCache::urls),
+        )?;
+        Ok(limits::json_bytes(body))
+    })
+    .await
 }
 
 async fn search(
@@ -265,12 +292,15 @@ async fn search(
     Query(query): Query<Search>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
+    let thumbnails = work.thumbnails.clone();
     let hide_adult = query.hide_adult;
     let query = query.query()?;
     let summary = query.filters.summary;
     let (cursor, mut response) = work
         .run(move || {
-            let page = catalog.encode_public_page(&query, true, 8 << 20, hide_adult)?;
+            let page = catalog.encode_public_page_with_thumbnails(
+                &query, true, 8 << 20, hide_adult, thumbnails.as_ref().map(ThumbnailCache::urls),
+            )?;
             Ok((page.continuation_token, limits::json_bytes(page.body)))
         })
         .await?;
@@ -293,9 +323,10 @@ async fn item(
     Path(id): Path<Uuid>,
 ) -> ApiResult {
     let catalog = work.reader(&state.catalog);
+    let thumbnails = work.thumbnails.clone();
     work.run(move || {
         let mut document = catalog
-            .encode_public_item(id, 8 << 20)?
+            .encode_public_item_with_thumbnails(id, 8 << 20, thumbnails.as_ref().map(ThumbnailCache::urls))?
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "Title not found".into()))?;
         let links: BTreeMap<_, _> = catalog.item_bindings(id)?.into_iter()
             .filter(|(site, external)| (site == "capibaratraductor" || umd_providers::Site::parse(site).is_some())
@@ -318,6 +349,7 @@ async fn item(
 
 #[derive(Clone)]
 struct CatalogWork {
+    thumbnails: Option<ThumbnailCache>,
     readers: Option<Arc<umd_core::CatalogReaders>>,
     admitted: Arc<Semaphore>,
     workers: Arc<Semaphore>,
@@ -327,6 +359,7 @@ struct CatalogWork {
 impl Default for CatalogWork {
     fn default() -> Self {
         Self {
+            thumbnails: None,
             readers: None,
             admitted: Arc::new(Semaphore::new(16)),
             workers: Arc::new(Semaphore::new(2)),

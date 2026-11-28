@@ -280,6 +280,8 @@ cargo build --manifest-path rust/Cargo.toml --release -p umd-server
 El servidor es independiente de Tauri y puede compilarse en Linux ARM64 con
 Rust y un compilador C para SQLite. El binario de Windows no sirve para Linux.
 
+Para habilitar las miniaturas persistentes y entregarlas desde el CDN, seguí la [guía de Cloudflare](../docs/SERVER_CATALOG_THUMBNAILS.md).
+
 ### Migrar un servidor .NET y restaurar una copia
 
 El ejecutable Rust incluye la migración del servidor .NET con esquema SQLite 2. Detené el servidor .NET y su rastreador para que los paquetes publicados y la base correspondan al mismo momento. Indicá el **directorio que contiene `server.db`** y un directorio de destino nuevo. La conversión conserva los identificadores del catálogo, las cuentas y sus contraseñas, las sesiones vigentes, los respaldos y sus revisiones, los enlaces públicos de listas, los permisos de amistad, la cola de rastreo y las publicaciones. Una cuenta migrada puede recibir un respaldo completo en su primera sincronización incremental. Las salas activas son temporales y se vuelven a crear después del cambio.

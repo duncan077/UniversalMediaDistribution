@@ -21,3 +21,7 @@ cargo run --manifest-path rust/Cargo.toml -p umd-server
 La [guía de Rust](rust/README.md) describe los requisitos de compilación, el empaquetado, las actualizaciones y la migración de bibliotecas y servidores existentes.
 
 La última versión del proyecto .NET está archivada en la [rama legacy](https://github.com/duncan077/UniversalMediaDistribution/tree/legacy).
+
+## Licencia
+
+Universal Media Distribution se distribuye bajo la [Licencia Apache 2.0](LICENSE).
