@@ -55,7 +55,6 @@ def package(binary, output, linux_vlc):
         archive_path = staging / final.name
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(binary, EXECUTABLE)
-            archive.write(WORKSPACE.parent / "LICENSE", "LICENSE")
             identity = {"product": CONFIG["identifier"], "version": version, "runtimeIdentifier": runtime}
             archive.writestr("umd-package.json", json.dumps(identity))
             if WINDOWS:
@@ -80,7 +79,16 @@ def package(binary, output, linux_vlc):
                 launcher.external_attr = 0o100755 << 16
                 archive.writestr(launcher, '#!/bin/sh\nset -eu\napp=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport VLC_PLUGIN_PATH="$app/libvlc/plugins"\nexec "$app/umd-desktop" "$@"\n')
                 readme = "Extraé el ZIP con unzip y ejecutá ./UMD en una sesión gráfica. Requiere GTK 3 y WebKitGTK 4.1. El paquete incluye VLC."
-            archive.writestr("LEEME.txt", readme + "\nPara actualizar, abrí Configuración → Actualizaciones y elegí Actualizar y reiniciar. La biblioteca se guarda en tu perfil de usuario.\n")
+            # Older portable updaters accept the readme but reject extra root files.
+            license_text = (WORKSPACE.parent / "LICENSE").read_text(encoding="utf-8")
+            archive.writestr(
+                "LEEME.txt",
+                readme
+                + "\nPara actualizar, abrí Configuración → Actualizaciones y elegí Actualizar y reiniciar. "
+                "La biblioteca se guarda en tu perfil de usuario.\n\n"
+                "Licencia de Universal Media Distribution\n\n"
+                + license_text,
+            )
         os.replace(archive_path, final)
     return final
 
